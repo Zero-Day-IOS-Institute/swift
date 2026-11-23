@@ -112,6 +112,10 @@ public:
   static ProtocolConformanceRef forMissingOrInvalid(
       Type type, ProtocolDecl *proto);
 
+  /// Whether conformances to the given protocol can be "missing" rather than
+  /// invalid when a legitimate conformance doesn't exist.
+  static bool canBeMissing(ProtocolDecl *proto);
+
   bool isInvalid() const;
 
   explicit operator bool() const { return !isInvalid(); }
@@ -171,12 +175,6 @@ public:
   bool forEachIsolatedConformance(
       llvm::function_ref<bool(ProtocolConformanceRef)> body
   ) const;
-
-  /// Returns the availability restriction that restricts use of this
-  /// conformance in the given context, or \c nullopt if the conformance is
-  /// available.
-  std::optional<AvailabilityRestriction>
-  getAvailabilityRestriction(DeclContext *dc, SourceLoc loc) const;
 
   using OpaqueValue = void*;
   OpaqueValue getOpaqueValue() const { return Union.getOpaqueValue(); }

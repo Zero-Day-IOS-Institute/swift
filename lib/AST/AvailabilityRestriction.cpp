@@ -17,6 +17,8 @@
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/PlatformKindUtils.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace swift;
 
@@ -32,6 +34,7 @@ AvailabilityRestriction::getDomainAndRange(const ASTContext &ctx) const {
   case Reason::Deprecated:
     return getAttr().getDeprecatedDomainAndRange(ctx).value();
   }
+  llvm_unreachable("covered switch");
 }
 
 AvailabilityDomainAndRange
@@ -166,6 +169,42 @@ bool AvailabilityRestriction::shouldHideDomainNameInDiagnostics() const {
       return true;
     }
   }
+  llvm_unreachable("covered switch");
+}
+
+StringRef AvailabilityRestriction::getDiagnosticDescription(
+    llvm::SmallString<64> &scratch, const ASTContext &ctx,
+    bool includeMessage) const {
+  auto domainAndRange = getDomainAndRange(ctx);
+  auto domain = domainAndRange.getDomain();
+  llvm::raw_svector_ostream os(scratch);
+  switch (getReason()) {
+  case Reason::UnavailableUnconditionally:
+  case Reason::UnavailableObsolete:
+  case Reason::UnavailableUnintroduced: {
+    os << "is unavailable";
+
+    if (!shouldHideDomainNameInDiagnostics())
+      os << " in " << domain.getNameForDiagnostics();
+
+    // Include the message from the `@available` attribute, if there is one.
+    if (includeMessage) {
+      EncodedDiagnosticMessage encodedMessage(getAttr().getMessage());
+      if (!encodedMessage.Message.empty())
+        os << ": " << encodedMessage.Message;
+    }
+    break;
+  }
+  case Reason::Unintroduced: {
+    os << "is only available in " << domain.getNameForDiagnostics();
+    if (domainAndRange.getRange().hasMinimumVersion())
+      os << " " << domainAndRange.getRange().getVersionString() << " or newer";
+    break;
+  }
+  case Reason::Deprecated:
+    llvm_unreachable("deprecation requires a different diagnostic");
+  }
+  return scratch.str();
 }
 
 void AvailabilityRestriction::print(llvm::raw_ostream &os) const {
@@ -272,6 +311,7 @@ static bool canIgnoreRestrictionInUnavailableContexts(
     // getDeprecationRestrictionForAttr().
     return false;
   }
+  llvm_unreachable("covered switch");
 }
 
 /// Returns the domain for the target platform if \p restriction may be narrowed
@@ -299,25 +339,6 @@ getSubstituteDomainForRestriction(const AvailabilityRestriction &restriction,
     return targetDomain;
 
   return std::nullopt;
-}
-
-static bool
-shouldIgnoreRestrictionInContext(const Decl *decl,
-                                 const AvailabilityRestriction &restriction,
-                                 const AvailabilityContext &context,
-                                 const AvailabilityRestrictionFlags flags) {
-  if (!context.isUnavailable())
-    return false;
-
-  if (!canIgnoreRestrictionInUnavailableContexts(decl, restriction, flags))
-    return false;
-
-  auto domain = restriction.getDomain();
-  if (auto substituteDomain =
-          getSubstituteDomainForRestriction(restriction, decl->getASTContext()))
-    domain = *substituteDomain;
-
-  return context.isUnavailableForDomain(domain);
 }
 
 static std::optional<AvailabilityRestriction>
@@ -357,6 +378,50 @@ getDeprecationRestrictionForAttr(const Decl *decl,
   }
 
   return std::nullopt;
+}
+
+/// Returns true if \p restriction should not be reported for a reference to
+/// \p decl from \p context.
+static bool shouldIgnoreRestriction(const Decl *decl,
+                                    const AvailabilityRestriction &restriction,
+                                    const AvailabilityContext &context,
+                                    const AvailabilityRestrictionFlags flags) {
+  auto &ctx = decl->getASTContext();
+
+  // The caller may have opted out of diagnosing potential unavailability for
+  // some of the domains that the restriction could belong to.
+  if (restriction.getReason() ==
+      AvailabilityRestriction::Reason::Unintroduced) {
+    if (flags.contains(
+            AvailabilityRestrictionFlag::AllowUnintroducedInPlatformDomains) &&
+        restriction.getDomain().isPlatform())
+      return true;
+
+    if (flags.contains(AvailabilityRestrictionFlag::
+                           AllowUnintroducedAtOrBelowDeploymentRange)) {
+      auto domainAndRange = restriction.getDomainAndRange(ctx);
+      if (auto deploymentRange =
+              domainAndRange.getDomain().getDeploymentRange(ctx)) {
+        if (deploymentRange->isContainedIn(domainAndRange.getRange()))
+          return true;
+      }
+    }
+  }
+
+  // The remaining reasons to ignore a restriction all require the context of
+  // the reference to be unavailable.
+  if (!context.isUnavailable())
+    return false;
+
+  if (!canIgnoreRestrictionInUnavailableContexts(decl, restriction, flags))
+    return false;
+
+  auto domain = restriction.getDomain();
+  if (auto substituteDomain =
+          getSubstituteDomainForRestriction(restriction, ctx))
+    domain = *substituteDomain;
+
+  return context.isUnavailableForDomain(domain);
 }
 
 std::optional<AvailabilityRestriction> swift::getAvailabilityRestrictionForAttr(
@@ -405,7 +470,7 @@ std::optional<AvailabilityRestriction> swift::getAvailabilityRestrictionForAttr(
 
   auto restriction = getRestriction();
   if (restriction &&
-      shouldIgnoreRestrictionInContext(decl, *restriction, context, flags))
+      shouldIgnoreRestriction(decl, *restriction, context, flags))
     return std::nullopt;
 
   return restriction;
@@ -444,6 +509,7 @@ domainCanBeUnconditionallyUnavailableAtRuntime(AvailabilityDomain domain,
       return false;
     }
   }
+  llvm_unreachable("covered switch");
 }
 
 /// Returns true if unsatisfied introduction restrictions for \p domain make
@@ -472,6 +538,7 @@ domainIsUnavailableAtRuntimeIfUnintroduced(AvailabilityDomain domain,
       return true;
     }
   }
+  llvm_unreachable("covered switch");
 }
 
 static bool restrictionIndicatesRuntimeUnavailability(
@@ -487,6 +554,7 @@ static bool restrictionIndicatesRuntimeUnavailability(
   case AvailabilityRestriction::Reason::Unintroduced:
     return domainIsUnavailableAtRuntimeIfUnintroduced(domain, ctx);
   }
+  llvm_unreachable("covered switch");
 }
 
 void swift::getRuntimeUnavailableDomains(

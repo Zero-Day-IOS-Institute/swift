@@ -1,6 +1,6 @@
-// RUN: %target-swift-frontend -primary-file %s -emit-ir -disable-availability-checking -runtime-compatibility-version none -target %module-target-future | %FileCheck %s --check-prefix=CHECK-MANGLE
+// RUN: %target-swift-frontend -primary-file %s -emit-ir -runtime-compatibility-version none -target %module-target-future | %FileCheck %s --check-prefix=CHECK-MANGLE
 
-// RUN: %target-swift-frontend -primary-file %s -emit-ir -disable-availability-checking -runtime-compatibility-version 5.8 -disable-concrete-type-metadata-mangled-name-accessors | %FileCheck %s --check-prefix=CHECK-NOMANGLE
+// RUN: %target-swift-frontend -primary-file %s -emit-ir -runtime-compatibility-version 5.8 -disable-concrete-type-metadata-mangled-name-accessors | %FileCheck %s --check-prefix=CHECK-NOMANGLE
 
 // RUN: %target-swift-frontend -primary-file %s -emit-ir  | %FileCheck %s --check-prefix=CHECK
 
@@ -38,7 +38,7 @@ func createsP() {
 func buildMetatype() -> Any.Type {
   typealias Fn = (Int) throws(MyBigError) -> Void
 
-  // CHECK-MANGLE: __swift_instantiateConcreteTypeFromMangledName(ptr @"$sySi12typed_throws10MyBigErrorOYKcMD
+  // CHECK-MANGLE: __swift_instantiateConcreteTypeFromMangledNameV2(ptr @"$sySi12typed_throws10MyBigErrorOYKcMd
 
   // CHECK-NOMANGLE: call swiftcc %swift.metadata_response @"$sySi12typed_throws10MyBigErrorOYKcMa"
   return Fn.self

@@ -33,7 +33,6 @@
 
 #include "swift/SIL/SILInstruction.h"
 #define DEBUG_TYPE "access-enforcement-selection"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/ApplySite.h"
 #include "swift/SIL/SILArgument.h"
@@ -505,7 +504,9 @@ void SelectEnforcement::updateAccess(BeginAccessInst *access) {
 
 void SelectEnforcement::updateCapture(AddressCapture capture) {
   auto captureIfEscaped = [&](SILInstruction *user) {
-    if (hasPotentiallyEscapedAt(user))
+    // A closure passed to the call that escapes the box, such as a call that
+    // also takes the box itself, may access the box during that call.
+    if (Escapes.count(user) || hasPotentiallyEscapedAt(user))
       dynamicCaptures.recordCapture(capture);
   };
   SingleValueInstruction *PAIUser = dyn_cast<PartialApplyInst>(capture.site);

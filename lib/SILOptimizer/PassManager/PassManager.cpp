@@ -14,7 +14,6 @@
 
 #include "swift/SILOptimizer/PassManager/PassManager.h"
 #include "../../IRGen/IRGenModule.h"
-#include "swift/AST/ASTMangler.h"
 #include "swift/AST/SILOptimizerRequests.h"
 #include "swift/Basic/Assertions.h"
 #include "swift/Basic/MD5Stream.h"
@@ -34,7 +33,6 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringSwitch.h"
-#include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -762,10 +760,8 @@ void SILPassManager::runPassOnFunction(unsigned TransIdx, SILFunction *F) {
       (SILVerifyAroundPass.end() != std::find_if(SILVerifyAroundPass.begin(),
                                                  SILVerifyAroundPass.end(),
                                                  MatchFun))) {
-    F->verify(getAnalysis<BasicCalleeAnalysis>()->getCalleeCache(),
-              getAnalysis<DominanceAnalysis>()->get(F));
+    runVerification(F);
     verifyAnalyses();
-    runSwiftFunctionVerification(F);
   }
 
   if (SILPrintPassName)
@@ -877,13 +873,8 @@ void SILPassManager::runPassOnFunction(unsigned TransIdx, SILFunction *F) {
 
   if (getOptions().VerifyAll &&
       (CurrentPassHasInvalidated || SILVerifyWithoutInvalidation)) {
-    F->verify(getAnalysis<BasicCalleeAnalysis>()->getCalleeCache(),
-              getAnalysis<DominanceAnalysis>()->get(F));
+    runVerification(F);
     verifyAnalyses(F);
-    runSwiftFunctionVerification(F);
-  } else if (getOptions().VerifyOwnershipAll &&
-             (CurrentPassHasInvalidated || SILVerifyWithoutInvalidation)) {
-    F->verifyOwnership();
   } else {
     if ((SILVerifyAfterPass.end() != std::find_if(SILVerifyAfterPass.begin(),
                                                   SILVerifyAfterPass.end(),
@@ -891,10 +882,8 @@ void SILPassManager::runPassOnFunction(unsigned TransIdx, SILFunction *F) {
         (SILVerifyAroundPass.end() != std::find_if(SILVerifyAroundPass.begin(),
                                                    SILVerifyAroundPass.end(),
                                                    MatchFun))) {
-      F->verify(getAnalysis<BasicCalleeAnalysis>()->getCalleeCache(),
-                getAnalysis<DominanceAnalysis>()->get(F));
+      runVerification(F);
       verifyAnalyses();
-      runSwiftFunctionVerification(F);
     }
   }
 
@@ -1016,9 +1005,8 @@ void SILPassManager::runModulePass(unsigned TransIdx) {
       (SILVerifyAroundPass.end() != std::find_if(SILVerifyAroundPass.begin(),
                                                  SILVerifyAroundPass.end(),
                                                  MatchFun))) {
-    Mod->verify(getAnalysis<BasicCalleeAnalysis>()->getCalleeCache());
+    runModuleVerification();
     verifyAnalyses();
-    runSwiftModuleVerification();
   }
 
   swiftPassInvocation.startModulePassRun(SMT);
@@ -1069,10 +1057,9 @@ void SILPassManager::runModulePass(unsigned TransIdx) {
   updateSILModuleStatsAfterTransform(*Mod, SMT, *this, NumPassesRun, duration.count());
 
   if (Options.VerifyAll &&
-      (CurrentPassHasInvalidated || !SILVerifyWithoutInvalidation)) {
-    Mod->verify(getAnalysis<BasicCalleeAnalysis>()->getCalleeCache());
+      (CurrentPassHasInvalidated || SILVerifyWithoutInvalidation)) {
+    runModuleVerification();
     verifyAnalyses();
-    runSwiftModuleVerification();
   } else {
     if ((SILVerifyAfterPass.end() != std::find_if(SILVerifyAfterPass.begin(),
                                                   SILVerifyAfterPass.end(),
@@ -1080,9 +1067,8 @@ void SILPassManager::runModulePass(unsigned TransIdx) {
         (SILVerifyAroundPass.end() != std::find_if(SILVerifyAroundPass.begin(),
                                                    SILVerifyAroundPass.end(),
                                                    MatchFun))) {
-      Mod->verify(getAnalysis<BasicCalleeAnalysis>()->getCalleeCache());
+      runModuleVerification();
       verifyAnalyses();
-      runSwiftModuleVerification();
     }
   }
 }
@@ -1103,6 +1089,23 @@ void SILPassManager::verifyAnalyses(SILFunction *F) const {
   for (auto *A : Analyses) {
     A->verify(F);
   }
+}
+
+void SILPassManager::runVerification(SILFunction *f) {
+  // Within a pass, the cached dominance info may be out of date, because the
+  // pass can change the CFG before it invalidates the analysis.
+  DominanceInfo *dominanceInfo = nullptr;
+  if (!swiftPassInvocation.getTransform())
+    dominanceInfo = getAnalysis<DominanceAnalysis>()->get(f);
+
+  f->verify(getAnalysis<BasicCalleeAnalysis>()->getCalleeCache(),
+            dominanceInfo);
+  runMandatoryVerification(f);
+}
+
+void SILPassManager::runModuleVerification() {
+  Mod->verify(getAnalysis<BasicCalleeAnalysis>()->getCalleeCache());
+  runMandatoryModuleVerification();
 }
 
 void SILPassManager::executePassPipelinePlan(const SILPassPipelinePlan &Plan) {
@@ -1689,6 +1692,8 @@ createEmptyFunction(StringRef name,
       IsNotRuntimeAccessible, fromFn->getEntryCount(), fromFn->isThunk(),
       fromFn->getClassSubclassScope(), fromFn->getInlineStrategy(),
       fromFn->getEffectsKind(), nullptr, fromFn->getDebugScope());
+
+  newF->inheritDerivedFrom(fromFn);
 
   return newF;
 }

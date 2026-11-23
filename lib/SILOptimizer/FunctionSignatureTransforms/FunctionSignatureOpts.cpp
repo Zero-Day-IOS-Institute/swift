@@ -31,9 +31,7 @@
 
 #define DEBUG_TYPE "sil-function-signature-opt"
 #include "FunctionSignatureOpts.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/SIL/DebugUtils.h"
-#include "swift/SIL/SILCloner.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILValue.h"
 #include "swift/SILOptimizer/Analysis/ARCAnalysis.h"
@@ -96,6 +94,7 @@ static bool isSpecializableRepresentation(SILFunctionTypeRepresentation Rep,
   case SILFunctionTypeRepresentation::WitnessMethod:
     return OptForPartialApply;
   case SILFunctionTypeRepresentation::ObjCMethod:
+  case SILFunctionTypeRepresentation::COMMethod:
   case SILFunctionTypeRepresentation::Block:
     return false;
   }
@@ -299,14 +298,21 @@ static bool usesGenerics(SILFunction *F,
         tvi->getParamType().visit(FindArchetypesAndGenericTypes);
       }
 
+      // Scan the formal types of a conditional cast.
+      // (In particular, `test_only` casts have a formal target type
+      // but no destination.)
+      if (auto *CCABI = dyn_cast<CheckedCastAddrBranchInst>(&I)) {
+        Type(CCABI->getSourceFormalType()).visit(FindArchetypesAndGenericTypes);
+        Type(CCABI->getTargetFormalType()).visit(FindArchetypesAndGenericTypes);
+      }
+
       // Scan the result type of the instruction.
       for (auto V : I.getResults()) {
         V->getType().getASTType().visit(FindArchetypesAndGenericTypes);
       }
 
       if (auto *DVI = dyn_cast<DebugValueInst>(&I)) {
-        if (std::optional<SILType> VarType = DVI->getVarInfo()->Type)
-          VarType->getASTType().visit(FindArchetypesAndGenericTypes);
+        DVI->getVarType().getASTType().visit(FindArchetypesAndGenericTypes);
 
         // If there are only debug uses of the generic, don't keep it.
         if (UsesGenerics) {
@@ -699,7 +705,7 @@ void FunctionSignatureTransform::createFunctionSignatureOptimizedFunction() {
   if (NewF->isNoReturnFunction(Builder.getTypeExpansionContext())) {
     Builder.createUnreachable(Loc);
   } else {
-    Builder.createReturn(Loc, ReturnValue);
+    createThunkReturn(Builder, Loc, ReturnValue);
   }
 
   // Do the last bit work to finalize the thunk.

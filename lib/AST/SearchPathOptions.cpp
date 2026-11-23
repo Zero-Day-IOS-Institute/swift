@@ -11,7 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/SearchPathOptions.h"
-#include "swift/Basic/Assertions.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/Support/Errc.h"
 
@@ -178,12 +177,15 @@ ModuleSearchPathLookup::searchPathsContainingFile(
 static llvm::Error loadAndValidateVFSOverlay(
     const std::string &File,
     const llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> &BaseFS,
+    const llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> &ExternalFS,
     const llvm::IntrusiveRefCntPtr<llvm::vfs::OverlayFileSystem> &OverlayFS) {
   auto Buffer = BaseFS->getBufferForFile(File);
   if (!Buffer)
     return llvm::createFileError(File, Buffer.getError());
 
-  auto VFS = llvm::vfs::getVFSFromYAML(std::move(Buffer.get()), nullptr, File);
+  auto VFS = llvm::vfs::getVFSFromYAML(
+      std::move(Buffer.get()), nullptr, File, nullptr,
+      ExternalFS ? ExternalFS : llvm::vfs::getRealFileSystem());
   if (!VFS)
     return llvm::createFileError(File, llvm::errc::invalid_argument);
 
@@ -193,7 +195,8 @@ static llvm::Error loadAndValidateVFSOverlay(
 
 llvm::Expected<llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem>>
 SearchPathOptions::makeOverlayFileSystem(
-    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> BaseFS) const {
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> BaseFS,
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> ExternalFS) const {
   // TODO: This implementation is different to how Clang reads overlays in.
   // Expose a helper in Clang rather than doing this ourselves.
 
@@ -204,7 +207,8 @@ SearchPathOptions::makeOverlayFileSystem(
   bool hasOverlays = false;
   for (const auto &File : VFSOverlayFiles) {
     hasOverlays = true;
-    if (auto Err = loadAndValidateVFSOverlay(File, BaseFS, OverlayFS))
+    if (auto Err =
+            loadAndValidateVFSOverlay(File, BaseFS, ExternalFS, OverlayFS))
       AllErrors = llvm::joinErrors(std::move(AllErrors), std::move(Err));
   }
 

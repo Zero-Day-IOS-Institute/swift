@@ -683,7 +683,8 @@ public:
   UNSUPPORTED_DECL(PrefixOperator)
   UNSUPPORTED_DECL(PostfixOperator)
   UNSUPPORTED_DECL(MacroExpansion)
-  UNSUPPORTED_DECL(Using)
+  UNSUPPORTED_DECL(FileDefault)
+  UNSUPPORTED_DECL(HiddenTypeLayoutInfo)
 
   bool visitAbstractFunctionDecl(AbstractFunctionDecl *api,
                                  AbstractFunctionDecl *abi) {
@@ -981,7 +982,9 @@ public:
       .withSending(false)
       .withOwnershipSpecifier(ownership);
 
-    return AnyFunctionType::Param(ty, Identifier(), flags, Identifier());
+    // Discard scope information.
+    return AnyFunctionType::Param::bodyAccess(ty, Identifier(), flags,
+                                              Identifier());
   }
 
   /// Folds away \p original to one of \c Consuming , \c Borrowing , or
@@ -1006,6 +1009,7 @@ public:
       return ParamSpecifier::Consuming;
       break;
     }
+    llvm_unreachable("covered switch");
   }
 
   static GenericSignature normalizeGenericSignature(GenericSignature original) {
@@ -1025,13 +1029,14 @@ public:
   static std::optional<Type> tryNormalizeOutermostType(TypeBase *original) {
     // Function types: Eliminate anything that doesn't affect calling convention.
     if (auto func = original->getAs<AnyFunctionType>()) {
-      // Ignore `@escaping`, `@Sendable`, `sending` on result, and most
-      // isolation; they have no ABI effect.
+      // Ignore `@escaping`, `@Sendable`, `sending` on result, most isolation,
+      // and scope parameters; they have no ABI effect.
       auto normalizedExt = func->getExtInfo().intoBuilder()
         .withNoEscape(false)
         .withSendable(false)
         .withSendingResult(false)
         .withIsolation(normalizeIsolation(func->getIsolation()))
+        .withScopeSignature(ScopeSignature())
         .build();
 
       // Ignore ignorable parts of parameters.
@@ -1043,8 +1048,14 @@ public:
         normalizedParams.push_back(normalizedParam);
       }
 
+      SmallVector<AnyFunctionType::Yield, 1> normalizedYields;
+      for (auto yield : func->getYields()) {
+        normalizedYields.emplace_back(normalizeType(yield.getType()),
+                                      yield.getFlags());
+      }
+
       if (isa<FunctionType>(func))
-        return FunctionType::get(normalizedParams,
+        return FunctionType::get(normalizedParams, normalizedYields,
                                  normalizeType(func->getResult()),
                                  normalizedExt);
 
@@ -1052,11 +1063,15 @@ public:
 
       // Ignore ignorable parts of the generic signature.
       auto sig = original->getAs<GenericFunctionType>()->getGenericSignature();
-      return GenericFunctionType::get(normalizeGenericSignature(sig),
-                                      normalizedParams,
-                                      normalizeType(func->getResult()),
-                                      normalizedExt);
+      return GenericFunctionType::get(
+          normalizeGenericSignature(sig), normalizedParams, normalizedYields,
+          normalizeType(func->getResult()), normalizedExt);
     }
+
+    // Nominal types: Remove scope arguments, which only restrict lifetimes.
+    if (auto nominal = original->getAs<NominalType>();
+        nominal && nominal->hasScopeArgs())
+      return normalizeType(nominal->withoutScopeArgs());
 
     // Protocol-related types: Remove marker protocols.
     if (auto comp = original->getAs<ProtocolCompositionType>()) {

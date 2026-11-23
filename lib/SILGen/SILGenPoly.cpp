@@ -326,7 +326,8 @@ ManagedValue SILGenFunction::emitTangentVectorToOptionalTangentVector(
       constructorDecl,
       SubstitutionMap::get(constructorDecl->getGenericSignature(),
                            {wrappedType}, {diffConf}));
-  PreparedArguments args({AnyFunctionType::Param(optionalOfWrappedTanType)});
+  PreparedArguments args(
+      {AnyFunctionType::Param::bodyAccess(optionalOfWrappedTanType)});
   args.add(loc, RValue(*this, {optVal}, optionalOfWrappedTanType));
 
   auto result = emitApplyAllocatingInitializer(loc, initDecl, std::move(args),
@@ -456,7 +457,7 @@ RValue Transform::transform(RValue &&input,
 // Single @objc protocol value metatypes can be converted to the ObjC
 // Protocol class type.
 static bool isProtocolClass(Type t) {
-  auto classDecl = t->getClassOrBoundGenericClass();
+  auto classDecl = t->getClassDecl();
   if (!classDecl)
     return false;
 
@@ -489,7 +490,7 @@ ManagedValue Transform::transform(ManagedValue v,
   // expect this.
   if (v.getType().isAddress()) {
     auto &inputTL = SGF.getTypeLowering(v.getType());
-    if (!inputTL.isAddressOnly() || !SGF.silConv.useLoweredAddresses()) {
+    if (inputTL.isLoadableOrOpaque(SGF.F)) {
       v = emitManagedLoad(SGF, Loc, v, inputTL);
     }
   }
@@ -529,25 +530,6 @@ ManagedValue Transform::transform(ManagedValue v,
                            loweredResultTy.getOptionalObjectType(),
                            objectCtxt);
         });
-  }
-
-  // If the value is an optional, but the desired formal type isn't an
-  // optional or Any, force it.
-  if (inputIsOptional && !outputIsOptional &&
-      !outputSubstType->isExistentialType()) {
-    // isImplicitUnwrap is hardcoded true because the looseness in types of
-    // @objc witnesses/overrides that we're handling here only allows IUOs,
-    // not explicit Optionals.
-    v = SGF.emitCheckedGetOptionalValueFrom(Loc, v,
-                                            /*isImplicitUnwrap*/ true, 
-                                            SGF.getTypeLowering(v.getType()),
-                                            SGFContext());
-
-    // Check if we have any more conversions remaining.
-    if (v.getType() == loweredResultTy)
-      return v;
-
-    inputIsOptional = false;
   }
 
   // Optional-to-optional conversion.
@@ -612,10 +594,10 @@ ManagedValue Transform::transform(ManagedValue v,
   }
 
   //  - casts for classes
-  if (outputSubstType->getClassOrBoundGenericClass() &&
-      inputSubstType->getClassOrBoundGenericClass()) {
-    auto class1 = inputSubstType->getClassOrBoundGenericClass();
-    auto class2 = outputSubstType->getClassOrBoundGenericClass();
+  if (outputSubstType->getClassDecl() &&
+      inputSubstType->getClassDecl()) {
+    auto class1 = inputSubstType->getClassDecl();
+    auto class2 = outputSubstType->getClassDecl();
 
     // CF <-> Objective-C via toll-free bridging.
     if ((class1->getForeignClassKind() == ClassDecl::ForeignKind::CFType) ^
@@ -637,10 +619,10 @@ ManagedValue Transform::transform(ManagedValue v,
   }
 
   // - upcasts for collections
-  if (outputSubstType->getStructOrBoundGenericStruct() &&
-      inputSubstType->getStructOrBoundGenericStruct()) {
-    auto *inputStruct = inputSubstType->getStructOrBoundGenericStruct();
-    auto *outputStruct = outputSubstType->getStructOrBoundGenericStruct();
+  if (outputSubstType->getStructDecl() &&
+      inputSubstType->getStructDecl()) {
+    auto *inputStruct = inputSubstType->getStructDecl();
+    auto *outputStruct = outputSubstType->getStructDecl();
 
     // Attempt collection upcast only if input and output declarations match.
     if (inputStruct == outputStruct) {
@@ -668,7 +650,7 @@ ManagedValue Transform::transform(ManagedValue v,
   }
 
   //  - upcasts from an archetype
-  if (outputSubstType->getClassOrBoundGenericClass()) {
+  if (outputSubstType->getClassDecl()) {
     if (auto archetypeType = dyn_cast<ArchetypeType>(inputSubstType)) {
       if (archetypeType->getSuperclass()) {
         // Replace the cleanup with a new one on the superclass value so we
@@ -718,7 +700,7 @@ ManagedValue Transform::transform(ManagedValue v,
     auto inputLoweredTy = SGF.getLoweredType(AbstractionPattern::getOpaque(),
                                              inputSubstType);
     // FIXME: Gross workaround for incorrect opaque type erasure
-    if (loweredTy.getNominalOrBoundGenericNominal() &&
+    if (loweredTy.getNominalDecl() &&
         inputLoweredTy.is<OpaqueTypeArchetypeType>()) {
       // Woohoo!
       inputSubstType = loweredTy.getASTType();
@@ -737,7 +719,9 @@ ManagedValue Transform::transform(ManagedValue v,
     auto *protocol = SGF.getASTContext().getProtocol(
         KnownProtocolKind::Hashable);
     auto conformance = lookupConformance(inputSubstType, protocol);
-    auto addr = v.getType().isAddress() ? v : v.materialize(SGF, Loc);
+    auto addr = v;
+    if (SGF.silConv.useLoweredAddresses() && !v.getType().isAddress())
+      addr = v.materialize(SGF, Loc);
     auto result = SGF.emitAnyHashableErasure(Loc, addr, inputSubstType,
                                              conformance, ctxt);
     if (result.isInContext())
@@ -830,6 +814,23 @@ ManagedValue Transform::transform(ManagedValue v,
     }
   }
 
+  // IUO unwrapping. This only comes up in a handful of situations. Check for
+  // this last, to avoid accidentally missing some other conversion from an
+  // optional type to a non-optional, of which there are several.
+  if (inputIsOptional && !outputIsOptional) {
+    // isImplicitUnwrap is hardcoded true because the looseness in types of
+    // @objc witnesses/overrides that we're handling here only allows IUOs,
+    // not explicit Optionals.
+    v = SGF.emitCheckedGetOptionalValueFrom(Loc, v,
+                                            /*isImplicitUnwrap*/ true,
+                                            SGF.getTypeLowering(v.getType()),
+                                            SGFContext());
+
+    return transform(v, inputOrigType.getOptionalObjectType(), inputObjectType,
+                     outputOrigType, outputObjectType, loweredResultTy,
+                     SGFContext());
+  }
+
   // Should have handled the conversion in one of the cases above.
   v.dump();
   llvm_unreachable("Unhandled transform?");
@@ -917,7 +918,7 @@ ManagedValue Transform::transformTuple(ManagedValue inputTuple,
                                        SGFContext ctxt) {
   const TypeLowering &outputTL =
     SGF.getTypeLowering(outputLoweredTy);
-  assert((outputTL.isAddressOnly() == inputTuple.getType().isAddress() ||
+  assert((outputTL.getRecursiveProperties().isAddressOnly() == inputTuple.getType().isAddress() ||
           !SGF.silConv.useLoweredAddresses()) &&
          "expected loadable inputs to have been loaded");
 
@@ -933,7 +934,7 @@ ManagedValue Transform::transformTuple(ManagedValue inputTuple,
 
   // If the tuple is address only, we need to do the operation in memory.
   SILValue outputAddr;
-  if (outputTL.isAddressOnly() && SGF.silConv.useLoweredAddresses())
+  if (!outputTL.isLoadableOrOpaque(SGF.F))
     outputAddr = SGF.getBufferForExprResult(Loc, outputLoweredTy, ctxt);
 
   // Explode the tuple into individual managed values.
@@ -947,7 +948,7 @@ ManagedValue Transform::transformTuple(ManagedValue inputTuple,
   for (auto index : indices(inputType->getElementTypes())) {
     auto &inputEltTL = SGF.getTypeLowering(inputElts[index].getType());
     ManagedValue inputElt = inputElts[index];
-    if (inputElt.getType().isAddress() && !inputEltTL.isAddressOnly()) {
+    if (inputElt.getType().isAddress() && !inputEltTL.getRecursiveProperties().isAddressOnly()) {
       inputElt = emitManagedLoad(SGF, Loc, inputElt, inputEltTL);
     }
 
@@ -965,7 +966,7 @@ ManagedValue Transform::transformTuple(ManagedValue inputTuple,
       SILValue outputEltAddr =
         SGF.B.createTupleElementAddr(Loc, outputAddr, index);
       auto &outputEltTL = SGF.getTypeLowering(outputEltLoweredTy);
-      assert(outputEltTL.isAddressOnly() == inputEltTL.isAddressOnly());
+      assert(outputEltTL.getRecursiveProperties().isAddressOnly() == inputEltTL.getRecursiveProperties().isAddressOnly());
       auto cleanup =
         SGF.enterDormantTemporaryCleanup(outputEltAddr, outputEltTL);
       outputEltTemp.emplace(outputEltAddr, cleanup);
@@ -982,7 +983,7 @@ ManagedValue Transform::transformTuple(ManagedValue inputTuple,
     // later assembly into a tuple.
     if (!outputEltTemp) {
       assert(outputElt);
-      assert(!inputEltTL.isAddressOnly() || !SGF.silConv.useLoweredAddresses());
+      assert(inputEltTL.isLoadableOrOpaque(SGF.F));
       outputElts.push_back(outputElt);
       continue;
     }
@@ -1255,7 +1256,7 @@ class ParamInfo {
       return false;
     }
     auto &tl = getTypeLowering(SGF);
-    if (tl.isAddressOnly() && SGF.silConv.useLoweredAddresses()) {
+    if (!tl.isLoadableOrOpaque(SGF.F)) {
       // In address-lowered mode, address-only types can't be loaded in the
       // first place before being store_borrow'd.
       return false;
@@ -1264,7 +1265,7 @@ class ParamInfo {
       // Can only store_borrow into a temporary allocation for @in_guaranteed.
       return false;
     }
-    if (tl.isTrivial()) {
+    if (tl.isTrivial(&SGF.F)) {
       // Can't store_borrow a trivial type.
       return false;
     }
@@ -2730,9 +2731,10 @@ void TranslateArguments::expandOuterSingleInnerParam(
   // Pull out a scalar component from the pack and process that.
   } else {
     auto outerValue = outerParam.projectPackComponent(SGF, Loc);
-    expandSingleOuterParam(innerOrigType, innerSubstParam,
-                           outerParam.getOrigType(), outerParam.getSubstParam(),
-                           outerValue);
+    expandSingleOuterParam(
+        innerOrigType, innerSubstParam,
+        outerParam.getOrigType().getPackExpansionPatternType(),
+        outerParam.getSubstParam(), outerValue);
   }
 
   outerParam.advance();
@@ -2953,8 +2955,8 @@ static ManagedValue applyTrivialConversions(SILGenFunction &SGF,
   if (innerASTTy == outerASTTy) {
     return innerValue;
   }
-  if (innerASTTy->getClassOrBoundGenericClass()
-      && outerASTTy->getClassOrBoundGenericClass()) {
+  if (innerASTTy->getClassDecl()
+      && outerASTTy->getClassDecl()) {
     if (outerASTTy->isExactSuperclassOf(innerASTTy)) {
       return SGF.B.createUpcast(loc, innerValue, outerType);
     } else if (innerASTTy->isExactSuperclassOf(outerASTTy)) {
@@ -3014,17 +3016,39 @@ forwardFunctionArguments(SILGenFunction &SGF, SILLocation loc,
     }
 
     if (isGuaranteedParameterInCallee(argTy.getConvention())) {
-      auto forwardedArg =
-          SGF.emitManagedBeginBorrow(loc, arg.getValue()).getValue();
-      if (forwardedArg->getType().isObject() && fTy->hasGuaranteedResult()) {
-        forwardedArg = SGF.B.createUncheckedOwnership(loc, forwardedArg);
-      }
-      forwardedArgs.push_back(forwardedArg);
+      forwardedArgs.push_back(
+          SGF.emitManagedBeginBorrow(loc, arg.getValue()).getValue());
       continue;
     }
 
     forwardedArgs.push_back(arg.getValue());
   }
+}
+
+/// Emit a @guaranteed borrow accessor result as a borrow introducer and emit
+/// unchecked_ownership which SILGenCleanup with fixup.
+static SILValue prepareGuaranteedResultForReturn(SILGenFunction &SGF,
+                                                 SILLocation loc,
+                                                 SILValue result) {
+  // The address result of an accessor with an object self is an interior
+  // pointer of self. Emit unchecked_ownership for self, which SILGenCleanup
+  // fixes up.
+  if (auto *apply = dyn_cast<ApplyInst>(result)) {
+    if (auto *selfOperand =
+            apply->getSelfObjectOfAddressBorrowMutateAccessorResult()) {
+      SILBuilderWithScope builder(apply);
+      selfOperand->set(
+          builder.createUncheckedOwnership(loc, selfOperand->get()));
+      return result;
+    }
+  }
+  if (!result->isBorrowAccessorResult() ||
+      result->getOwnershipKind() != OwnershipKind::Guaranteed) {
+    return result;
+  }
+  auto borrowIntroducerResult =
+      SGF.emitManagedBorrowedRValueWithCleanup(result);
+  return SGF.B.createUncheckedOwnership(loc, borrowIntroducerResult).getValue();
 }
 
 namespace {
@@ -5763,6 +5787,7 @@ static void buildThunkBody(SILGenFunction &SGF, SILLocation loc,
         // and wrap it up as an `Optional<any Actor>`.
         llvm::report_fatal_error("Should never see this?!");
       }
+      llvm_unreachable("covered switch");
     }();
 
     assert(forwardedIsolationValue);
@@ -5841,12 +5866,9 @@ static ManagedValue createPartialApplyOfThunk(SILGenFunction &SGF,
     thunkArgs.push_back(ManagedValue::forObjectRValueWithoutOwnership(value));
   }
 
-  return
-    SGF.B.createPartialApply(loc, thunkValue,
-                             interfaceSubs, thunkArgs,
-                             toType->getCalleeConvention(),
-                             toType->getIsolation(),
-                             toType->isCalledOnce());
+  return SGF.B.createPartialApply(
+      loc, thunkValue, interfaceSubs, thunkArgs, toType->getCalleeConvention(),
+      toType->getIsolation(), toType->getExecutionSemantics());
 }
 
 static ManagedValue createDifferentiableFunctionThunk(
@@ -5913,6 +5935,9 @@ static ManagedValue createThunk(SILGenFunction &SGF,
   assert(expectedType->getLanguage() ==
          fn.getType().castTo<SILFunctionType>()->getLanguage() &&
          "bridging in re-abstraction thunk?");
+  // We cannot reabstract coroutines (yet)
+  assert(!expectedType->isCoroutine() && !sourceType->isCoroutine() &&
+         "cannot reabstract a coroutine");
 
   // Declare the thunk.
   SubstitutionMap interfaceSubs;
@@ -6333,8 +6358,7 @@ ManagedValue SILGenFunction::getThunkedAutoDiffLinearMap(
     if (linearMapFnType != linearMapUnsubstFnType) {
       auto unsubstType =
           SILType::getPrimitiveObjectType(linearMapUnsubstFnType);
-      linearMap = B.createConvertFunction(loc, linearMap, unsubstType,
-                                          /*withoutActuallyEscaping*/ false);
+      linearMap = B.createConvertFunction(loc, linearMap, unsubstType);
     }
     auto thunkedFn = createPartialApplyOfThunk(
         *this, loc, thunk, interfaceSubs, dynamicSelfType, toType, linearMap,
@@ -6741,7 +6765,7 @@ SILFunction *SILGenModule::getOrCreateCustomDerivativeThunk(
     auto *classDecl = thunkFnTy->getParameters()
                           .back()
                           .getInterfaceType()
-                          ->getClassOrBoundGenericClass();
+                          ->getClassDecl();
     assert(classDecl && "Expected last argument to have class type");
     auto classMetatype = MetatypeType::get(
         classDecl->getDeclaredInterfaceType(), MetatypeRepresentation::Thick);
@@ -6774,6 +6798,12 @@ SILFunction *SILGenModule::getOrCreateCustomDerivativeThunk(
       return false;
     auto selfParamIndex = origFnTy->getNumParameters() - 1;
     if (!config.parameterIndices->contains(selfParamIndex))
+      return false;
+    // A mutating self tangent is not returned from the reverse-mode pullback
+    // but passed as inout, so there is no self result to reorder.
+    // Forward-mode differentials still need this self-reordering.
+    if (kind == AutoDiffDerivativeFunctionKind::VJP &&
+        origFnTy->getSelfParameter().isIndirectMutating())
       return false;
     return config.parameterIndices->getNumIndices() > 1;
   };
@@ -6839,9 +6869,8 @@ SILFunction *SILGenModule::getOrCreateCustomDerivativeThunk(
   auto targetLinearMapUnsubstFnType =
       SILType::getPrimitiveObjectType(targetLinearMapFnType);
   if (linearMap.getType() != targetLinearMapUnsubstFnType) {
-    linearMap = thunkSGF.B.createConvertFunction(
-        loc, linearMap, targetLinearMapUnsubstFnType,
-        /*withoutActuallyEscaping*/ false);
+    linearMap = thunkSGF.B.createConvertFunction(loc, linearMap,
+                                                 targetLinearMapUnsubstFnType);
   }
 
   // Return original results and thunked differential/pullback.
@@ -6914,13 +6943,19 @@ ManagedValue Transform::transformFunction(ManagedValue fn,
   }
 
   // We do not, conversion is trivial.
+  //
+  // Only a thick function can have execution semantics; thin-to-thick adds
+  // them.
   auto expectedEI = expectedFnType->getExtInfo().intoBuilder();
-  auto newEI = expectedEI.withRepresentation(fnType->getRepresentation())
-                   .withNoEscape(fnType->getRepresentation() ==
-                                         SILFunctionType::Representation::Thick
-                                     ? fnType->isNoEscape()
-                                     : expectedFnType->isNoEscape())
-                   .build();
+  bool isThick =
+      fnType->getRepresentation() == SILFunctionType::Representation::Thick;
+  auto newEI =
+      expectedEI.withRepresentation(fnType->getRepresentation())
+          .withNoEscape(isThick ? fnType->isNoEscape()
+                                : expectedFnType->isNoEscape())
+          .withExecutionSemantics(
+              isThick ? expectedFnType->getExecutionSemantics() : std::nullopt)
+          .build();
   auto newFnType =
       adjustFunctionType(expectedFnType, newEI, fnType->getCalleeConvention(),
                          fnType->getWitnessMethodConformanceOrInvalid());
@@ -7280,6 +7315,7 @@ SILGenFunction::emitVTableThunk(SILDeclRef base,
         }
       }
       }
+      llvm_unreachable("covered switch");
     }();
 
     args.push_back(B.convertToImplicitActor(loc, arg));
@@ -7326,6 +7362,7 @@ SILGenFunction::emitVTableThunk(SILDeclRef base,
       emitApplyWithRethrow(loc, derivedRef,
                             SILType::getPrimitiveObjectType(derivedFTy),
                             subs, args);
+    implResult = prepareGuaranteedResultForReturn(*this, loc, implResult);
 
     // Reabstract the return.
     result = resultPlanner->execute(implResult, derivedFTy);
@@ -7357,9 +7394,8 @@ SILGenFunction::emitVTableThunk(SILDeclRef base,
     }
 
     // End the inner coroutine normally.
-    emitEndApplyWithRethrow(loc, token, allocation);
-
-    result = B.createTuple(loc, {});
+    result = emitEndApplyWithRethrow(loc, token, allocation,
+                                     SILType::getEmptyTupleType(getASTContext()));
     break;
   }
 
@@ -7491,7 +7527,10 @@ getWitnessFunctionRef(SILGenFunction &SGF,
           NormalDifferentiableFunctionTypeComponent(derivativeId->getKind()),
           diffFn);
     }
-    return SGF.emitGlobalFunctionRef(loc, witness);
+
+    return SGF.emitGlobalFunctionRef(
+        loc, SGF.SGM.getBackDeploymentEntryPoint(
+                 witness, SGF.F.getResilienceExpansion()));
   case WitnessDispatchKind::Dynamic:
     assert(!witness.getDerivativeFunctionIdentifier());
     return SGF.emitDynamicMethodRef(loc, witness, witnessFTy).getValue();
@@ -7642,9 +7681,9 @@ void SILGenFunction::emitProtocolWitness(
       // Load the actor instance if necessary.
       if (actorParamVal.getType().isAddress()) {
         auto &actorInstanceTL = getTypeLowering(actorParamVal.getType());
-        if (!actorInstanceTL.isAddressOnly()) {
-          actorParamVal =
-              emitManagedLoad(*this, loc, actorParamVal, actorInstanceTL);
+        if (!actorInstanceTL.getRecursiveProperties().isAddressOnly()) {
+          actorParamVal = emitManagedLoad(
+              *this, loc, actorParamVal, actorInstanceTL);
         }
       }
 
@@ -7802,6 +7841,7 @@ void SILGenFunction::emitProtocolWitness(
         }
       }
       }
+      llvm_unreachable("covered switch");
     }();
 
     args.push_back(B.convertToImplicitActor(loc, arg));
@@ -7838,6 +7878,8 @@ void SILGenFunction::emitProtocolWitness(
   case SILCoroutineKind::None: {
     SILValue witnessResultValue =
       emitApplyWithRethrow(loc, witnessFnRef, witnessSILTy, witnessSubs, args);
+    witnessResultValue =
+        prepareGuaranteedResultForReturn(*this, loc, witnessResultValue);
 
     // Reabstract the result value.
     reqtResultValue = resultPlanner->execute(witnessResultValue, witnessFTy);
@@ -7867,9 +7909,8 @@ void SILGenFunction::emitProtocolWitness(
     }
 
     // End the inner coroutine normally.
-    emitEndApplyWithRethrow(loc, token, allocation);
-
-    reqtResultValue = B.createTuple(loc, {});
+    reqtResultValue = emitEndApplyWithRethrow(loc, token, allocation,
+                                             SILType::getEmptyTupleType(getASTContext()));
     break;
   }
 

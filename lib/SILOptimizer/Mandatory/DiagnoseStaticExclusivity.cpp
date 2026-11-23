@@ -29,20 +29,16 @@
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/Stmt.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceLoc.h"
 #include "swift/Parse/Lexer.h"
-#include "swift/SIL/CFG.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/MemAccessUtils.h"
-#include "swift/SIL/Projection.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SILOptimizer/Analysis/AccessSummaryAnalysis.h"
 #include "swift/SILOptimizer/Analysis/PostOrderAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
-#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
@@ -801,17 +797,6 @@ static void checkCaptureAccess(ApplySite Apply, AccessState &State) {
   }
 }
 
-/// If the given values has a SILFunctionType or an Optional<SILFunctionType>,
-/// return the SILFunctionType. Otherwise, return an invalid type.
-static CanSILFunctionType getSILFunctionTypeForValue(SILValue arg) {
-  SILType argTy = arg->getType();
-  // Handle `Optional<@convention(block) @noescape (_)->(_)>`
-  if (auto optionalObjTy = argTy.getOptionalObjectType())
-    argTy = optionalObjTy;
-
-  return argTy.getAs<SILFunctionType>();
-}
-
 /// Recursively check for conflicts with in-progress accesses at the given
 /// apply.
 ///
@@ -841,16 +826,14 @@ static void checkForViolationAtApply(ApplySite Apply, AccessState &State) {
   // First, check access to variables immediately captured at this apply site.
   checkCaptureAccess(Apply, State);
 
-  // Next, recursively check any noescape closures passed as arguments at this
-  // apply site.
+  // Next, recursively check any non-escaping closures passed as arguments at
+  // this apply site. This includes a closure with an @inout_aliasable capture
+  // whose function type is escaping. MandatoryAllocBoxToStack creates these when
+  // it promotes a box captured by a closure that is only called.
   TinyPtrVector<PartialApplyInst *> partialApplies;
-  for (SILValue Argument : Apply.getArguments()) {
-    auto FnType = getSILFunctionTypeForValue(Argument);
-    if (!FnType || !FnType->isNoEscape())
-      continue;
+  for (SILValue Argument : Apply.getArguments())
+    findNonEscapingClosuresForFunctionValue(Argument, partialApplies);
 
-    findClosuresForFunctionValue(Argument, partialApplies);
-  }
   // Continue recursively walking up the chain of applies if necessary.
   findClosuresForFunctionValue(Apply.getCallee(), partialApplies);
 

@@ -11,17 +11,11 @@
 
 #include "ArgsToFrontendOutputsConverter.h"
 
-#include "ArgsToFrontendInputsConverter.h"
 #include "ArgsToFrontendOptionsConverter.h"
 #include "swift/AST/DiagnosticsFrontend.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/OutputFileMap.h"
-#include "swift/Basic/Platform.h"
-#include "swift/Frontend/Frontend.h"
 #include "swift/Option/Options.h"
 #include "swift/Option/SanitizerOptions.h"
-#include "swift/Strings.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/ArgList.h"
@@ -29,6 +23,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/LineIterator.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/VirtualFileSystem.h"
 
 using namespace swift;
 using namespace llvm::opt;
@@ -40,7 +35,7 @@ bool ArgsToFrontendOutputsConverter::convert(
 
   std::optional<OutputFilesComputer> ofc = OutputFilesComputer::create(
       Args, Diags, InputsAndOutputs,
-      {"output", options::OPT_o, options::OPT_output_filelist, "-o"});
+      {"output", options::OPT_o, options::OPT_output_filelist, "-o"}, FS);
   if (!ofc)
     return true;
   std::optional<std::vector<std::string>> mains = ofc->computeOutputFiles();
@@ -54,7 +49,8 @@ bool ArgsToFrontendOutputsConverter::convert(
         Args, Diags, InputsAndOutputs,
         {"index unit output path", options::OPT_index_unit_output_path,
          options::OPT_index_unit_output_path_filelist,
-         "-index-unit-output-path"});
+         "-index-unit-output-path"},
+        FS);
     if (!iuofc)
       return true;
     indexMains = iuofc->computeOutputFiles();
@@ -65,8 +61,8 @@ bool ArgsToFrontendOutputsConverter::convert(
   }
 
   std::optional<std::vector<SupplementaryOutputPaths>> supplementaries =
-      SupplementaryOutputPathsComputer(Args, Diags, InputsAndOutputs, *mains,
-                                       ModuleName)
+      SupplementaryOutputPathsComputer(Args, Diags, FS, InputsAndOutputs,
+                                       *mains, ModuleName)
           .computeOutputPaths();
   if (!supplementaries)
     return true;
@@ -80,9 +76,10 @@ bool ArgsToFrontendOutputsConverter::convert(
 
 std::optional<std::vector<std::string>>
 ArgsToFrontendOutputsConverter::readOutputFileList(const StringRef filelistPath,
-                                                   DiagnosticEngine &diags) {
+                                                   DiagnosticEngine &diags,
+                                                   llvm::vfs::FileSystem &fs) {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
-      llvm::MemoryBuffer::getFile(filelistPath);
+      fs.getBufferForFile(filelistPath);
   if (!buffer) {
     diags.diagnose(SourceLoc(), diag::cannot_open_file, filelistPath,
                    buffer.getError().message());
@@ -98,28 +95,33 @@ ArgsToFrontendOutputsConverter::readOutputFileList(const StringRef filelistPath,
 std::optional<std::vector<std::string>>
 OutputFilesComputer::getOutputFilenamesFromCommandLineOrFilelist(
     const ArgList &args, DiagnosticEngine &diags, options::ID singleOpt,
-    options::ID filelistOpt) {
+    options::ID filelistOpt, llvm::vfs::FileSystem &fs) {
   if (const Arg *A = args.getLastArg(filelistOpt)) {
     assert(!args.hasArg(singleOpt) &&
            "don't use -o with -output-filelist or -index-unit-output-path with "
            " -index-unit-output-filelist");
     return ArgsToFrontendOutputsConverter::readOutputFileList(A->getValue(),
-                                                              diags);
+                                                              diags, fs);
   }
   return args.getAllArgValues(singleOpt);
 }
 
-std::optional<OutputFilesComputer> OutputFilesComputer::create(
-    const llvm::opt::ArgList &args, DiagnosticEngine &diags,
-    const FrontendInputsAndOutputs &inputsAndOutputs, OutputOptInfo optInfo) {
+std::optional<OutputFilesComputer>
+OutputFilesComputer::create(const llvm::opt::ArgList &args,
+                            DiagnosticEngine &diags,
+                            const FrontendInputsAndOutputs &inputsAndOutputs,
+                            OutputOptInfo optInfo, llvm::vfs::FileSystem &fs) {
   std::optional<std::vector<std::string>> outputArguments =
       getOutputFilenamesFromCommandLineOrFilelist(args, diags, optInfo.SingleID,
-                                                  optInfo.FilelistID);
+                                                  optInfo.FilelistID, fs);
   if (!outputArguments)
     return std::nullopt;
+  auto isDirectory = [&](StringRef path) {
+    auto status = fs.status(path);
+    return status && status->isDirectory();
+  };
   const StringRef outputDirectoryArgument =
-      outputArguments->size() == 1 &&
-              llvm::sys::fs::is_directory(outputArguments->front())
+      outputArguments->size() == 1 && isDirectory(outputArguments->front())
           ? StringRef(outputArguments->front())
           : StringRef();
   ArrayRef<std::string> outputFileArguments =
@@ -256,10 +258,10 @@ OutputFilesComputer::deriveOutputFileFromParts(StringRef dir,
 }
 
 SupplementaryOutputPathsComputer::SupplementaryOutputPathsComputer(
-    const ArgList &args, DiagnosticEngine &diags,
+    const ArgList &args, DiagnosticEngine &diags, llvm::vfs::FileSystem &fs,
     const FrontendInputsAndOutputs &inputsAndOutputs,
     ArrayRef<std::string> outputFiles, StringRef moduleName)
-    : Args(args), Diags(diags), InputsAndOutputs(inputsAndOutputs),
+    : Args(args), Diags(diags), FS(fs), InputsAndOutputs(inputsAndOutputs),
       OutputFiles(outputFiles), ModuleName(moduleName),
       RequestedAction(
           ArgsToFrontendOptionsConverter::determineRequestedAction(Args)) {}
@@ -454,7 +456,8 @@ SupplementaryOutputPathsComputer::getSupplementaryOutputPathsFromArguments()
     sop.ModuleDocOutputPath = (*moduleDocOutput)[moduleIndex];
     sop.DependenciesFilePath = (*dependenciesFile)[moduleIndex];
     sop.ReferenceDependenciesFilePath = (*referenceDependenciesFile)[moduleIndex];
-    sop.SerializedDiagnosticsPath = (*serializedDiagnostics)[moduleIndex];
+    sop.LLVMBitcodeDiagnosticsPath = (*serializedDiagnostics)[moduleIndex];
+    sop.SARIFDiagnosticsPath = (*serializedDiagnostics)[moduleIndex];
     sop.LoadedModuleTracePath = (*loadedModuleTrace)[moduleIndex];
     sop.TBDPath = (*TBD)[moduleIndex];
     sop.ModuleInterfaceOutputPath = (*moduleInterfaceOutput)[moduleIndex];
@@ -570,6 +573,15 @@ static bool shouldEmitFineModuleTrace(FrontendOptions::ActionType action) {
   case swift::FrontendOptions::ActionType::EmitPolyglotAST:
     return false;
   }
+  llvm_unreachable("covered switch");
+}
+
+/// Whether diagnostics are serialized as SARIF rather than in the binary
+/// format, as requested by -serialize-diagnostics=<format>.
+static bool serializesDiagnosticsAsSARIF(const llvm::opt::ArgList &Args) {
+  const llvm::opt::Arg *A =
+      Args.getLastArg(options::OPT_serialize_diagnostics_EQ);
+  return A && StringRef(A->getValue()) == "sarif";
 }
 
 std::optional<SupplementaryOutputPaths>
@@ -598,10 +610,26 @@ SupplementaryOutputPathsComputer::computeOutputPathsForOneInput(
       file_types::TY_ConstValues, "",
       defaultSupplementaryOutputPathExcludingExtension);
 
-  auto serializedDiagnosticsPath = determineSupplementaryOutputFilename(
-      OPT_serialize_diagnostics, pathsFromArguments.SerializedDiagnosticsPath,
-      file_types::TY_SerializedDiagnostics, "",
-      defaultSupplementaryOutputPathExcludingExtension);
+  // Diagnostics are serialized in one format per invocation, so only the
+  // requested format contributes a path. The other is left empty, so that it
+  // is not reported as an output of the compilation.
+  const bool serializeAsSARIF = serializesDiagnosticsAsSARIF(Args);
+
+  auto serializedDiagnosticsPath =
+      serializeAsSARIF ? std::string()
+                       : determineSupplementaryOutputFilename(
+                             OPT_serialize_diagnostics,
+                             pathsFromArguments.LLVMBitcodeDiagnosticsPath,
+                             file_types::TY_SerializedDiagnostics, "",
+                             defaultSupplementaryOutputPathExcludingExtension);
+
+  auto sarifDiagnosticsPath =
+      serializeAsSARIF ? determineSupplementaryOutputFilename(
+                             OPT_serialize_diagnostics,
+                             pathsFromArguments.SARIFDiagnosticsPath,
+                             file_types::TY_SARIFDiagnostics, "",
+                             defaultSupplementaryOutputPathExcludingExtension)
+                       : std::string();
 
   // There is no non-path form of -emit-fixits-path
   auto fixItsOutputPath = pathsFromArguments.FixItsOutputPath;
@@ -701,7 +729,8 @@ SupplementaryOutputPathsComputer::computeOutputPathsForOneInput(
   sop.ModuleDocOutputPath = moduleDocOutputPath;
   sop.DependenciesFilePath = dependenciesFilePath;
   sop.ReferenceDependenciesFilePath = referenceDependenciesFilePath;
-  sop.SerializedDiagnosticsPath = serializedDiagnosticsPath;
+  sop.LLVMBitcodeDiagnosticsPath = serializedDiagnosticsPath;
+  sop.SARIFDiagnosticsPath = sarifDiagnosticsPath;
   sop.FixItsOutputPath = fixItsOutputPath;
   sop.LoadedModuleTracePath = loadedModuleTracePath;
   sop.FineModuleTracePath = FineModuleTracePath.str().str();
@@ -747,6 +776,9 @@ SupplementaryOutputPathsComputer::determineSupplementaryOutputFilename(
       return true;
     if (emitOpt == options::OPT_save_optimization_record &&
         Args.hasArg(options::OPT_save_optimization_record_EQ))
+      return true;
+    if (emitOpt == options::OPT_serialize_diagnostics &&
+        Args.hasArg(options::OPT_serialize_diagnostics_EQ))
       return true;
     return false;
   };
@@ -856,7 +888,7 @@ SupplementaryOutputPathsComputer::readSupplementaryOutputFileMap() const {
 
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer = nullptr;
   for (unsigned I = 0; I < BadFileDescriptorRetryCount + 1; ++I) {
-    buffer = llvm::MemoryBuffer::getFile(supplementaryFileMapPath);
+    buffer = FS.getBufferForFile(supplementaryFileMapPath);
     if (buffer)
       break;
     if (buffer.getError().value() != EBADF)

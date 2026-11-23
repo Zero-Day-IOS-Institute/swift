@@ -25,14 +25,23 @@
 
 #include <dlfcn.h>
 
-#include <cstdio>
+
+#ifdef SWIFT_STDLIB_OVERRIDABLE_RETAIN_RELEASE
+#include <atomic>
+// Defined in HeapObject.cpp.
+SWIFT_RUNTIME_EXPORT
+std::atomic<bool>
+    _swift_enableSwizzlingOfAllocationAndRefCountingFunctions_forInstrumentsOnly;
+#endif
 
 namespace swift {
 namespace threading_impl {
 
 SWIFT_THREADING_EXPORT bool _swift_tsan_enabled = false;
-SWIFT_THREADING_EXPORT void (*_swift_tsan_acquire)(const void *) = nullptr;
-SWIFT_THREADING_EXPORT void (*_swift_tsan_release)(const void *) = nullptr;
+SWIFT_THREADING_EXPORT void (* __ptrauth_swift_thread_sanitizer_hook
+                             _swift_tsan_acquire)(const void *) = nullptr;
+SWIFT_THREADING_EXPORT void (* __ptrauth_swift_thread_sanitizer_hook
+                             _swift_tsan_release)(const void *) = nullptr;
 
 // The TSan library code will call this function when it starts up
 extern "C" SWIFT_ATTRIBUTE_FOR_EXPORTS
@@ -42,6 +51,13 @@ void __tsan_on_initialize() {
                                                       "__tsan_acquire");
   _swift_tsan_release = (void (*)(const void *))dlsym(RTLD_DEFAULT,
                                                       "__tsan_release");
+
+#ifdef SWIFT_STDLIB_OVERRIDABLE_RETAIN_RELEASE
+  // We want to let TSan know when a release has occurred - this is required
+  // for letting it know about the synchronization used by CoW, and deinits
+  _swift_enableSwizzlingOfAllocationAndRefCountingFunctions_forInstrumentsOnly
+      .store(true, std::memory_order_relaxed);
+#endif
 
   // Always call through to the next image; this won't work on macOS, but it's
   // important on Linux to allow others to hook into the thread sanitizer if

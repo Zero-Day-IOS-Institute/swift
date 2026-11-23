@@ -12,7 +12,6 @@
 
 #include "swift/SILOptimizer/Utils/SILIsolationInfo.h"
 
-#include "swift/AST/ASTWalker.h"
 #include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/DistributedDecl.h"
 #include "swift/AST/ExistentialLayout.h"
@@ -349,7 +348,7 @@ getSelfFunctionArgumentForRefElementAddr(SILValue value) {
   if (!lbi)
     return {};
 
-  auto *asi = dyn_cast<AllocStackInst>(lbi->getOperand());
+  auto *asi = dyn_cast<AllocStackInst>(lbi->getAddress());
   if (!asi || !asi->getDecl()->isActorSelf())
     return {};
   return self;
@@ -418,7 +417,7 @@ static SILIsolationInfo computeIsolationForClassField(SILValue queriedValue,
   }
 
   // Then check if our classValue is an any Actor.
-  if (auto *nomDecl = classValue->getType().getNominalOrBoundGenericNominal();
+  if (auto *nomDecl = classValue->getType().getNominalDecl();
       nomDecl && nomDecl->isAnyActor()) {
     return SILIsolationInfo::getActorInstanceIsolated(queriedValue, classValue,
                                                       nomDecl);
@@ -430,7 +429,7 @@ static SILIsolationInfo computeIsolationForClassField(SILValue queriedValue,
     if (auto *nomDecl =
             classValue->getType()
                 .getLoweredInstanceTypeOfMetatype(classValue->getFunction())
-                .getNominalOrBoundGenericNominal()) {
+                .getNominalDecl()) {
 
       // See if the nominal decl is global actor isolated. In such a case, we
       // know that the metatype is also actor isolated.
@@ -712,7 +711,7 @@ SILIsolationInfo SILIsolationInfo::get(SILInstruction *inst) {
       if (funcType->hasSelfParam()) {
         auto selfParam = funcType->getSelfInstanceType(
             fri->getModule(), func->getTypeExpansionContext());
-        if (auto *nomDecl = selfParam->getNominalOrBoundGenericNominal()) {
+        if (auto *nomDecl = selfParam->getNominalDecl()) {
           auto nomDeclIsolation = swift::getActorIsolation(nomDecl);
           if (nomDeclIsolation.isGlobalActor()) {
             return SILIsolationInfo::getGlobalActorIsolated(
@@ -862,7 +861,7 @@ SILIsolationInfo SILIsolationInfo::get(SILInstruction *inst) {
 
   if (auto *asi = dyn_cast<AllocStackInst>(inst)) {
     if (asi->isFromVarDecl()) {
-      if (auto *varDecl = asi->getLoc().getAsASTNode<VarDecl>()) {
+      if (auto *varDecl = asi->getDecl()) {
         auto isolation = swift::getActorIsolation(varDecl);
         if (isolation.getKind() == ActorIsolation::NonisolatedUnsafe) {
           return SILIsolationInfo::getDisconnected(
@@ -882,7 +881,7 @@ SILIsolationInfo SILIsolationInfo::get(SILInstruction *inst) {
     if (mvi->isFromVarDecl()) {
       if (auto *debugInfo = getSingleDebugUse(mvi)) {
         if (auto *dbg = dyn_cast<DebugValueInst>(debugInfo->getUser())) {
-          if (auto *varDecl = dbg->getLoc().getAsASTNode<VarDecl>()) {
+          if (auto *varDecl = dbg->getDecl()) {
             auto isolation = swift::getActorIsolation(varDecl);
             if (isolation.getKind() == ActorIsolation::NonisolatedUnsafe) {
               return SILIsolationInfo::getDisconnected(
@@ -961,7 +960,7 @@ SILIsolationInfo SILIsolationInfo::get(SILArgument *arg) {
       // Handle a switch_enum from a global-actor-isolated type.
       if (auto *swi = dyn_cast<SwitchEnumInst>(singleTerm)) {
         auto enumDecl =
-            swi->getOperand()->getType().getEnumOrBoundGenericEnum();
+            swi->getOperand()->getType().getEnumDecl();
         return SILIsolationInfo::getGlobalActorIsolated(arg, enumDecl);
       }
 
@@ -1011,10 +1010,17 @@ SILIsolationInfo SILIsolationInfo::get(SILArgument *arg) {
   // sync with that code.
   if (!fArg->isIndirectResult() && !fArg->isIndirectErrorResult() &&
       fArg->isClosureCapture()) {
-    if (auto declRef = func->getDeclRef();
-        declRef && declRef.isAsyncLetClosure) {
-      return SILIsolationInfo::getDisconnected(
-          isClosureCapturedNonisolatedUnsafe);
+    if (auto declRef = func->getDeclRef()) {
+      if (declRef.isAsyncLetClosure) {
+        return SILIsolationInfo::getDisconnected(
+            isClosureCapturedNonisolatedUnsafe);
+      }
+
+      // The captures of non-escaping at-most-once closures that are inferred
+      // to be `sending` are disconnected.
+      if (isInferredSendingClosureCapture(fArg))
+        return SILIsolationInfo::getDisconnected(
+            isClosureCapturedNonisolatedUnsafe);
     }
   }
 
@@ -1242,7 +1248,9 @@ SILIsolationInfo SILIsolationInfo::getForCastConformances(
   return {};
 }
 
-/// Retrieve a suitable destination value for the cast instruction.
+/// Retrieve a suitable destination value for the cast instruction, or an
+/// invalid value if the cast produces none -- `checked_cast_addr_br test_only`
+/// reports only whether the cast would succeed.
 ///
 /// TODO: This should probably be SILDynamicCastInst::getDest(), but that has
 /// unimplemented TODOs.
@@ -1258,6 +1266,7 @@ static SILValue destValueForDynamicCast(SILDynamicCastInst dynCast) {
     case SILDynamicCastKind::UnconditionalCheckedCastInst:
       return cast<UnconditionalCheckedCastInst>(inst);
   }
+  llvm_unreachable("covered switch");
 }
 
 SILIsolationInfo SILIsolationInfo::getConformanceIsolation(SILInstruction *inst) {
@@ -1274,8 +1283,13 @@ SILIsolationInfo SILIsolationInfo::getConformanceIsolation(SILInstruction *inst)
 
   // Dynamic casts.
   if (auto dynCast = SILDynamicCastInst::getAs(inst)) {
+    // A cast that produces no value has nothing to carry an isolated
+    // conformance.
+    SILValue dest = destValueForDynamicCast(dynCast);
+    if (!dest)
+      return {};
     return getForCastConformances(
-        destValueForDynamicCast(dynCast),
+        dest,
         dynCast.getSourceFormalType(),
         dynCast.getTargetFormalType());
   }
@@ -1449,6 +1463,7 @@ bool SILIsolationInfo::hasSameIsolation(const SILIsolationInfo &other) const {
     return lhsIsolation == rhsIsolation;
   }
   }
+  llvm_unreachable("covered switch");
 }
 
 bool SILIsolationInfo::isEqual(const SILIsolationInfo &other) const {
@@ -1781,6 +1796,30 @@ SILIsolationInfo SILIsolationInfo::getFunctionIsolation(SILFunction *fn) {
   }
 
   return {};
+}
+
+bool SILIsolationInfo::isInferredSendingClosureCapture(
+    SILFunctionArgument *arg) {
+  if (!arg->isClosureCapture() || arg->isSending())
+    return false;
+
+  auto declRef = arg->getFunction()->getDeclRef();
+  if (!declRef)
+    return false;
+
+  auto *closure = declRef.getClosureExpr();
+  if (!closure || !closure->hasCalledAtMostOnceSemantics())
+    return false;
+
+  auto *closureTy = closure->getType()->castTo<FunctionType>();
+  if (!closureTy->getExtInfo().isNoEscape())
+    return false;
+
+  // Listing a value in a capture list without `sending` opts it out of the
+  // inference, like in a regular closure. This includes the capture list of an
+  // enclosing closure, where the value isn't disconnected and so can't be sent.
+  auto *var = dyn_cast_or_null<VarDecl>(arg->getDecl());
+  return !var || !var->isCaptureList();
 }
 
 //===----------------------------------------------------------------------===//

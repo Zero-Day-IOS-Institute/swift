@@ -69,3 +69,23 @@ func setStaticIntRefTypealias() {
 // CHECK: sil hidden @$s4main24setStaticIntRefTypealiasyyF : $@convention(thin) () -> ()
 // CHECK: [[REF:%.*]] = function_ref @$sSo24setStaticIntRefTypealiasyys5Int32VzFTo : $@convention(c) (@inout Int32) -> ()
 // CHECK: apply [[REF]](%{{[0-9]+}}) : $@convention(c) (@inout Int32) -> ()
+
+func passCallbacks() {
+  callWithIntRef { $0.pointee = 99 }
+  callWithConstIntRef { _ = $0 }
+  callWithIntRvalueRef { _ = $0 }
+  callWithConstIntRvalueRef { _ = $0 }
+}
+
+// CHECK: sil {{.*}}[clang callWithIntRef] @{{.*}} : $@convention(c) (Optional<@convention(c) (UnsafeMutablePointer<Int32>) -> ()>) -> ()
+// CHECK: sil {{.*}}[clang callWithConstIntRef] @{{.*}} : $@convention(c) (Optional<@convention(c) (@in_guaranteed Int32) -> ()>) -> ()
+// CHECK: sil {{.*}}[clang callWithIntRvalueRef] @{{.*}} : $@convention(c) (Optional<@convention(c) (@in_cxx Int32) -> ()>) -> ()
+// CHECK: sil {{.*}}[clang callWithConstIntRvalueRef] @{{.*}} : $@convention(c) (Optional<@convention(c) (@in_guaranteed Int32) -> ()>) -> ()
+
+// A reference to a function is passed directly, like a function pointer.
+func passFuncRefs() -> CInt {
+  return callFuncRef(getStaticInt) + callFuncRvalueRef(consuming: getStaticInt)
+}
+
+// CHECK: sil {{.*}}[clang callFuncRef] @{{.*}} : $@convention(c) (@convention(c) () -> Int32) -> Int32
+// CHECK: sil {{.*}}[clang callFuncRvalueRef] @{{.*}} : $@convention(c) (@convention(c) () -> Int32) -> Int32

@@ -26,7 +26,6 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/Assertions.h"
-#include <algorithm>
 #include <vector>
 #include "PropertyMap.h"
 #include "RequirementLowering.h"
@@ -187,7 +186,7 @@ void PropertyMap::concretizeNestedTypesFromConcreteParent(
     recordConcreteConformanceRule(concreteRuleID, conformanceRuleID,
                                   requirementKind, concreteConformanceSymbol);
 
-    // This is disabled by default because we fail to produce a convergent
+    // This is disabled by default because we fail to produce a complete
     // rewrite system if the opaque archetype has infinitely-recursive
     // nested types. Fixing this requires a better representation for
     // concrete conformances in the rewrite system.

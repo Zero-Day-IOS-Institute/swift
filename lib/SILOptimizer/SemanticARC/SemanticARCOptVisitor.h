@@ -14,17 +14,12 @@
 #define SWIFT_SILOPTIMIZER_SEMANTICARC_SEMANTICARCOPTVISITOR_H
 
 #include "Context.h"
-#include "OwnershipLiveRange.h"
-#include "SemanticARCOpts.h"
 
 #include "swift/Basic/BlotSetVector.h"
-#include "swift/Basic/FrozenMultiMap.h"
-#include "swift/Basic/MultiMapCache.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/SILVisitor.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
-#include "swift/SILOptimizer/Utils/ValueLifetime.h"
 
 namespace swift {
 namespace semanticarc {
@@ -146,6 +141,10 @@ struct LLVM_LIBRARY_VISIBILITY SemanticARCOptVisitor
   bool
   visitUncheckedOwnershipConversionInst(UncheckedOwnershipConversionInst *uoci);
 
+  bool visitUncheckedOwnershipInst(UncheckedOwnershipInst *uoi) {
+    return false;
+  }
+
   static bool shouldVisitInst(SILInstruction *i) {
     switch (i->getKind()) {
     default:
@@ -174,6 +173,7 @@ struct LLVM_LIBRARY_VISIBILITY SemanticARCOptVisitor
   FORWARDING_INST(UncheckedValueCast)
   FORWARDING_INST(ThinToThickFunction)
   FORWARDING_INST(OpenExistentialRef)
+  FORWARDING_INST(OpenCOMExistential)
   FORWARDING_INST(Upcast)
   FORWARDING_INST(UncheckedRefCast)
   FORWARDING_INST(ConvertFunction)

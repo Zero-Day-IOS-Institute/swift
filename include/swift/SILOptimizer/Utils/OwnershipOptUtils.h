@@ -19,11 +19,9 @@
 #ifndef SWIFT_SILOPTIMIZER_UTILS_OWNERSHIPOPTUTILS_H
 #define SWIFT_SILOPTIMIZER_UTILS_OWNERSHIPOPTUTILS_H
 
-#include "swift/Basic/Defer.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/PrunedLiveness.h"
-#include "swift/SIL/SILModule.h"
 #include "swift/SILOptimizer/Utils/InstructionDeleter.h"
 
 namespace swift {
@@ -360,6 +358,11 @@ bool extendStoreBorrow(StoreBorrowInst *sbi,
                        SmallVectorImpl<Operand *> &newUses,
                        InstModCallbacks callbacks = InstModCallbacks());
 
+/// Return \p result from a thunk. The result of a borrow accessor call is
+/// returned from within its borrow scope by a return_borrow.
+TermInst *createThunkReturn(SILBuilder &builder, SILLocation loc,
+                            SILValue result);
+
 /// Updates the reborrow flags and the borrowed-from instructions for all
 /// guaranteed phis in function `f`.
 void updateAllGuaranteedPhis(SILPassManager *pm, SILFunction *f);
@@ -373,6 +376,11 @@ void replacePhisWithIncomingValues(SILPassManager *pm, ArrayRef<SILPhiArgument *
 /// Complete lifetimes which were cut off by an `unreachable` instruction.
 /// For details see the swift implementation `completeLifetimes(in: Function)`.
 void completeAllLifetimes(SILPassManager *pm, SILFunction *f, bool includeTrivialVars = false);
+
+/// Rewrite the result of a borrow accessor that SILGen returns from within
+/// local borrow scopes into a return_borrow. Returns true if \p f changed.
+/// For details see the swift implementation `fixupBorrowAccessors(in:)`.
+bool fixupBorrowAccessors(SILPassManager *pm, SILFunction *f);
 
 /// Complete lifetimes of all `values` at `deadEnds` instructions.
 /// Instead of completing the lifetimes at `unreachable` instructions, they are

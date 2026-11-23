@@ -20,7 +20,6 @@
 #include "swift/Basic/LLVM.h"
 #include "swift/IRGen/GenericRequirement.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/Support/raw_ostream.h"
 
 namespace swift {
 
@@ -98,7 +97,7 @@ public:
       raw_ostream &os, const TypeDecl *typeDecl, StringRef typeMetadataFuncName,
       ArrayRef<GenericRequirement> typeMetadataFuncRequirements,
       const ModuleDecl *moduleContext, DeclAndTypePrinter &declAndTypePrinter,
-      bool isOpaqueLayout = false);
+      bool isOpaqueLayout = false, bool usesBoxedStorage = false);
 
   static void printTypePrecedingGenericTraits(raw_ostream &os,
                                               const NominalTypeDecl *typeDecl,

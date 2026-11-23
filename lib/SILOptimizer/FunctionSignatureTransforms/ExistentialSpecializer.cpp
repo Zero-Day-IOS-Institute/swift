@@ -17,13 +17,11 @@
 
 #define DEBUG_TYPE "sil-existential-specializer"
 #include "ExistentialTransform.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SILOptimizer/Analysis/ProtocolConformanceAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/Existential.h"
-#include "swift/SILOptimizer/Utils/InstOptUtils.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 
@@ -160,8 +158,8 @@ bool ExistentialSpecializer::canSpecializeExistentialArgsInFunction(
 
     /// Find the concrete type.
     Operand &ArgOper = Apply.getArgumentRef(Idx);
-    CanType ConcreteType =
-        ConcreteExistentialInfo(ArgOper.get(), ArgOper.getUser()).ConcreteType;
+    ConcreteExistentialInfo CEI(ArgOper.get(), ArgOper.getUser());
+    CanType ConcreteType = CEI.isValid() ? CEI.ConcreteType : CanType();
     auto ArgConvention = F->getConventions().getSILArgumentConvention(Idx);
     /// Find the concrete type, either via sole type or via
     /// findInitExistential..
@@ -198,6 +196,15 @@ bool ExistentialSpecializer::canSpecializeExistentialArgsInFunction(
     if (!paramInfo.isConsumedInCallee() &&
         paramInfo.getSILStorageInterfaceType().isMoveOnly())
       continue;
+
+    // The result of a borrow accessor borrows from self's memory location,
+    // but the ExistentialSpecializerCloner copies self into a local
+    // existential that is destroyed before the return.
+    if (F->hasSelfParam() && CalleeArg == F->getSelfArgument() &&
+        (F->getConventions().hasGuaranteedResult() ||
+         F->getConventions().hasGuaranteedAddressResult())) {
+      continue;
+    }
 
     ETAD.AccessType = paramInfo.isConsumedInCallee()
                           ? OpenedExistentialAccess::Mutable

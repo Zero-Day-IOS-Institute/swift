@@ -28,12 +28,11 @@
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/AST/Types.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/STLExtras.h"
+#include "swift/Basic/Statistic.h"
 #include "swift/Basic/StringExtras.h"
 #include "swift/ClangImporter/ClangImporterRequests.h"
 #include "swift/Parse/ParseDeclName.h"
-#include "swift/Strings.h"
 #include "swift/Subsystems.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/DeclCXX.h"
@@ -53,13 +52,26 @@
 #include <memory>
 #include <optional>
 
-#include "llvm/ADT/Statistic.h"
-#define DEBUG_TYPE "Import Name"
-STATISTIC(ImportNameNumCacheHits, "# of times the import name cache was hit");
-STATISTIC(ImportNameNumCacheMisses, "# of times the import name cache was missed");
-
 using namespace swift;
 using namespace importer;
+
+void ImportNameVersion::dump(llvm::raw_ostream &out) const {
+  if (withoutCArrayProjection() == raw())
+    out << "raw";
+  else
+    out << asClangVersionTuple().getAsString();
+  if (supportsConcurrency())
+    out << " (concurrency)";
+  if (getCArrayProjection() == CArrayProjection::Legacy)
+    out << " (legacy C arrays)";
+  else if (getCArrayProjection() == CArrayProjection::HiddenStorage)
+    out << " (hidden C array storage)";
+}
+
+void ImportNameVersion::dump() const {
+  dump(llvm::errs());
+  llvm::errs() << "\n";
+}
 
 Identifier importer::getOperatorName(ASTContext &ctx,
                                      clang::OverloadedOperatorKind op) {
@@ -72,6 +84,7 @@ Identifier importer::getOperatorName(ASTContext &ctx,
     return ctx.getIdentifier("__operator" #Name);
 #include "clang/Basic/OperatorKinds.def"
   }
+  llvm_unreachable("covered switch");
 }
 
 Identifier importer::getOperatorName(ASTContext &ctx, Identifier op) {
@@ -630,6 +643,10 @@ findSwiftNameAttr(const clang::Decl *decl, ImportNameVersion version) {
 
   if (version == ImportNameVersion::raw())
     return std::nullopt;
+
+  // Attributes on a function template are attached to the templated decl.
+  if (auto *ftd = dyn_cast<clang::FunctionTemplateDecl>(decl))
+    decl = ftd->getTemplatedDecl();
 
   /// Decode the given Clang attribute to try to determine whether it is
   /// a Swift name attribute.
@@ -1594,7 +1611,8 @@ addDefaultArgNamesForClangFunction(const clang::FunctionDecl *funcDecl,
 std::optional<StringRef>
 NameImporter::findCustomName(const clang::Decl *decl,
                              ImportNameVersion version) {
-  if (auto nameAttr = findSwiftNameAttr(decl, version)) {
+  if (auto nameAttr = findSwiftNameAttr(decl,
+                                        version.withoutCArrayProjection())) {
     return nameAttr->name;
   }
   return std::nullopt;
@@ -1614,7 +1632,8 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
     return ImportedName();
 
   // C++ interop was not available in Swift 2
-  if (!swift3OrLaterName && isa<clang::CXXMethodDecl>(D)) {
+  if (!swift3OrLaterName &&
+      isa_and_nonnull<clang::CXXMethodDecl>(D->getAsFunction())) {
     return ImportedName();
   }
   // If this function uses C++23 deducing this, bail.
@@ -1799,7 +1818,8 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
         skipCustomName = true;
         result.info.hasInvalidCustomName = true;
       }
-    } else if (auto *func = dyn_cast<clang::FunctionDecl>(D)) {
+    } else if (auto *func = D->getAsFunction()) {
+      // Look through function templates to the templated decl.
       if (auto *cxxMethod = dyn_cast<clang::CXXMethodDecl>(func)) {
         // `swift_name` attribute is not supported in virtual methods overrides
         if (cxxMethod->isVirtual() && cxxMethod->size_overridden_methods() > 0)
@@ -1807,7 +1827,7 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
       }
 
       // `swift_name` attribute is not supported in virtual methods overrides
-      if (auto method = dyn_cast<clang::CXXMethodDecl>(D);
+      if (auto method = dyn_cast<clang::CXXMethodDecl>(func);
           method && overridesVirtualMethods(method))
         skipCustomName = true;
 
@@ -1815,6 +1835,17 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
           parsedName.BaseNameKind == DeclBaseName::Kind::Constructor &&
           !shouldImportAsInitializer(func, parsedName))
         skipCustomName = true;
+
+      if (!skipCustomName &&
+          parsedName.BaseNameKind == DeclBaseName::Kind::Constructor) {
+        if (auto method = dyn_cast<clang::CXXMethodDecl>(func))
+          if (method->isStatic() &&
+              getUncachedForeignReferenceTypeInfo(method->getParent())
+                  .isReference())
+            // This lets a Swift subclass of this FRT initialize itself using
+            // base's constructor.
+            result.info.initKind = CtorInitializerKind::ConvenienceFactory;
+      }
     }
 
     if (!skipCustomName) {
@@ -2394,7 +2425,7 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
           dyn_cast<clang::ClassTemplateSpecializationDecl>(D)) {
     if (!isa<clang::ClassTemplatePartialSpecializationDecl>(D)) {
       auto name = printClassTemplateSpecializationName(classTemplateSpecDecl,
-                                                       swiftCtx, this, version);
+                                                       this, version);
       baseName = swiftCtx.getIdentifier(name).get();
     }
   }
@@ -2641,16 +2672,21 @@ NameImporter::importMacroName(const clang::IdentifierInfo *II,
 }
 
 ImportedName NameImporter::importName(const clang::NamedDecl *decl,
-                                      ImportNameVersion version,
+                                      ImportNameVersion exactVersion,
                                       clang::DeclarationName givenName) {
+  // Strip bits that don't affect names.
+  auto version = exactVersion.withoutCArrayProjection();
+
   CacheKeyType key(decl, version);
   if (!givenName) {
     if (auto cachedRes = importNameCache[key]) {
-      ++ImportNameNumCacheHits;
+      if (auto *Stats = swiftCtx.Stats)
+        ++Stats->getFrontendCounters().ClangNameImportCacheHit;
       return cachedRes;
     }
   }
-  ++ImportNameNumCacheMisses;
+  if (auto *Stats = swiftCtx.Stats)
+    ++Stats->getFrontendCounters().ClangNameImportCacheMiss;
   auto res = importNameImpl(decl, version, givenName);
 
   // Add information about the async version of the name to the non-async

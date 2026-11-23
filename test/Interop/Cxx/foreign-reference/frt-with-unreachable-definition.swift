@@ -5,7 +5,7 @@
 //
 // RUN: %target-swift-frontend -typecheck -verify %t%{fs-sep}verify.swift \
 // RUN:   -I %t%{fs-sep}Inputs -cxx-interoperability-mode=default \
-// RUN:   -disable-availability-checking \
+// RUN:   -target %target-swift-5.8-abi-triple \
 // RUN:   -verify-additional-file %t%{fs-sep}Inputs%{fs-sep}FRTImpl.h \
 // RUN:   -verify-additional-file %t%{fs-sep}Inputs%{fs-sep}OpsImpl.h \
 // RUN:   -verify-additional-file %t%{fs-sep}Inputs%{fs-sep}CxxModule.h
@@ -14,7 +14,7 @@
 //
 // RUN: %target-swift-frontend -typecheck %t/compile.swift \
 // RUN:   -I %t/Inputs -cxx-interoperability-mode=default \
-// RUN:   -disable-availability-checking
+// RUN:   -target %target-swift-5.8-abi-triple
 
 //--- Inputs/module.modulemap
 module CxxModule {
@@ -87,7 +87,9 @@ public:
 } SWIFT_SHARED_REFERENCE(.ref, .deref)
   SWIFT_RETURNED_AS_UNRETAINED_BY_DEFAULT;
 
-// expected-error@+1 {{has unreachable definition}}
+// FRTDerived inherits its FRT annotation from FRTBase, but its definition is
+// unreachable from Swift, so it is imported as unavailable.
+// expected-note@+1 {{'FRTDerived' has been explicitly marked unavailable here}}
 class FRTDerived : public FRTBase<FRTDerived> {
   FRTDerived(const FRTDerived &) = delete;
   FRTDerived &operator=(const FRTDerived &) = delete;
@@ -147,9 +149,12 @@ FRTOps *makeFRTOps();
 import CxxModule
 
 let _ = makeFRTBasic()
-let _ = makeFRTDerived()
+let _ = makeFRTDerived() // expected-error {{contains foreign reference type 'FRTDerived', whose definition is not reachable}}
 let _ = makeFRTOps()
 let _ = makeFRTAnnotated()
+
+let _: FRTDerived? = nil // expected-error {{foreign reference type 'FRTDerived' has unreachable definition}}
+                         // expected-error@-1 {{contains foreign reference type 'FRTDerived', whose definition is not reachable}}
 
 //--- compile.swift
 import CxxModule

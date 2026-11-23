@@ -17,30 +17,23 @@
 #define DEBUG_TYPE "cowarray-opts"
 
 #include "ArrayOpt.h"
-#include "swift/Basic/Assertions.h"
-#include "swift/SIL/CFG.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/LoopInfo.h"
 #include "swift/SIL/Projection.h"
 #include "swift/SIL/SILArgument.h"
-#include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/BasicBlockBits.h"
 #include "swift/SILOptimizer/Analysis/ARCAnalysis.h"
-#include "swift/SILOptimizer/Analysis/AliasAnalysis.h"
 #include "swift/SILOptimizer/Analysis/ArraySemantic.h"
 #include "swift/SILOptimizer/Analysis/ColdBlockInfo.h"
 #include "swift/SILOptimizer/Analysis/DominanceAnalysis.h"
 #include "swift/SILOptimizer/Analysis/LoopAnalysis.h"
 #include "swift/SILOptimizer/Analysis/RCIdentityAnalysis.h"
-#include "swift/SILOptimizer/Analysis/ValueTracking.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
-#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 using namespace swift;
 
@@ -465,8 +458,9 @@ bool COWArrayOpt::checkSafeArrayAddressUses(UserList &AddressUsers) {
       continue;
     }
 
-    if (isa<DeallocStackInst>(UseInst)) {
+    if (isa<DeallocStackInst>(UseInst) || isa<DestroyAddrInst>(UseInst)) {
       // Handle destruction of a local array.
+      // A `destroy_addr` is equivalent to a `load [take]` + `destroy_value`.
       continue;
     }
 
@@ -514,6 +508,7 @@ isTransitiveSafeUser(SILInstruction *I) {
   case SILInstructionKind::UncheckedRefCastInst:
   case SILInstructionKind::UncheckedBitwiseCastInst:
   case SILInstructionKind::BeginBorrowInst:
+  case SILInstructionKind::UncheckedOwnershipInst:
     return I->getResults();
   default:
     return std::nullopt;
@@ -644,6 +639,13 @@ bool COWArrayOpt::checkSafeArrayElementUse(SILInstruction *UseInst,
 
   if (isa<EndBorrowInst>(UseInst))
     return true;
+
+  // The value hint of a `load_borrow` (inserted by RedundantLoadElimination)
+  // is not a real use.
+  if (auto *lbi = dyn_cast<LoadBorrowInst>(UseInst)) {
+    if (lbi->hasValueHint() && lbi->getValueHint() == ArrayVal)
+      return true;
+  }
 
   if (UseInst->isDebugInstruction())
     return true;

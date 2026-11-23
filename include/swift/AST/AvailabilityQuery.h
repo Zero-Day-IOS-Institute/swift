@@ -19,12 +19,43 @@
 
 #include "swift/AST/AvailabilityDomain.h"
 #include "swift/AST/AvailabilityRange.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/VersionTuple.h"
 
 namespace swift {
 class ASTContext;
 class FuncDecl;
+
+/// Identifies the kinds of standard library entry points that evaluate a
+/// platform availability query at runtime. Every function that carries the
+/// `availability.osversion` semantics attribute should have a kind here.
+enum class OSVersionQueryKind : uint8_t {
+  IsOSVersionAtLeast,
+  IsVariantOSVersionAtLeast,
+  IsOSVersionAtLeastOrVariantVersionAtLeast,
+};
+
+/// Returns the spelling of `kind` in the argument of the
+/// `availability.osversion` semantics attribute, e.g.,
+/// `@_semantics("availability.osversion(isOSVersionAtLeast)")`.
+llvm::StringRef getOSVersionQueryKindName(OSVersionQueryKind kind);
+
+/// Returns the full spelling of the semantics attribute that identifies a
+/// function as an OS version query function of kind `kind`.
+std::string getOSVersionQuerySemanticsAttr(OSVersionQueryKind kind);
+
+/// Given the value of a semantics attribute, returns the kind of OS version
+/// query function that it identifies. Returns `std::nullopt` if `attr` is not
+/// of the form `availability.osversion(<kind>)` for a known kind.
+std::optional<OSVersionQueryKind>
+parseOSVersionQuerySemanticsAttr(llvm::StringRef attr);
+
+/// Infers the kind of OS version query function that `decl`, which carries the
+/// `availability.osversion` semantics attribute without an explicit kind, is.
+/// Only the functions that the standard library declares are recognized.
+std::optional<OSVersionQueryKind> inferOSVersionQueryKind(const FuncDecl *decl);
 
 /// Represents the information needed to evaluate an `#if available` query
 /// (either at runtime or compile-time).
@@ -87,6 +118,19 @@ public:
             const std::optional<AvailabilityRange> &primaryRange,
             const std::optional<AvailabilityRange> &variantRange);
 
+  /// Returns the `AvailabilityQuery` that a call to a query function of kind
+  /// `queryKind` evaluates, where `arguments` are the integer version
+  /// components that the call passes to the function. This is the inverse of
+  /// `getDynamicQueryDeclAndArguments()` for queries in platform domains.
+  ///
+  /// Returns `std::nullopt` if `arguments` has the wrong number of elements
+  /// for `queryKind`, or if the target triples in `ctx` have no platform
+  /// domain.
+  static std::optional<AvailabilityQuery>
+  forOSVersionQueryCall(OSVersionQueryKind queryKind,
+                        llvm::ArrayRef<unsigned> arguments,
+                        const ASTContext &ctx);
+
   /// Returns a copy of the `AvailabilityQuery` that has been modified to
   /// represent an `if #unavailable` query if `isUnavailability` is true, or an
   /// `if #available` query otherwise.
@@ -120,7 +164,14 @@ public:
     case ResultKind::Dynamic:
       return std::nullopt;
     }
+    llvm_unreachable("covered switch");
   }
+
+  /// Returns true if the query is guaranteed to evaluate to true at runtime
+  /// when the code is compiled for the target triples in `ctx`, because the
+  /// deployment version of every platform whose version the query tests is at
+  /// least the version that the query requires.
+  bool isAlwaysTrueForDeploymentTargets(const ASTContext &ctx) const;
 
   /// Returns the availability range that is the first argument to query
   /// function.

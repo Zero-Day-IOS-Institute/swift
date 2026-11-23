@@ -2,12 +2,21 @@
 // RUN: %target-swift-emit-ir %s -parse-stdlib -enable-experimental-feature Embedded -enable-experimental-feature TypedAllocation -target arm64-apple-macos99.99 -wmo | %FileCheck %s --check-prefix=UNSAFEMUTABLEPOINTERALLOC
 // RUN: %target-swift-emit-ir %s -parse-stdlib -enable-experimental-feature Embedded -enable-experimental-feature TypedAllocation -target arm64-apple-macos99.99 -wmo | %FileCheck %s --check-prefix=ERRORBOX
 // RUN: %target-swift-emit-ir %s -parse-stdlib -enable-experimental-feature Embedded -enable-experimental-feature TypedAllocation -target arm64-apple-macos99.99 -wmo | %FileCheck %s --check-prefix=COROFRAME
+// RUN: %target-swift-emit-ir %s -parse-stdlib -enable-experimental-feature Embedded -enable-experimental-feature TypedAllocation -target arm64-apple-macos99.99 -wmo | %FileCheck %s --check-prefix=MEMLAYOUTTYPEDALLOCID
+// RUN: %empty-directory(%t)
+// RUN: %target-swift-emit-ir %s -parse-stdlib -enable-experimental-feature Embedded -enable-experimental-feature TypedAllocation -enable-experimental-feature TailAllocatedAttribute -target arm64-apple-macos99.99 -wmo > %t/tail.ll
+// RUN: %FileCheck %s --check-prefix=TAILALLOC-ARRAY < %t/tail.ll
+// RUN: %FileCheck %s --check-prefix=TAILALLOC-STRING < %t/tail.ll
+// RUN: %FileCheck %s --check-prefix=TAILALLOC-SET < %t/tail.ll
+// RUN: %FileCheck %s --check-prefix=TAILALLOC-DICTIONARY < %t/tail.ll
+// RUN: %FileCheck %s --check-prefix=TAILALLOC-CLASSHOLDER < %t/tail.ll
 
 // REQUIRES: OS=macosx
 // REQUIRES: SWIFT_STDLIB_ARCH=arm64
 // REQUIRES: embedded_stdlib
 // REQUIRES: swift_feature_Embedded
 // REQUIRES: swift_feature_TypedAllocation
+// REQUIRES: swift_feature_TailAllocatedAttribute
 
 import Swift
 
@@ -47,7 +56,125 @@ public class MyOtherClass {
   }
 }
 
-// CHECK-LABEL: define swiftcc void @"$e16typed_allocation3runyyAA3RefCFyyXEfU0_"(ptr %0, ptr captures(none) dereferenceable(16) %1)
+// Check that inherited properties are included in the type descriptor.
+public class MyThreeFieldClass {
+  let x: Int
+  let y: Int
+  let z: Int
+  init(x: Int, y: Int, z: Int) {
+    self.x = x
+    self.y = y
+    self.z = z
+  }
+}
+@inline(never)
+public func makeMyThreeFieldClass(x: Int, y: Int, z: Int) -> MyThreeFieldClass {
+  return MyThreeFieldClass(x: x, y: y, z: z)
+}
+// CHECK-LABEL: define swiftcc ptr @"$e16typed_allocation17MyThreeFieldClassC1x1y1zACSi_S2itcfC"(i64 %0, i64 %1, i64 %2, ptr swiftself %3) #0 {
+// CHECK-NEXT: entry:
+// CHECK-NEXT:   {{.*}} = call noalias ptr @swift_allocObjectTyped(ptr {{.*}}, i64 40, i64 7, i64 [[MYSUBCLASS_TYPEID:[0-9]+]])
+public class MySubclass: MyClass {
+  let z: Int
+  init(x: Int, y: Int, z: Int) {
+    self.z = z
+    super.init(x: x, y: y)
+  }
+}
+@inline(never)
+public func makeMySubclass(x: Int, y: Int, z: Int) -> MySubclass {
+  return MySubclass(x: x, y: y, z: z)
+}
+// CHECK-LABEL: define swiftcc ptr @"$e16typed_allocation10MySubclassC1x1y1zACSi_S2itcfC"(i64 %0, i64 %1, i64 %2, ptr swiftself %3) #0 {
+// CHECK-NEXT: entry:
+// CHECK-NEXT:   {{.*}} = call noalias ptr @swift_allocObjectTyped(ptr {{.*}}, i64 40, i64 7, i64 [[MYSUBCLASS_TYPEID]])
+
+// Same as above, include a generic class.
+public class ClassA {
+  let x: Int
+  init(x: Int) {
+    self.x = x
+  }
+}
+public class ClassB<T>: ClassA {
+  let y: T
+  init(x: Int, y: T) {
+    self.y = y
+    super.init(x: x)
+  }
+}
+public class ClassC: ClassB<Int> {
+  let z: Int
+  init(x: Int, y: Int, z: Int) {
+    self.z = z
+    super.init(x: x, y: y)
+  }
+}
+@inline(never)
+public func makeClassC(x: Int, y: Int, z: Int) -> ClassC {
+  return ClassC(x: x, y: y, z: z)
+}
+// CHECK-LABEL: define swiftcc ptr @"$e16typed_allocation6ClassCC1x1y1zACSi_S2itcfC"(i64 %0, i64 %1, i64 %2, ptr swiftself %3) #0 {
+// CHECK-NEXT: entry:
+// CHECK-NEXT:   {{.*}} = call noalias ptr @swift_allocObjectTyped(ptr {{.*}}, i64 40, i64 7, i64 [[MYSUBCLASS_TYPEID]])
+
+public class ClassD<T> {
+  let x: T
+  init(x: T) {
+    self.x = x
+  }
+}
+public class ClassE: ClassD<Int> {
+  let y: Int
+  init(x: Int, y: Int) {
+    self.y = y
+    super.init(x: x)
+  }
+}
+public class ClassF: ClassE {
+  let z: Int
+  init(x: Int, y: Int, z: Int) {
+    self.z = z
+    super.init(x: x, y: y)
+  }
+}
+@inline(never)
+public func makeClassF(x: Int, y: Int, z: Int) -> ClassF {
+  return ClassF(x: x, y: y, z: z)
+}
+// CHECK-LABEL: define swiftcc ptr @"$e16typed_allocation6ClassFC1x1y1zACSi_S2itcfC"(i64 %0, i64 %1, i64 %2, ptr swiftself %3) #0 {
+// CHECK-NEXT: entry:
+// CHECK-NEXT:   {{.*}} = call noalias ptr @swift_allocObjectTyped(ptr {{.*}}, i64 40, i64 7, i64 [[MYSUBCLASS_TYPEID]])
+
+public class ClassG {
+  let x: Int
+  init(x: Int) {
+    self.x = x
+  }
+}
+public class ClassH: ClassG {
+  let y: Int
+  init(x: Int, y: Int) {
+    self.y = y
+    super.init(x: x)
+  }
+}
+public class ClassI<T>: ClassH {
+  let z: T
+  init(x: Int, y: Int, z: T) {
+    self.z = z
+    super.init(x: x, y: y)
+  }
+}
+@inline(never)
+public func makeClassI(x: Int, y: Int, z: Int) -> ClassI<Int> {
+  return ClassI<Int>(x: x, y: y, z: z)
+}
+// CHECK-LABEL: define {{.*}}swiftcc ptr @"$e16typed_allocation6ClassIC1x1y1zACyxGSi_SixtcfCSi_Tt2g5"(i64 %0, i64 %1, i64 %2) #0 {
+// CHECK-NEXT: entry:
+// CHECK-NEXT:   {{.*}} = call noalias ptr @swift_allocObjectTyped(ptr {{.*}}, i64 40, i64 7, i64 [[MYSUBCLASS_TYPEID]])
+
+// CHECK-LABEL: define swiftcc void @"$e16typed_allocation3runyyAA3RefCFyyXEfU0_"(ptr %0, ptr align 8 captures(none) dereferenceable(16) %1)
 // CHECK: %2 = call {{.*}} ptr @swift_allocObjectTyped(ptr {{.*}}, i64 {{.*}}, i64 {{.*}}, i64 [[P_CAPTURE_TYPEID:.*]])
 // CHECK: call void @swift_deallocUninitializedObjectTyped(ptr %2, i64 {{.*}}, i64 {{.*}}, i64 [[P_CAPTURE_TYPEID]])
 public class Ref {}
@@ -373,3 +500,96 @@ public final class CoroFrameHolder {
 //
 // COROFRAME-DAG: define {{.*}} @"[[CORO_READ]].resume.0"
 // COROFRAME-DAG:   call void @swift_coroFrameDeallocTyped(ptr {{.*}}, i64 [[CORO_TYPEID]])
+
+
+// --- MemoryLayout<T>.typedAllocationID ---
+
+@inline(never)
+public func typedAllocationIDForMyClass() -> UInt64 {
+  _ = MyClass(x: 1, y: 2)
+  return MemoryLayout<MyClass>.typedAllocationID
+}
+@inline(never)
+public func typedAllocationIDForInt() -> UInt64 {
+  return MemoryLayout<Int>.typedAllocationID
+}
+public struct MyStruct {
+  var x: Int
+}
+@inline(never)
+public func typedAllocationIDForMyStruct() -> UInt64 {
+  return MemoryLayout<MyStruct>.typedAllocationID
+}
+// MEMLAYOUTTYPEDALLOCID: define swiftcc ptr @"$e16typed_allocation7MyClassC1x1yACSi_SitcfC"
+// MEMLAYOUTTYPEDALLOCID:   call noalias ptr @swift_allocObjectTyped(ptr {{.*}}, i64 {{.*}}, i64 {{.*}}, i64 [[MYCLASS_ALLOC_TYPEDALLOCID:[0-9]+]])
+//
+// MEMLAYOUTTYPEDALLOCID-LABEL: define swiftcc i64 @"$e16typed_allocation0A22AllocationIDForMyClasss6UInt64VyF"() #{{.*}} {
+// MEMLAYOUTTYPEDALLOCID:   ret i64 [[MYCLASS_ALLOC_TYPEDALLOCID]]
+//
+// MEMLAYOUTTYPEDALLOCID-LABEL: define swiftcc i64 @"$e16typed_allocation0A18AllocationIDForInts6UInt64VyF"() #{{.*}} {
+// MEMLAYOUTTYPEDALLOCID:   ret i64 [[INT_TYPEDALLOCID:[0-9]+]]
+//
+// MEMLAYOUTTYPEDALLOCID-LABEL: define swiftcc i64 @"$e16typed_allocation0A23AllocationIDForMyStructs6UInt64VyF"() #{{.*}} {
+// MEMLAYOUTTYPEDALLOCID:   ret i64 [[INT_TYPEDALLOCID]]
+
+// The stdlib's @_tailAllocated classes: each is allocated and freed with the
+// same type ID, and its free passes the size computed from the tail element
+// counts its deinit read. (The values are checked at run time by
+// test/embedded/typed_allocation_tail_allocations.swift.)
+public func makeArray(_ n: Int) -> [Int] {
+  Array(repeating: 1, count: n)
+}
+// TAILALLOC-ARRAY-LABEL: define {{.*}}@"$es23_ContiguousArrayStorageCfDSi_Tgq5"(
+// Only the size's constants (stride 8, header 32) are checked; the form of its
+// arithmetic isn't.
+// TAILALLOC-ARRAY:         {{i64 8, (i64 )?%[0-9]+}}
+// TAILALLOC-ARRAY:         {{i64 32, (i64 )?%[0-9]+}}
+// TAILALLOC-ARRAY:         call void @swift_deallocClassInstanceTyped(ptr {{%[0-9]+}}, i64 {{%[0-9]+}}, i64 7, i64 [[ID:[0-9]+]])
+// TAILALLOC-ARRAY-LABEL: define {{.*}}@"$eSa28_allocateBufferUninitialized{{.*}}Si_Tt0g5"(
+// TAILALLOC-ARRAY:         call noalias ptr @swift_allocObjectTyped({{.*}}ContiguousArrayStorageCySiGMf{{.*}}, i64 {{%[0-9]+}}, i64 7, i64 [[ID]])
+
+public func makeString(_ n: Int) -> String {
+  var s = ""
+  for _ in 0..<n { s += "abcd" }
+  return s
+}
+// TAILALLOC-STRING-LABEL: define {{.*}}@"$es15__StringStorageCfD"(
+// TAILALLOC-STRING:         call void @swift_deallocClassInstanceTyped(ptr {{%[0-9]+}}, i64 {{%[0-9]+}}, i64 7, i64 [[ID:[0-9]+]])
+// TAILALLOC-STRING-LABEL: define {{.*}}@"$es22_allocateStringStorage{{.*}}"(
+// TAILALLOC-STRING:         call noalias ptr @swift_allocObjectTyped({{.*}}__StringStorageCMf{{.*}}, i64 {{%[0-9]+}}, i64 7, i64 [[ID]])
+
+public func makeSet(_ n: Int) -> Set<Int> {
+  var s: Set<Int> = []
+  for i in 0..<n { s.insert(i) }
+  return s
+}
+// TAILALLOC-SET-LABEL: define {{.*}}@"$es11_SetStorageCfDSi_Tgq5"(
+// TAILALLOC-SET:         call void @swift_deallocClassInstanceTyped(ptr {{%[0-9]+}}, i64 {{%[0-9]+}}, i64 7, i64 [[ID:[0-9]+]])
+// TAILALLOC-SET-LABEL: define {{.*}}@"$es11_SetStorageC8allocate{{.*}}Si_Tt2g5"(
+// TAILALLOC-SET:         call noalias ptr @swift_allocObjectTyped({{.*}}_SetStorageCySiGMf{{.*}}, i64 {{%[0-9]+}}, i64 7, i64 [[ID]])
+
+public func makeDictionary(_ n: Int) -> [Int: Int] {
+  var d: [Int: Int] = [:]
+  for i in 0..<n { d[i] = i }
+  return d
+}
+// TAILALLOC-DICTIONARY-LABEL: define {{.*}}@"$es18_DictionaryStorageCfDSi_SiTgq5"(
+// TAILALLOC-DICTIONARY:         call void @swift_deallocClassInstanceTyped(ptr {{%[0-9]+}}, i64 {{%[0-9]+}}, i64 7, i64 [[ID:[0-9]+]])
+// TAILALLOC-DICTIONARY-LABEL: define {{.*}}@"$es18_DictionaryStorageC8allocate{{.*}}Si_SiTt2g5"(
+// TAILALLOC-DICTIONARY:         call noalias ptr @swift_allocObjectTyped({{.*}}_DictionaryStorageCyS2iGMf{{.*}}, i64 {{%[0-9]+}}, i64 7, i64 [[ID]])
+
+// A writable key path through a class allocates a KeyPath ClassHolder, whose
+// count is the constant 1.
+public final class KeyPathObj { var value = 0 }
+public struct KeyPathOuter { var obj: KeyPathObj; var n: Int }
+public func write(_ o: inout KeyPathOuter,
+                  _ kp: WritableKeyPath<KeyPathOuter, Int>) {
+  o[keyPath: kp] = 1
+}
+public func writeThroughClass(_ o: inout KeyPathOuter) {
+  write(&o, \KeyPathOuter.obj.value)
+}
+// TAILALLOC-CLASSHOLDER-LABEL: define {{.*}}@"$es11ClassHolderC7_create{{.*}}s5UInt8V_Tt2t3g5"(
+// TAILALLOC-CLASSHOLDER:         call noalias ptr @swift_allocObjectTyped({{.*}}ClassHolderCys5UInt8VGMf{{.*}}, i64 {{[0-9]+}}, i64 7, i64 [[ID:[0-9]+]])
+// TAILALLOC-CLASSHOLDER-LABEL: define {{.*}}@"$es11ClassHolderCfDs5UInt8V_Tgq5"(
+// TAILALLOC-CLASSHOLDER:         call void @swift_deallocClassInstanceTyped(ptr {{%[0-9]+}}, i64 {{[0-9]+|%[0-9]+}}, i64 7, i64 [[ID]])

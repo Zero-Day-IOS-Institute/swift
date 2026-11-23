@@ -10,13 +10,13 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Pack.h"
 #include "swift/Basic/Platform.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Support/VersionTuple.h"
+#include "llvm/Support/VirtualFileSystem.h"
 
 using namespace swift;
 
@@ -232,7 +232,6 @@ StringRef swift::getPlatformNameForTriple(const llvm::Triple &triple) {
   case llvm::Triple::KFreeBSD:
   case llvm::Triple::Lv2:
   case llvm::Triple::Mesa3D:
-  case llvm::Triple::NaCl:
   case llvm::Triple::NetBSD:
   case llvm::Triple::NVCL:
   case llvm::Triple::PS5:
@@ -246,6 +245,7 @@ StringRef swift::getPlatformNameForTriple(const llvm::Triple &triple) {
   case llvm::Triple::ChipStar:
   case llvm::Triple::OpenCL:
   case llvm::Triple::QURT:
+  case llvm::Triple::H2:
     return "";
   case llvm::Triple::Darwin:
   case llvm::Triple::MacOSX:
@@ -928,8 +928,9 @@ swift::getCanonicalTriple(const llvm::Triple &triple) {
   return Result;
 }
 
-static std::string getPlistEntry(const llvm::Twine &Path, StringRef KeyName) {
-  auto BufOrErr = llvm::MemoryBuffer::getFile(Path);
+static std::string getPlistEntry(const llvm::Twine &Path, StringRef KeyName,
+                                 llvm::vfs::FileSystem &FS) {
+  auto BufOrErr = FS.getBufferForFile(Path);
   if (!BufOrErr) {
     // FIXME: diagnose properly
     return {};
@@ -954,18 +955,22 @@ static std::string getPlistEntry(const llvm::Twine &Path, StringRef KeyName) {
   return {};
 }
 
-std::string swift::getSDKBuildVersionFromPlist(StringRef Path) {
-  return getPlistEntry(Path, "ProductBuildVersion");
+std::string swift::getSDKBuildVersionFromPlist(StringRef Path,
+                                               llvm::vfs::FileSystem &FS) {
+  return getPlistEntry(Path, "ProductBuildVersion", FS);
 }
 
-std::string swift::getSDKBuildVersion(StringRef Path) {
-  return getSDKBuildVersionFromPlist((llvm::Twine(Path) +
-    "/System/Library/CoreServices/SystemVersion.plist").str());
+std::string swift::getSDKBuildVersion(StringRef Path,
+                                      llvm::vfs::FileSystem &FS) {
+  return getSDKBuildVersionFromPlist(
+      (llvm::Twine(Path) + "/System/Library/CoreServices/SystemVersion.plist")
+          .str(),
+      FS);
 }
 
-std::string swift::getSDKName(StringRef Path) {
-  std::string Name = getPlistEntry(llvm::Twine(Path)+"/SDKSettings.plist",
-                                   "CanonicalName");
+std::string swift::getSDKName(StringRef Path, llvm::vfs::FileSystem &FS) {
+  std::string Name = getPlistEntry(llvm::Twine(Path) + "/SDKSettings.plist",
+                                   "CanonicalName", FS);
   if (Name.empty() && Path.ends_with(".sdk")) {
     Name = llvm::sys::path::filename(Path).drop_back(strlen(".sdk")).str();
   }

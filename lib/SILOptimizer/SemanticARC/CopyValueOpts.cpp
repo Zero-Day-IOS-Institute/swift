@@ -24,9 +24,7 @@
 #include "SemanticARCOptVisitor.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/LinearLifetimeChecker.h"
-#include "swift/SIL/MemAccessUtils.h"
 #include "swift/SIL/OwnershipUtils.h"
-#include "swift/SIL/Projection.h"
 #include "swift/SIL/Test.h"
 #include "swift/SILOptimizer/Analysis/BasicCalleeAnalysis.h"
 
@@ -766,7 +764,7 @@ bool SemanticARCOptVisitor::tryPerformOwnedCopyValueOptimization(
   // parent owned value's lifetime.
   // Note: we cannot optimistically ignore DeadEndBlocks - unlike for ownership
   //       verification.
-  LinearLifetimeChecker checker(nullptr);
+  LinearLifetimeChecker checker;
   if (!checker.validateLifetime(originalValue, parentLifetimeEndingUses,
                                 allCopyUses))
     return false;

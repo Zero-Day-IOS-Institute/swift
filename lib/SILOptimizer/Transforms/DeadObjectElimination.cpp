@@ -24,9 +24,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "dead-object-elim"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/IndexTrie.h"
-#include "swift/AST/ResilienceExpansion.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/InstructionUtils.h"
@@ -90,7 +88,7 @@ static SILFunction *getDestructor(AllocRefInstBase *ARI) {
     return nullptr;
 
   // We only support classes.
-  ClassDecl *ClsDecl = ARI->getType().getClassOrBoundGenericClass();
+  ClassDecl *ClsDecl = ARI->getType().getClassDecl();
   if (!ClsDecl)
     return nullptr;
 
@@ -913,8 +911,6 @@ DeadObjectElimination::buildDIExpression(SILInstruction *current) {
     auto var = dvci->getVarInfo();
     if (!var)
       return {};
-    if (!var->Type)
-      var->Type = dvci->getElementType();
     // Strip op_deref: we are salvaging an element being stored.
     // Note: as this is an AllocStackInst, the DIExpr is always
     // a single op_deref.
@@ -1089,7 +1085,7 @@ bool DeadObjectElimination::processKeyPath(KeyPathInst *KPI) {
   if (!KPI->getFunction()->hasOwnership()) {
     // In non-ossa, bail out if we have non-trivial pattern operands.
     for (const Operand &Op : KPI->getPatternOperands()) {
-      if (Op.get()->getType().isTrivial(*KPI->getFunction()))
+      if (!Op.get()->getType().isTrivial(*KPI->getFunction()))
         return false;
     }
   } else {

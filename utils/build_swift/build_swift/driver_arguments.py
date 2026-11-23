@@ -514,7 +514,8 @@ def create_argument_parser():
                 'multiple times.')
     option('--caching-prefix-map', toggle_true,
            help='enable prefix mapping for cached builds. Maps source, '
-                'SDK, and toolchain paths to canonical prefixes.')
+                'SDK, and toolchain paths to canonical prefixes, plus the '
+                'Xcode developer directory for Swift on macOS.')
     option('--caching-remote-service-path', store_path,
            default=None,
            help='the path to the remote caching service socket. Implies '
@@ -817,6 +818,9 @@ def create_argument_parser():
 
     option(['--swiftsyntax'], toggle_true('build_swiftsyntax'),
            help='build swiftSyntax')
+
+    option(['--sarif'], toggle_true('build_sarif'),
+           help='build SARIF diagnostic serialization support into the compiler')
 
     option(['--skip-early-swiftsyntax'],
            toggle_false('build_early_swiftsyntax'),
@@ -1399,8 +1403,12 @@ def create_argument_parser():
     option('--skip-build-android', toggle_false('build_android'),
            help='skip building Swift stdlibs for Android')
 
-    option('--skip-build-benchmarks', toggle_false('build_benchmarks'),
-           help='skip building Swift Benchmark Suite')
+    option('--build-benchmarks', toggle_true('build_benchmarks'), default=False,
+           help='build Swift Benchmark Suite')
+
+    option('--skip-build-benchmarks', toggle_true('skip_build_benchmarks'),
+           help='[no-op] building the Swift Benchmark Suite is skipped by '
+                'default; pass --build-benchmarks to opt in')
 
     option('--build-external-benchmarks', toggle_true,
            help='skip building Swift Benchmark Suite')

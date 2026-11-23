@@ -21,11 +21,11 @@
 #include "swift/AST/Evaluator.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/TypeID.h"
 #include "swift/ConstExtract/ConstExtractRequests.h"
 #include "swift/Subsystems.h"
 #include "llvm/ADT/PointerUnion.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/PrefixMapper.h"
@@ -33,8 +33,6 @@
 #include "llvm/Support/YAMLParser.h"
 #include "llvm/Support/YAMLTraits.h"
 
-#include <set>
-#include <sstream>
 #include <string>
 
 using namespace swift;
@@ -79,7 +77,8 @@ public:
   visitAuxiliaryDecls:
     // Visit peers expanded from macros
     D->visitAuxiliaryDecls([&](Decl *decl) { decl->walk(*this); },
-                           /*visitFreestandingExpanded=*/false);
+                           /*visitFreestandingExpanded=*/false,
+                           /*visitExtensions*/ true);
     return Action::Continue();
   }
 
@@ -444,12 +443,16 @@ extractCompileTimeValue(Expr *expr, const DeclContext *declContext) {
         std::vector<KeyPathValue::Component> components;
 
         for (auto component: keyPathExpr->getComponents()) {
-            if (component.isResolved()) {
+            if (component.getKind() == KeyPathExpr::Component::Kind::Member) {
                 auto declRef = component.getDeclRef();
                 auto identifier = declRef.getDecl()->getBaseIdentifier().str();
                 auto type = component.getComponentType()->getRValueType();
                 components.push_back({identifier.str(), type});
             }
+        }
+
+        if (components.empty()) {
+            return std::make_shared<RuntimeValue>();
         }
 
         std::string path = "";
@@ -477,11 +480,23 @@ extractCompileTimeValue(Expr *expr, const DeclContext *declContext) {
 
     case ExprKind::MemberRef: {
       auto memberExpr = cast<MemberRefExpr>(expr);
+      auto label = memberExpr->getDecl().getDecl()->getBaseIdentifier().str();
+
       if (isa<TypeExpr>(memberExpr->getBase())) {
         auto baseTypeExpr = cast<TypeExpr>(memberExpr->getBase());
-        auto label = memberExpr->getDecl().getDecl()->getBaseIdentifier().str();
         return std::make_shared<MemberReferenceValue>(
             baseTypeExpr->getInstanceType(), label.str());
+      }
+
+      // Non-TypeExpr base: attempt to recursively extract the base and
+      // represent the chain as a ChainedMemberReferenceValue.
+      auto baseValue = extractCompileTimeValue(memberExpr->getBase(),
+                                               declContext);
+      if (!isa<RuntimeValue>(baseValue.get())) {
+        auto stepValue = std::make_shared<MemberReferenceValue>(
+            memberExpr->getBase()->getType(), label.str());
+        return std::make_shared<ChainedMemberReferenceValue>(stepValue,
+                                                             baseValue);
       }
       break;
     }
@@ -491,12 +506,18 @@ extractCompileTimeValue(Expr *expr, const DeclContext *declContext) {
       auto tapExpr = interpolatedStringExpr->getAppendingExpr();
       auto &Ctx = tapExpr->getVar()->getASTContext();
 
-      std::vector<std::shared_ptr<CompileTimeValue>> segments;
+      std::vector<InterpolatedStringSegment> segments;
       interpolatedStringExpr->forEachSegment(
           Ctx, [&](bool isInterpolation, CallExpr *segment) -> void {
-            auto arg = segment->getArgs()->get(0);
-            auto expr = arg.getExpr();
-            segments.push_back(extractCompileTimeValue(expr, declContext));
+            if (isInterpolation) {
+              auto args = extractFunctionArguments(segment->getArgs(),
+                                                  declContext);
+              segments.push_back(InterpolationSegment{args});
+            } else {
+              auto arg = segment->getArgs()->get(0);
+              auto value = extractCompileTimeValue(arg.getExpr(), declContext);
+              segments.push_back(RawStringSegment{value});
+            }
           });
 
       return std::make_shared<InterpolatedStringLiteralValue>(segments);
@@ -702,12 +723,6 @@ gatherConstValuesForModule(const std::unordered_set<std::string> &Protocols,
   NominalTypeConformanceCollector ConformanceCollector(Protocols,
                                                        ConformanceDecls);
   Module->walk(ConformanceCollector);
-  // Visit macro expanded extensions
-  for (auto *FU : Module->getFiles())
-    if (auto *synthesizedSF = FU->getSynthesizedFile())
-      for (auto D : synthesizedSF->getTopLevelDecls())
-        if (isa<ExtensionDecl>(D))
-          D->walk(ConformanceCollector);
 
   for (auto *CD : ConformanceDecls)
     Result.emplace_back(evaluateOrDefault(CD->getASTContext().evaluator,
@@ -724,13 +739,8 @@ gatherConstValuesForPrimary(const std::unordered_set<std::string> &Protocols,
   std::vector<NominalTypeDecl *> ConformanceDecls;
   NominalTypeConformanceCollector ConformanceCollector(Protocols,
                                                        ConformanceDecls);
-  for (auto D : SF->getTopLevelDecls())
-    D->walk(ConformanceCollector);
-  // Visit macro expanded extensions
-  if (auto *synthesizedSF = SF->getSynthesizedFile())
-    for (auto D : synthesizedSF->getTopLevelDecls())
-      if (isa<ExtensionDecl>(D))
-        D->walk(ConformanceCollector);
+  auto *mutableSF = const_cast<SourceFile *>(SF);
+  mutableSF->walk(ConformanceCollector);
 
   for (auto *CD : ConformanceDecls)
     Result.emplace_back(evaluateOrDefault(
@@ -979,6 +989,30 @@ void writeValue(llvm::json::OStream &JSON,
     break;
   }
 
+  case CompileTimeValue::ValueKind::ChainedMemberReference: {
+    // Walk the chain collecting member steps.
+    std::vector<std::shared_ptr<CompileTimeValue>> chain;
+    std::shared_ptr<CompileTimeValue> cursor = Value;
+    while (cursor && cursor->getKind() ==
+                         CompileTimeValue::ValueKind::ChainedMemberReference) {
+      auto *cmr = cast<ChainedMemberReferenceValue>(cursor.get());
+      chain.push_back(cmr->getStepValue());
+      cursor = cmr->getBaseValue();
+    }
+    std::reverse(chain.begin(), chain.end());
+
+    JSON.attribute("valueKind", "ChainedMemberReference");
+    JSON.attributeObject("value", [&]() {
+      JSON.attributeObject("baseValue", [&] { writeValue(JSON, cursor); });
+      JSON.attributeArray("members", [&] {
+        for (auto &step : chain) {
+          JSON.object([&] { writeValue(JSON, step); });
+        }
+      });
+    });
+    break;
+  }
+
   case CompileTimeValue::ValueKind::MemberReference: {
     auto memberReferenceValue = cast<MemberReferenceValue>(value);
     JSON.attribute("valueKind", "MemberReference");
@@ -995,9 +1029,32 @@ void writeValue(llvm::json::OStream &JSON,
     JSON.attribute("valueKind", "InterpolatedStringLiteral");
     JSON.attributeObject("value", [&]() {
       JSON.attributeArray("segments", [&] {
-        auto segments = interpolatedStringValue->getSegments();
-        for (auto s : segments) {
-          JSON.object([&] { writeValue(JSON, s); });
+        for (auto &seg : interpolatedStringValue->getSegments()) {
+          JSON.object([&] {
+            std::visit(llvm::makeVisitor(
+              [&](const RawStringSegment &raw) {
+                writeValue(JSON, raw.Value);
+              },
+              [&](const InterpolationSegment &interp) {
+                // Backwards-compatible rule: a single unlabeled argument uses the
+                // existing flat format so existing consumers are unaffected.
+                if (interp.Arguments.size() == 1 && interp.Arguments[0].Label.empty()) {
+                  writeValue(JSON, interp.Arguments[0].Value);
+                } else {
+                  JSON.attributeArray("arguments", [&] {
+                    for (auto &param : interp.Arguments) {
+                      JSON.object([&] {
+                        JSON.attribute("label", param.Label);
+                        JSON.attribute("type",
+                                       toFullyQualifiedTypeNameString(param.Type));
+                        writeValue(JSON, param.Value);
+                      });
+                    }
+                  });
+                }
+              }
+            ), seg);
+          });
         }
       });
     });

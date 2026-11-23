@@ -21,10 +21,10 @@
 #include "TypeCheckUnsafe.h"
 
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/Effects.h"
 #include "swift/AST/PackConformance.h"
-#include "swift/AST/SourceFile.h"
 #include "swift/AST/Types.h"
 #include "swift/AST/UnsafeUse.h"
 
@@ -149,6 +149,10 @@ void swift::diagnoseUnsafeUse(const UnsafeUse &use) {
           isCall, decl);
     }
 
+    // If this came from C++, explain why the importer judged it unsafe.
+    if (auto *loader = ctx.getClangModuleLoader())
+      loader->diagnoseCxxUnsafetyReason(decl, type, loc);
+
     return;
   }
 
@@ -204,20 +208,12 @@ void swift::diagnoseUnsafeUse(const UnsafeUse &use) {
   }
 }
 
-bool swift::retainUnsafeUsesToDiagnose(SmallVectorImpl<UnsafeUse> &unsafeUses,
-                                       bool includeMerelyUnsafe) {
-  bool anyAlways = false;
-  // When we're only after always-unsafe uses, this also drops the merely unsafe
-  // ones we happened to find along the way.
-  llvm::erase_if(unsafeUses, [&](const UnsafeUse &use) {
-    if (!use.isAlways())
-      return !includeMerelyUnsafe;
-
-    anyAlways = true;
+bool swift::retainUnsafeUsesToDiagnose(SmallVectorImpl<UnsafeUse> &unsafeUses) {
+  if (llvm::none_of(unsafeUses, std::mem_fn(&UnsafeUse::isAlways)))
     return false;
-  });
 
-  return anyAlways;
+  llvm::erase_if(unsafeUses, std::not_fn(std::mem_fn(&UnsafeUse::isAlways)));
+  return true;
 }
 
 /// Determine whether a reference to the given variable is treated as

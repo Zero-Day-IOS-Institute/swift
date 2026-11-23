@@ -21,6 +21,7 @@
 #include "MiscDiagnostics.h"
 #include "TypeCheckAccess.h"
 #include "TypeCheckAvailability.h"
+#include "swift/Basic/Platform.h"
 #include "TypeCheckCOM.h"
 #include "TypeCheckConcurrency.h"
 #include "TypeCheckDecl.h"
@@ -34,7 +35,6 @@
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/AccessNotes.h"
-#include "swift/AST/AccessScope.h"
 #include "swift/AST/Attr.h"
 #include "swift/AST/AvailabilityInference.h"
 #include "swift/AST/ConformanceLookup.h"
@@ -44,7 +44,6 @@
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Expr.h"
-#include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/KnownProtocols.h"
@@ -57,11 +56,9 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
-#include "swift/AST/TypeDifferenceVisitor.h"
 #include "swift/AST/TypeWalker.h"
 #include "swift/AST/UnsafeUse.h"
 #include "swift/Basic/Assertions.h"
-#include "swift/Basic/Defer.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Bridging/MacroEvaluation.h"
 #include "swift/Parse/Lexer.h"
@@ -70,12 +67,9 @@
 #include "clang/Basic/Module.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
-#include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Twine.h"
-#include "llvm/Support/Compiler.h"
-#include "llvm/Support/DJB.h"
 
 using namespace swift;
 
@@ -300,6 +294,28 @@ static void checkInheritanceClause(
         isa<AssociatedTypeDecl>(decl))
       continue;
 
+    // The COM identity protocols describe compiler-managed metatype
+    // conformances. Protocols cannot refine them in source, including through
+    // protocol compositions.
+    if (ctx.LangOpts.EnableCOMInterop && isa<ProtocolDecl>(decl) &&
+        inheritedTy->isConstraintType()) {
+      auto layout = inheritedTy->getExistentialLayout();
+      bool hasIdentity = false;
+      for (auto *protocol : layout.getProtocols()) {
+        if (!protocol->isCOMIdentity())
+          continue;
+        diags.diagnose(inherited.getLoc(),
+                       diag::com_identity_explicit_conformance,
+                       protocol->getName());
+        hasIdentity = true;
+      }
+      if (hasIdentity) {
+        if (auto *repr = inherited.getTypeRepr())
+          repr->setInvalid();
+        continue;
+      }
+    }
+
     if (inherited.isReparented())
       checkReparentedExtensionEntry(ext, inherited, inheritedTy);
 
@@ -444,7 +460,7 @@ static void checkInheritanceClause(
     // If this is a class type, it may be the superclass. We end up here when
     // the inherited type is either itself a class, or when it is a subclass
     // existential via the existential type path above.
-    if (inheritedTy->getClassOrBoundGenericClass()) {
+    if (inheritedTy->getClassDecl()) {
       // First, check if we already had a superclass.
       if (superclassTy) {
         // FIXME: Check for shadowed protocol names, i.e., NSObject?
@@ -485,7 +501,7 @@ static void checkInheritanceClause(
           if (auto behavior = shouldDiagnoseEmbeddedLimitations(
                   classDecl, inherited.getSourceRange().Start,
                   /*wasAlwaysEmbeddedError=*/true)) {
-            if (auto superBGT = inheritedTy->getAs<BoundGenericClassType>()) {
+            if (auto superBGT = inheritedTy->getAs<ClassType>()) {
               for (auto arg : superBGT->getGenericArgs()) {
                 if (auto *nominal = arg->getAnyNominal()) {
                   if (nominal == classDecl) {
@@ -823,6 +839,19 @@ CheckRedeclarationRequest::evaluate(Evaluator &eval, ValueDecl *current,
     currentFile->getParentModule()->lookupValue(current->getBaseName(),
                                                 NLKind::QualifiedLookup,
                                                 flags, otherDefinitions);
+
+    // A unique macro name is only visible inside the macro expansion that
+    // introduced it, so it can only conflict with declarations there.
+    if (MacroDecl::isUniqueMacroName(current->getBaseName())) {
+      SmallVector<ValueDecl *, 1> expansionDefinitions;
+      currentFile->getParentModule()
+          ->lookupUniqueMacroNameInEnclosingExpansions(
+              current->getBaseName(), current->getLoc(), expansionDefinitions);
+      for (auto *other : expansionDefinitions) {
+        if (ABIRoleInfo(other).matchesOptions(flags))
+          otherDefinitions.push_back(other);
+      }
+    }
   }
 
   // Compare this signature against the signature of other
@@ -1824,6 +1853,107 @@ static void collectProtocolsFromInheritedEntry(
 /// it's not supported to declare these conformances because any other framework
 /// (including the source framework) can declare this conformance, which would
 /// result in duplicate symbols at runtime.
+/// Find a type within the type of a stored property or enum payload whose
+/// layout is resilient, so that the layout of the containing type isn't fixed.
+static Type findResilientLayoutType(Type type) {
+  auto canType = type->getCanonicalType();
+
+  if (auto tuple = dyn_cast<TupleType>(canType)) {
+    for (auto elt : tuple->getElements())
+      if (auto found = findResilientLayoutType(elt.getType()))
+        return found;
+    return Type();
+  }
+
+  // References to classes have a fixed layout.
+  auto *nominal = canType->getAnyNominal();
+  if (!nominal || isa<ClassDecl>(nominal) || isa<ProtocolDecl>(nominal))
+    return Type();
+
+  if (nominal->isResilient())
+    return type;
+
+  if (auto nominalType = dyn_cast<NominalType>(canType)) {
+    for (auto arg : nominalType->getGenericArgs())
+      if (auto found = findResilientLayoutType(arg))
+        return found;
+  }
+  if (auto parent = canType->getNominalParent())
+    return findResilientLayoutType(parent);
+
+  return Type();
+}
+
+/// Whether \p decl, nested in the back-deployed type \p outer, is back-deployed
+/// along with it, on the primary target or on the target variant.
+static bool isBackDeployedAlongWith(const Decl *decl,
+                                    const NominalTypeDecl *outer) {
+  auto &ctx = decl->getASTContext();
+  for (bool forTargetVariant : {false, true}) {
+    if (forTargetVariant && !ctx.LangOpts.TargetVariant)
+      continue;
+    if (auto attrAndRange = outer->getBackDeployedAttrAndRange(forTargetVariant))
+      if (!decl->isOnlyAvailableWithinBackDeployedRange(attrAndRange->second,
+                                                        forTargetVariant))
+        return true;
+  }
+  return false;
+}
+
+/// Check the requirements on a back-deployed type, whose metadata is emitted
+/// into clients and so can't require runtime initialization, and on the
+/// types nested in it.
+static void checkBackDeployedType(NominalTypeDecl *NTD) {
+  auto &ctx = NTD->getASTContext();
+
+  // A public struct or enum nested in a back-deployed type is back-deployed
+  // along with it, unless it is only available where the outer type's
+  // defining module provides it. Other kinds of types can't be.
+  if (!NTD->getAttrs().getBackDeployed(ctx, /*forTargetVariant*/ false)) {
+    auto *outer = NTD->getDeclContext()->getSelfNominalTypeDecl();
+    if (outer && (isa<StructDecl>(outer) || isa<EnumDecl>(outer)) &&
+        outer->getModuleContext() == NTD->getModuleContext() &&
+        outer->isBackDeployed() && isBackDeployedAlongWith(NTD, outer) &&
+        NTD->getFormalAccessScope(/*useDC*/ nullptr,
+                                  /*treatUsableFromInlineAsPublic*/ true)
+            .isPublic()) {
+      if (!isa<StructDecl>(NTD) && !isa<EnumDecl>(NTD)) {
+        NTD->diagnose(diag::back_deployed_type_nested_type_kind, NTD, outer);
+        return;
+      }
+
+      if (!NTD->getAttrs().hasAttribute<FrozenAttr>()) {
+        NTD->diagnose(diag::back_deployed_type_nested_requires_frozen, NTD,
+                      outer);
+        return;
+      }
+    }
+  }
+
+  if (!(isa<StructDecl>(NTD) || isa<EnumDecl>(NTD)) ||
+      !NTD->isBackDeployed() || !NTD->getAttrs().hasAttribute<FrozenAttr>())
+    return;
+
+  if (auto *SD = dyn_cast<StructDecl>(NTD)) {
+    for (auto *var : SD->getStoredProperties()) {
+      if (auto found = findResilientLayoutType(var->getInterfaceType()))
+        var->diagnose(diag::back_deployed_type_resilient_layout, var, SD,
+                      found);
+    }
+  } else {
+    auto *ED = cast<EnumDecl>(NTD);
+    if (ED->isIndirect())
+      return;
+    for (auto *elt : ED->getAllElements()) {
+      if (elt->isIndirect() || !elt->hasAssociatedValues())
+        continue;
+      if (auto found = findResilientLayoutType(elt->getPayloadInterfaceType()))
+        elt->diagnose(diag::back_deployed_type_resilient_layout, elt, ED,
+                      found);
+    }
+  }
+}
+
 static void diagnoseRetroactiveConformances(
     ExtensionDecl *ext, DiagnosticEngine &diags) {
   ModuleDecl *module = ext->getParentModule();
@@ -2144,6 +2274,16 @@ static void checkProtocolRefinementRequirements(ProtocolDecl *proto) {
     if (!genericSig->requiresProtocol(ir.subject, ir.protocol))
       continue;
 
+    // If Copyable implies Deinitable, then applyInverses() already diagnosed a
+    // `~Deinitable` without `~Copyable`.
+    if (ir.getKind() == InvertibleProtocolKind::Deinitable &&
+        InverseRequirement::copyableImpliesDeinitable(ctx)) {
+      if (auto *copyable = ctx.getProtocol(KnownProtocolKind::Copyable)) {
+        if (genericSig->requiresProtocol(ir.subject, copyable))
+          continue;
+      }
+    }
+
     // We didn't diagnose this as an error for associated types prior to
     // SuppressedAssociatedTypesWithDefaults.
     //
@@ -2262,9 +2402,9 @@ public:
     // We don't do this for members of classes because it happens as part of
     // visiting their ABI members.
     if (!isa<ClassDecl>(decl->getDeclContext())) {
-      decl->visitAuxiliaryDecls([&](Decl *auxiliaryDecl) {
-        this->visit(auxiliaryDecl);
-      }, /*visitFreestandingExpanded=*/false);
+      decl->visitAuxiliaryDecls(
+          [&](Decl *auxiliaryDecl) { this->visit(auxiliaryDecl); },
+          /*visitFreestandingExpanded=*/false, /*visitExtensions*/ true);
     }
 
     if (auto *Stats = Ctx.Stats)
@@ -2280,6 +2420,7 @@ public:
     DeclVisitor<DeclChecker>::visit(decl);
 
     TypeChecker::checkExistentialTypes(decl);
+    diagnoseUnusableForeignTypesInDecl(decl);
 
     if (auto VD = dyn_cast<ValueDecl>(decl)) {
       TypeChecker::checkForForbiddenPrefix(Ctx, VD->getBaseName());
@@ -2304,11 +2445,14 @@ public:
       (void) VD->isDynamic();
 
       // Check for actor isolation of top-level and local declarations, and
-      // protocol requirements.g
+      // protocol requirements.
       // Declarations inside types are handled in checkConformancesInContext()
       // to avoid cycles involving associated type inference.
-      if (!VD->getDeclContext()->isTypeContext() ||
-          isa<ProtocolDecl>(VD->getDeclContext()))
+      // The isolation of a defer in a closure is that of the closure, which is
+      // not determined yet
+      if ((!VD->getDeclContext()->isTypeContext() ||
+           isa<ProtocolDecl>(VD->getDeclContext())) &&
+          !isDeferInClosureContext(VD))
         (void) getActorIsolation(VD);
 
       // If this is a member of a nominal type, don't allow it to have a name of
@@ -2335,13 +2479,8 @@ public:
             ExpandExtensionMacros{nominal},
             { });
 
-        // If strict memory safety checking is enabled, check the storage
-        // of the nominal type.
-        if (Ctx.LangOpts.hasFeature(
-                Feature::StrictMemorySafety, /*allowMigration=*/true) &&
-            !isa<ProtocolDecl>(nominal)) {
+        if (!isa<ProtocolDecl>(nominal))
           checkUnsafeStorage(nominal);
-        }
       }
     }
   }
@@ -2423,16 +2562,15 @@ public:
     // concurrency checking enabled.
     if (ID->preconcurrency() &&
         Ctx.LangOpts.StrictConcurrencyLevel == StrictConcurrency::Complete &&
-        Ctx.LangOpts.hasFeature(Feature::StrictMemorySafety) &&
         ID->getExplicitSafety() != ExplicitSafety::Unsafe) {
       diagnoseUnsafeUse(UnsafeUse::forPreconcurrencyImport(ID));
     }
   }
 
-  void visitUsingDecl(UsingDecl *UD) {
-    if (!UD->getDeclContext()->isModuleScopeContext()) {
-      // 'using' is only valid at file scope.
-      UD->diagnose(diag::decl_inner_scope);
+  void visitFileDefaultDecl(FileDefaultDecl *FDD) {
+    if (!FDD->getDeclContext()->isModuleScopeContext()) {
+      // 'default' is only valid at file scope.
+      FDD->diagnose(diag::decl_inner_scope);
     }
   }
 
@@ -2488,6 +2626,7 @@ public:
 
     case MacroDefinition::Kind::Invalid:
     case MacroDefinition::Kind::Builtin:
+    case MacroDefinition::Kind::Internal:
     case MacroDefinition::Kind::Expanded:
       // Nothing else to check here.
       break;
@@ -2554,6 +2693,37 @@ public:
     });
   }
 
+  void visitHiddenTypeLayoutInfoDecl(HiddenTypeLayoutInfoDecl *) {
+    llvm_unreachable("hidden layout declarations are not type checked");
+  }
+
+  /// Nothing consumes the value of a global, a static property, a lazy
+  /// property, or an `async let` binding explicitly, so its type must be
+  /// Deinitable.
+  static void checkNondeinitableStorage(VarDecl *VD) {
+    if (VD->isImplicit() || !VD->hasInterfaceType())
+      return;
+
+    enum : unsigned { Global, Static, Lazy, AsyncLet };
+    std::optional<unsigned> kind;
+    if (VD->isAsyncLet())
+      kind = AsyncLet;
+    else if (VD->getAttrs().hasAttribute<LazyAttr>())
+      kind = Lazy;
+    else if (VD->hasStorage() && VD->isStatic())
+      kind = Static;
+    else if (VD->hasStorage() && VD->getDeclContext()->isModuleScopeContext())
+      kind = Global;
+    if (!kind)
+      return;
+
+    auto type = VD->getTypeInContext();
+    if (type->hasError() || type->isDeinitable())
+      return;
+
+    VD->diagnose(diag::nondeinitable_storage, *kind, VD->getName(), type);
+  }
+
   void visitBoundVariable(VarDecl *VD) {
     // WARNING: Anything you put in this function will only be run when the
     // VarDecl is fully type-checked within its own file. It will NOT be run
@@ -2603,16 +2773,29 @@ public:
         // occur once per instantiation, which we don't yet handle.
         if (DC->getExtendedProtocolDecl()) {
           unimplementedStatic(ProtocolExtensions);
-        } else if (DC->isGenericContext()
-               && !DC->getGenericSignatureOfContext()->areAllParamsConcrete()) {
+        } else if (DC->isEffectivelyGenericContext()) {
           unimplementedStatic(GenericTypes);
         } else if (DC->getSelfClassDecl()) {
           auto StaticSpelling = PBD->getStaticSpelling();
           if (StaticSpelling != StaticSpellingKind::KeywordStatic)
             unimplementedStatic(Classes);
         }
+
+        // A back-deployed type is emitted into clients, each of which would
+        // have its own storage, unless the property is only available where
+        // the type's defining module provides it.
+        if (auto *nominal = DC->getSelfNominalTypeDecl()) {
+          if ((isa<StructDecl>(nominal) || isa<EnumDecl>(nominal)) &&
+              nominal->getModuleContext() == VD->getModuleContext() &&
+              nominal->isBackDeployed() &&
+              isBackDeployedAlongWith(VD, nominal))
+            VD->diagnose(diag::back_deployed_type_static_stored_property,
+                         nominal, VD);
+        }
       }
     }
+
+    checkNondeinitableStorage(VD);
 
     TypeChecker::checkDeclAttributes(VD);
 
@@ -2667,7 +2850,7 @@ public:
     // completely type checked at that point.
     auto &DE = Ctx.Diags;
     if (auto attr = VD->getAttrs().getAttribute<NoImplicitCopyAttr>()) {
-      if (auto *nom = VD->getInterfaceType()->getNominalOrBoundGenericNominal()) {
+      if (auto *nom = VD->getInterfaceType()->getNominalDecl()) {
         if (!nom->canBeCopyable()) {
           DE.diagnose(attr->getLocation(),
                       diag::noimplicitcopy_attr_not_allowed_on_moveonlytype)
@@ -2677,7 +2860,7 @@ public:
     }
 
     // @_staticExclusiveOnly types cannot be put into 'var's, only 'let'.
-    if (auto SD = VD->getInterfaceType()->getStructOrBoundGenericStruct()) {
+    if (auto SD = VD->getInterfaceType()->getStructDecl()) {
       if (SD->getAttrs().hasAttribute<StaticExclusiveOnlyAttr>()) {
         auto isProtocolContext = isa<ProtocolDecl>(DC);
 
@@ -3038,6 +3221,26 @@ public:
       }
     }
 
+    // A `consuming` index is consumed by whichever accessor runs, so it is only
+    // legal when a single accessor performs a whole access.
+    if (SD->getImplInfo().getReadWriteImpl() ==
+        ReadWriteImplKind::MaterializeToTemporary) {
+      for (auto *index : *SD->getIndices()) {
+        if (index->getValueOwnership() != ValueOwnership::Owned)
+          continue;
+
+        auto spelling = ParamDecl::getSpecifierSpelling(index->getSpecifier());
+        SD->diagnose(diag::subscript_consuming_parameter_separate_accessors,
+                     spelling);
+        if (auto *set = SD->getAccessor(AccessorKind::Set))
+          set->diagnose(diag::subscript_consuming_parameter_use_coroutine,
+                        "_modify");
+        index->setInvalid();
+        SD->setInvalid();
+        break;
+      }
+    }
+
     // Now check all the accessors.
     SD->visitEmittedAccessors([&](AccessorDecl *accessor) {
       visit(accessor);
@@ -3115,6 +3318,8 @@ public:
 
   void checkUnsupportedNestedType(NominalTypeDecl *NTD) {
     auto *DC = NTD->getDeclContext();
+
+    checkBackDeployedType(NTD);
 
     // We don't allow nested types inside inlinable contexts.
     auto kind = DC->getFragileFunctionKind();
@@ -3200,6 +3405,10 @@ public:
     (void) ED->hasCircularRawValue();
 
     TypeChecker::checkDeclAttributes(ED);
+
+    // Expand member macros so the members they add are checked below.
+    (void)evaluateOrDefault(Ctx.evaluator,
+                            ExpandSynthesizedMemberMacroRequest{ED}, {});
 
     for (Decl *member : ED->getMembers())
       visit(member);
@@ -3400,9 +3609,7 @@ public:
     (void) getDirectlyInheritedNominalTypeDecls(decl, inverses, anyObject);
 
     for (auto ip : inverses) {
-      // Allow ~Copyable when MoveOnlyClasses is enabled
-      if (ip == InvertibleProtocolKind::Copyable
-          && ctx.LangOpts.hasFeature(Feature::MoveOnlyClasses))
+      if (decl->canSuppressInvertible(ip))
         continue;
 
       ctx.Diags.diagnose(decl->getLoc(),
@@ -3467,8 +3674,16 @@ public:
     if (CD->isActor())
       TypeChecker::checkConcurrencyAvailability(CD->getLoc(), CD);
 
-    for (Decl *Member : CD->getABIMembers())
+    for (Decl *Member : CD->getABIMembers()) {
+      // Since `visit(Decl *)` skips visiting auxiliary decls for classes, we
+      // need to manually handle extension macros here.
+      if (auto *NTD = dyn_cast<NominalTypeDecl>(Member)) {
+        NTD->visitAuxiliaryExtensions([&](Decl *ext) { visit(ext); });
+      }
       visit(Member);
+    }
+
+    TypeChecker::checkTailAllocatedCounts(CD);
 
     // If this class requires all of its stored properties to have
     // in-class initializers, diagnose this now.
@@ -3497,7 +3712,7 @@ public:
       });
 
     if (auto superclassTy = CD->getSuperclass()) {
-      ClassDecl *Super = superclassTy->getClassOrBoundGenericClass();
+      ClassDecl *Super = superclassTy->getClassDecl();
       bool isInvalidSuperclass = false;
 
       if (Super->isFinal()) {
@@ -3576,6 +3791,28 @@ public:
           CD->diagnose(diag::superclass_of_open_not_open, superclassTy);
           Super->diagnose(diag::superclass_here);
         }
+
+        // A Swift class that subclasses a C++ foreign reference type has no
+        // Swift type metadata, and therefore no vtable: its members cannot be
+        // dynamically dispatched. Require the class to be 'final', which also
+        // means the foreign reference type is always the immediate superclass.
+        if (!isInvalidSuperclass &&
+            Ctx.LangOpts.hasFeature(Feature::ForeignReferenceTypeSubclassing) &&
+            !CD->isSemanticallyFinal() &&
+            CD->getForeignReferenceSuperclassOrSelf()) {
+          CD->diagnose(diag::foreign_reference_subclass_must_be_final, CD)
+              .fixItInsert(CD->getAttributeInsertionLoc(/*forModifier=*/true),
+                           "final ");
+        }
+
+        // The layout of a Swift subclass of a C++ foreign reference type is
+        // fixed at compile time, and it has no Swift class metadata that could
+        // describe its generic arguments (yet), so it cannot be generic.
+        if (!isInvalidSuperclass && CD->getForeignReferenceSuperclassOrSelf() &&
+            CD->isGenericContext()) {
+          CD->diagnose(diag::foreign_reference_subclass_cannot_be_generic, CD,
+                       /*inGenericContext=*/!CD->getGenericParams());
+        }
       }
     }
 
@@ -3625,6 +3862,9 @@ public:
     // Check the members.
     for (auto Member : PD->getMembers())
       visit(Member);
+
+    if (Ctx.LangOpts.EnableCOMInterop)
+      com::validateProtocol(PD);
 
     checkDeclCommon(PD);
 
@@ -3698,7 +3938,10 @@ public:
       }
 
       TypeChecker::checkParameterList(FD->getParameters(), FD);
+      TypeChecker::checkYieldList(FD->getYields(), FD);
     }
+
+    checkScopedSignature(FD);
 
     checkDeclCommon(FD);
 
@@ -3713,7 +3956,10 @@ public:
       diagnoseUntypedThrows(FD, throwsLoc);
     }
 
-    if (!checkOverrides(FD)) {
+    // A @cxx implementation's `override` keyword is checked against its C++
+    // declaration when it is matched to the imported method.
+    if (!checkOverrides(FD) &&
+        !FD->getAttrs().hasAttribute<CxxDeclAttr>(/*AllowInvalid=*/true)) {
       // If a method has an 'override' keyword but does not
       // override anything, complain.
       if (auto *OA = FD->getAttrs().getAttribute<OverrideAttr>()) {
@@ -3795,11 +4041,25 @@ public:
       }
     }
 
-    // If the function is exported to C, it must be representable in (Obj-)C.
-    if (auto CDeclAttr = FD->getAttrs().getAttribute<swift::CDeclAttr>()) {
+    // If the function is exported to a foreign language, its signature must be
+    // representable in that language. This covers @c and @_cdecl (C) and
+    // @cxx (C++), as well as @objc on a top-level function (SE-0495), which
+    // is a C export accepting Objective-C types.
+    DeclAttribute *foreignLangAttr =
+        FD->getAttrs().getAttribute<swift::CDeclAttr>();
+    if (!foreignLangAttr)
+      foreignLangAttr = FD->getAttrs().getAttribute<swift::CxxDeclAttr>();
+    if (foreignLangAttr) {
       evaluateOrDefault(Ctx.evaluator,
-                        TypeCheckCDeclFunctionRequest{FD, CDeclAttr},
+                        TypeCheckForeignFunctionRequest{FD, foreignLangAttr},
                         {});
+    } else if (FD->getDeclContext()->isModuleScopeContext() &&
+               !isa<AccessorDecl>(FD)) {
+      if (auto objcAttr = FD->getAttrs().getAttribute<ObjCAttr>()) {
+        evaluateOrDefault(Ctx.evaluator,
+                          TypeCheckForeignFunctionRequest{FD, objcAttr},
+                          {});
+      }
     }
 
     TypeChecker::checkObjCImplementation(FD);
@@ -3869,7 +4129,12 @@ public:
   static void diagnoseExtensionOfMarkerProtocol(ExtensionDecl *ED) {
     auto *nominal = ED->getExtendedNominal();
     if (auto *proto = dyn_cast_or_null<ProtocolDecl>(nominal)) {
-      if (proto->getKnownProtocolKind() && proto->isMarkerProtocol()) {
+      bool isExternalCOMInterfaceExtension =
+          ED->getASTContext().LangOpts.EnableCOMInterop &&
+          proto->isSpecificProtocol(KnownProtocolKind::COMInterface) &&
+          ED->getModuleContext() != proto->getModuleContext();
+      if ((proto->getKnownProtocolKind() && proto->isMarkerProtocol()) ||
+          isExternalCOMInterfaceExtension) {
         ED->diagnose(diag::cannot_extend_nominal, nominal);
       }
     }
@@ -4072,6 +4337,10 @@ public:
 
     TypeChecker::checkDeclAttributes(ED);
 
+    // Expand member macros so the members they add are checked below.
+    (void)evaluateOrDefault(Ctx.evaluator,
+                            ExpandSynthesizedMemberMacroRequest{ED}, {});
+
     // If this is an @_objcImplementation of a class, set up some aspects of the
     // class.
     if (auto CD = dyn_cast_or_null<ClassDecl>(ED->getImplementedObjCDecl())) {
@@ -4126,6 +4395,7 @@ public:
 
     TypeChecker::checkDeclAttributes(CD);
     TypeChecker::checkParameterList(CD->getParameters(), CD);
+    checkScopedSignature(CD);
 
     checkEmbeddedRestrictionsInSignature(CD);
 
@@ -4137,6 +4407,19 @@ public:
     if (throwsLoc.isValid() && !CD->getThrownTypeRepr() &&
         !CD->hasPolymorphicEffect(EffectKind::Throws)) {
       diagnoseUntypedThrows(CD, throwsLoc);
+    }
+
+    // If the class inherits from a C++ foreign reference type, prohibit
+    // failable and throwing initializers. There is no clear way to clean up the
+    // object if initialization fails.
+    if (auto classDecl = CD->getDeclContext()->getSelfClassDecl()) {
+      if (Ctx.LangOpts.hasFeature(Feature::ForeignReferenceTypeSubclassing) &&
+          !classDecl->hasClangNode() &&
+          classDecl->getForeignReferenceSuperclassOrSelf() &&
+          (CD->isFailable() || CD->hasThrows())) {
+        CD->diagnose(diag::foreign_reference_subclass_init_cannot_fail, CD,
+                     CD->isFailable());
+      }
     }
 
     // Check whether this initializer overrides an initializer in its
@@ -4272,12 +4555,30 @@ public:
         DD->diagnose(diag::destructor_decl_outside_class_or_noncopyable);
       }
 
+      // A `~Deinitable` type cannot have a user-defined deinit.
+      if (nom && isa<StructDecl, EnumDecl>(nom) &&
+          nom->canConformTo(InvertibleProtocolKind::Deinitable) ==
+              TypeDecl::CanBeInvertible::Never) {
+        DD->diagnose(diag::deinitable_illegal_deinit, nom);
+      }
+
       // Temporarily ban deinit on noncopyable enums, unless the experimental
       // feature flag is set.
       if (!Ctx.LangOpts.hasFeature(Feature::MoveOnlyEnumDeinits)
           && isa<EnumDecl>(nom)
           && !nom->canBeCopyable()) {
         DD->diagnose(diag::destructor_decl_on_noncopyable_enum);
+      }
+
+      // A Swift subclass of a C++ foreign reference type is destroyed by the
+      // C++ destructor of the implicitly instantiated shim type, which destroys
+      // the Swift fields of the subclass but does not run a Swift deinit.
+      if (auto classDecl = dyn_cast_or_null<ClassDecl>(nom)) {
+        if (classDecl->getForeignReferenceSuperclassOrSelf() &&
+            !DD->isImplicit() && !classDecl->hasClangNode()) {
+          DD->diagnose(diag::foreign_reference_subclass_cannot_have_deinit,
+                       classDecl);
+        }
       }
     }
 
@@ -4405,7 +4706,7 @@ void TypeChecker::checkParameterList(ParameterList *params,
     // If we have a noimplicitcopy parameter, make sure that the underlying type
     // is not move only. It is redundant.
     if (auto attr = param->getAttrs().getAttribute<NoImplicitCopyAttr>()) {
-      if (auto *nom = param->getInterfaceType()->getNominalOrBoundGenericNominal()) {
+      if (auto *nom = param->getInterfaceType()->getNominalDecl()) {
         if (!nom->canBeCopyable()) {
           param->diagnose(diag::noimplicitcopy_attr_not_allowed_on_moveonlytype)
             .fixItRemove(attr->getRange());
@@ -4415,7 +4716,7 @@ void TypeChecker::checkParameterList(ParameterList *params,
 
     // @_staticExclusiveOnly types cannot be passed as 'inout', only as either
     // a borrow or as consuming.
-    if (auto SD = param->getInterfaceType()->getStructOrBoundGenericStruct()) {
+    if (auto SD = param->getInterfaceType()->getStructDecl()) {
       if (SD->getAttrs().hasAttribute<StaticExclusiveOnlyAttr>() &&
           param->isInOut()) {
         SD->getASTContext().Diags.diagnoseWithNotes(
@@ -4438,6 +4739,10 @@ void TypeChecker::checkParameterList(ParameterList *params,
     // Check for duplicate parameter names.
     diagnoseDuplicateDecls(*params);
   }
+}
+
+void TypeChecker::checkYieldList(YieldList *yields, AbstractFunctionDecl *AFD) {
+  // TODO: Reject yields on non-coroutines
 }
 
 std::optional<unsigned>

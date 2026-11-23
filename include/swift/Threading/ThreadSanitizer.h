@@ -21,10 +21,12 @@
 #define SWIFT_THREADING_THREAD_SANITIZER_H
 
 #include "swift/shims/Visibility.h"
+#include "swift/ABI/MetadataValues.h"
+#include "swift/Runtime/Config.h"
 
 namespace swift {
 
-#if SWIFT_THREADING_NONE                                                \
+#if SWIFT_THREADING_NONE || SWIFT_THREADING_EMBEDDED                    \
   || defined(_WIN32) || defined(__wasi__)                               \
   || !__has_include(<dlfcn.h>)                                          \
   || (defined(SWIFT_STDLIB_HAS_DLSYM) && !SWIFT_STDLIB_HAS_DLSYM)
@@ -55,8 +57,10 @@ template <typename T> T *release(T *ptr) { return ptr; }
 namespace threading_impl {
 
 SWIFT_THREADING_EXPORT bool _swift_tsan_enabled;
-SWIFT_THREADING_EXPORT void (*_swift_tsan_acquire)(const void *ptr);
-SWIFT_THREADING_EXPORT void (*_swift_tsan_release)(const void *ptr);
+SWIFT_THREADING_EXPORT void (* __ptrauth_swift_thread_sanitizer_hook
+                             _swift_tsan_acquire)(const void *ptr);
+SWIFT_THREADING_EXPORT void (* __ptrauth_swift_thread_sanitizer_hook
+                             _swift_tsan_release)(const void *ptr);
 
 } // namespace threading_impl
 

@@ -16,7 +16,6 @@
 #ifndef SWIFT_TYPE_CHECK_REQUESTS_H
 #define SWIFT_TYPE_CHECK_REQUESTS_H
 
-#include "swift/ABI/InvertibleProtocols.h"
 #include "swift/AST/ASTNode.h"
 #include "swift/AST/ASTTypeIDs.h"
 #include "swift/AST/ActorIsolation.h"
@@ -31,11 +30,11 @@
 #include "swift/AST/Pattern.h"
 #include "swift/AST/PluginRegistry.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/ScopeRestrictions.h"
 #include "swift/AST/SimpleRequest.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeResolutionStage.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Basic/TaggedUnion.h"
 #include "swift/Basic/TypeID.h"
@@ -74,7 +73,7 @@ class PreInverseGenericsAttr;
 class TrailingWhereClause;
 class TypeAliasDecl;
 class TypeLoc;
-class UsingDecl;
+class FileDefaultDecl;
 class Witness;
 class TypeResolution;
 struct TypeWitnessAndDecl;
@@ -146,6 +145,7 @@ public:
     case Default:
       return Type();
     }
+    llvm_unreachable("covered switch");
   }
   Type getInheritedType() { return payload.get<Inherited_>().ty; }
   std::pair<Type, InverseTypeRepr *> getSuppressed() {
@@ -2671,6 +2671,26 @@ public:
   void cacheResult(Type value) const;
 };
 
+/// Determines the yield type of a coroutine
+class YieldsTypeRequest
+    : public SimpleRequest<YieldsTypeRequest, Type(FuncDecl *, unsigned),
+                           RequestFlags::SeparatelyCached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  Type evaluate(Evaluator &evaluator, FuncDecl *decl, unsigned idx) const;
+
+public:
+  // Separate caching.
+  bool isCached() const { return true; }
+  std::optional<Type> getCachedResult() const;
+  void cacheResult(Type value) const;
+};
+
 class PatternBindingEntryRequest
     : public SimpleRequest<PatternBindingEntryRequest,
                            const PatternBindingEntry *(PatternBindingDecl *,
@@ -3099,7 +3119,7 @@ public:
 class CompareDeclSpecializationRequest
     : public SimpleRequest<CompareDeclSpecializationRequest,
                            bool(DeclContext *, ValueDecl *, ValueDecl *, bool,
-                                bool, bool),
+                                bool, bool, bool),
                            RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -3110,7 +3130,7 @@ private:
   // Evaluation.
   bool evaluate(Evaluator &evaluator, DeclContext *DC, ValueDecl *VD1,
                 ValueDecl *VD2, bool dynamic, bool allowMissingConformances,
-                bool debugMode) const;
+                bool ignoreExecutionSemantics, bool debugMode) const;
 
 public:
   // Caching.
@@ -4022,6 +4042,48 @@ public:
   void cacheResult(Type value) const;
 };
 
+/// Resolves the element types of a `@_tailAllocated` attribute in the context
+/// of the class it is attached to.
+class ResolveTailAllocatedTypesRequest
+    : public SimpleRequest<ResolveTailAllocatedTypesRequest,
+                           ArrayRef<Type>(ClassDecl *, TailAllocatedAttr *),
+                           RequestFlags::SeparatelyCached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  ArrayRef<Type> evaluate(Evaluator &evaluator, ClassDecl *owner,
+                          TailAllocatedAttr *attr) const;
+
+public:
+  // Separate caching.
+  bool isCached() const { return true; }
+  std::optional<ArrayRef<Type>> getCachedResult() const;
+  void cacheResult(ArrayRef<Type> value) const;
+};
+
+/// Finds the counts property named by a `@_tailAllocated` attribute.
+class TailAllocatedCountsDeclRequest
+    : public SimpleRequest<TailAllocatedCountsDeclRequest,
+                           VarDecl *(ClassDecl *, TailAllocatedAttr *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  VarDecl *evaluate(Evaluator &evaluator, ClassDecl *owner,
+                    TailAllocatedAttr *attr) const;
+
+public:
+  bool isCached() const { return true; }
+};
+
 /// Determines whether this is a "simple" didSet i.e one that either does not
 /// use the implicit oldValue parameter in the body or does not take an explicit
 /// parameter (ex: 'didSet(oldValue)').
@@ -4110,9 +4172,6 @@ public:
 public:
   // Cycle handling.
   void noteCycleStep(DiagnosticEngine &diags) const;
-
-  static Type evaluate(const TypeResolution &resolution,
-                       TypeRepr *repr);
 
 private:
   friend SimpleRequest;
@@ -5057,11 +5116,14 @@ public:
 
 /// Compute the local discriminators for the given declaration context.
 ///
-/// This is a state-changing operation for closures within the context, which
-/// produces the discriminator value that any subsequent requests should use.
+/// This is a state-changing operation for closures within the context.
+///
+/// NOTE: Do not call into this request directly: Use
+/// `DeclContext::assignLocalDiscriminators` instead since that handles function
+/// bodies.
 class LocalDiscriminatorsRequest
     : public SimpleRequest<LocalDiscriminatorsRequest,
-                           unsigned(DeclContext *),
+                           evaluator::SideEffect(DeclContext *),
                            RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -5069,10 +5131,33 @@ public:
 private:
   friend SimpleRequest;
 
-  unsigned evaluate(Evaluator &evaluator, DeclContext *dc) const;
+  evaluator::SideEffect evaluate(Evaluator &evaluator, DeclContext *dc) const;
 
 public:
   bool isCached() const { return true; }
+};
+
+/// The function/top-level body equivalent to LocalDiscriminatorsRequest.
+///
+/// This is necessary since we support replacing function/top-level bodies for
+/// code completion, so need to be able to re-assign discriminators without also
+/// re-assigning for function parameters.
+class BodyDiscriminatorsRequest
+    : public SimpleRequest<BodyDiscriminatorsRequest,
+                           evaluator::SideEffect(DeclContext *),
+                           RequestFlags::SeparatelyCached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  evaluator::SideEffect evaluate(Evaluator &eval, DeclContext *) const;
+
+public:
+  bool isCached() const { return true; }
+  std::optional<evaluator::SideEffect> getCachedResult() const;
+  void cacheResult(evaluator::SideEffect) const;
 };
 
 /// Retrieve the raw documentation comment of a declaration.
@@ -5154,11 +5239,14 @@ public:
   bool isCached() const { return true; }
 };
 
-/// Check @c functions for compatibility with the foreign language.
-class TypeCheckCDeclFunctionRequest
-    : public SimpleRequest<TypeCheckCDeclFunctionRequest,
+/// Check a function that is exported to a foreign language for compatibility
+/// with that language. This covers @c, @_cdecl, and @cxx, as well as @objc
+/// on a top-level function (SE-0495); \p attr is the attribute that
+/// requested the export.
+class TypeCheckForeignFunctionRequest
+    : public SimpleRequest<TypeCheckForeignFunctionRequest,
                            evaluator::SideEffect(FuncDecl *FD,
-                                                 CDeclAttr *attr),
+                                                 DeclAttribute *attr),
                            RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -5167,7 +5255,7 @@ private:
   friend SimpleRequest;
 
   evaluator::SideEffect
-  evaluate(Evaluator &evaluator, FuncDecl *FD, CDeclAttr *attr) const;
+  evaluate(Evaluator &evaluator, FuncDecl *FD, DeclAttribute *attr) const;
 
 public:
   bool isCached() const { return true; }
@@ -5311,7 +5399,7 @@ public:
 
 class SerializeAttrGenericSignatureRequest
     : public SimpleRequest<SerializeAttrGenericSignatureRequest,
-                           GenericSignature(const AbstractFunctionDecl *,
+                           GenericSignature(const Decl *,
                                             AbstractSpecializeAttr *),
                            RequestFlags::SeparatelyCached> {
 public:
@@ -5320,8 +5408,7 @@ public:
 private:
   friend SimpleRequest;
 
-  GenericSignature evaluate(Evaluator &evaluator,
-                            const AbstractFunctionDecl *decl,
+  GenericSignature evaluate(Evaluator &evaluator, const Decl *decl,
                             AbstractSpecializeAttr *attr) const;
 
 public:
@@ -5514,6 +5601,45 @@ public:
   getCachedResult() const;
   void cacheResult(
       std::optional<llvm::ArrayRef<LifetimeDependenceInfo>> value) const;
+};
+
+/// Intermediate representation of the scopes of the accesses of a function's
+/// parameters and `self`, before being written into `Param`s.
+struct ParamAccessScopes {
+  /// For each parameter index, what access scope should it have relative to
+  /// the declaration's type. These can be error scopes if there was a
+  /// problem resolving the parameter.
+  ArrayRef<ScopeRef> Params;
+  /// Whether something refers to the access of `self`, requiring the outer
+  /// function type to have a scope parameter.
+  bool IsSelfReferenced = false;
+  /// The declared `@_scopeParams`, plus the accesses that are referenced
+  /// without being bound by `@_accessScope`.
+  ScopeSignature Signature;
+};
+
+/// Resolves the scopes of the accesses of the parameters and `self` of a
+/// function that supports scopes.
+///
+/// DISCUSSION: Each parameter's access scope depends on the whole signature,
+/// like which other accesses something refers to, so they're computed together
+/// syntactically. Since each type depends on access scope numbering, depending
+/// on the type of parameters would be cyclic.
+class ParamAccessScopesRequest
+    : public SimpleRequest<ParamAccessScopesRequest,
+                           ParamAccessScopes(AbstractFunctionDecl *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  ParamAccessScopes evaluate(Evaluator &evaluator,
+                             AbstractFunctionDecl *fn) const;
+
+public:
+  bool isCached() const { return true; }
 };
 
 class CaptureInfoRequest :
@@ -5735,9 +5861,9 @@ public:
   void cacheResult(std::optional<SemanticAvailabilitySpec> value) const;
 };
 
-/// Gathers the file-level defaults declared by `using ...` at the top of a
+/// Gathers the file-level defaults declared by `default ...` at the top of a
 /// source file, and diagnoses any issues that would affect results. Other
-/// validation in `visitUsingDecl` instead.
+/// validation in `visitFileDefaultDecl` instead.
 class FileDefaultsRequest
     : public SimpleRequest<FileDefaultsRequest,
                            FileDefaults(const SourceFile *),
@@ -5754,7 +5880,7 @@ public:
   bool isCached() const { return true; }
 };
 
-/// Materializes file-level `using @available(...)` defaults onto \p decl's
+/// Materializes file-level `default @available(...)` defaults onto \p decl's
 /// attribute list by tail-appending implicit clones of each applicable
 /// availability attr. Must only be called on top-level value decls and
 /// extensions.

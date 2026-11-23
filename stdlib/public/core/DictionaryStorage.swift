@@ -256,6 +256,9 @@ extension __RawDictionaryStorage {
 }
 
 @unsafe @usableFromInline
+#if hasFeature(TailAllocatedAttribute)
+@_tailAllocated(counts: _tailCounts, types: _HashTable.Word, Key, Value)
+#endif
 final internal class _DictionaryStorage<Key: Hashable, Value>
   : __RawDictionaryStorage, @unsafe _NSDictionaryCore {
   // This type is made with allocWithTailElems, so no init is ever called.
@@ -264,6 +267,19 @@ final internal class _DictionaryStorage<Key: Hashable, Value>
   override internal init(_doNotCallMe: ()) {
     _internalInvariantFailure("This class cannot be directly initialized")
   }
+
+#if hasFeature(TailAllocatedAttribute)
+  /// The numbers of bitmap words, keys and values allocated, for typed
+  /// deallocation. (The word count is `_UnsafeBitset.wordCount`, without its
+  /// checks, so the deinit stays free of traps.)
+  @export(implementation)
+  internal final var _tailCounts: (Int, Int, Int) {
+    let bucketCount = unsafe _bucketCount
+    let wordCount = (bucketCount &+ (Int.bitWidth &- 1))
+      &>> Int.bitWidth.trailingZeroBitCount
+    return (wordCount, bucketCount, bucketCount)
+  }
+#endif
 
   deinit {
     guard unsafe _count > 0 else { return }
@@ -437,14 +453,14 @@ extension _DictionaryStorage {
     capacity: Int,
     move: Bool
   ) -> _DictionaryStorage {
-    let scale = unsafe _HashTable.scale(forCapacity: capacity)
+    let scale = _HashTable.scale(forCapacity: capacity)
     return unsafe allocate(scale: scale, age: nil, seed: nil)
   }
 
   @usableFromInline
   @_effects(releasenone)
   static internal func allocate(capacity: Int) -> _DictionaryStorage {
-    let scale = unsafe _HashTable.scale(forCapacity: capacity)
+    let scale = _HashTable.scale(forCapacity: capacity)
     return unsafe allocate(scale: scale, age: nil, seed: nil)
   }
 
@@ -455,8 +471,8 @@ extension _DictionaryStorage {
     _ cocoa: __CocoaDictionary,
     capacity: Int
   ) -> _DictionaryStorage {
-    let scale = unsafe _HashTable.scale(forCapacity: capacity)
-    let age = unsafe _HashTable.age(for: cocoa.object)
+    let scale = _HashTable.scale(forCapacity: capacity)
+    let age = _HashTable.age(for: cocoa.object)
     return unsafe allocate(scale: scale, age: age, seed: nil)
   }
 #endif
@@ -471,7 +487,7 @@ extension _DictionaryStorage {
     _internalInvariant(scale >= 0 && scale < Int.bitWidth - 1)
 
     let bucketCount = (1 as Int) &<< scale
-    let wordCount = unsafe _UnsafeBitset.wordCount(forCapacity: bucketCount)
+    let wordCount = _UnsafeBitset.wordCount(forCapacity: bucketCount)
     let storage = unsafe Builtin.allocWithTailElems_3(
       _DictionaryStorage<Key, Value>.self,
       wordCount._builtinWordValue, _HashTable.Word.self,
@@ -486,7 +502,7 @@ extension _DictionaryStorage {
       keysAddr, bucketCount._builtinWordValue, Key.self,
       Value.self)
     unsafe storage._count = 0
-    unsafe storage._capacity = unsafe _HashTable.capacity(forScale: scale)
+    unsafe storage._capacity = _HashTable.capacity(forScale: scale)
     unsafe storage._scale = scale
     unsafe storage._reservedScale = 0
     unsafe storage._extra = 0

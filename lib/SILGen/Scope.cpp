@@ -11,7 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "Scope.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Range.h"
 
 using namespace swift;
@@ -132,6 +131,7 @@ RValue Scope::popPreservingValue(RValue &&rv) {
 void Scope::popImpl() {
   verify();
   cleanups.innermostScope = savedInnermostScope;
+  cleanups.SGF.enterBlockEndDebugScope(loc);
   cleanups.endScope(depth, loc);
   if (cleanups.innermostScope)
     cleanups.stack.checkIterator(cleanups.innermostScope->depth);

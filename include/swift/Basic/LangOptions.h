@@ -269,6 +269,9 @@ namespace swift {
     /// Emit remarks for unexpected conditions when serializing a module.
     bool EnableModuleSerializationRemarks = false;
 
+    /// Emit remarks about hidden type layout serialization.
+    bool EnableHiddenTypeLayoutSerializationRemarks = false;
+
     /// Emit remarks about the source of each element exposed by the module API.
     bool EnableModuleApiImportRemarks = false;
 
@@ -675,6 +678,10 @@ namespace swift {
     /// for bypassing resilience when accessing the decl. By default, a warning is issued
     /// if a deserialization failure is found; this flag causes the build to fail fast instead.
     bool AbortOnDeserializationFailForPackageCMO = false;
+
+    /// Returns the same discriminator for every ClosureExpr. Testing purposes
+    /// only.
+    bool DebugDuplicateClosureDiscriminators = false;
 
     /// Enables dumping type witness systems from associated type inference.
     bool DumpTypeWitnessSystems = false;
@@ -1109,6 +1116,17 @@ namespace swift {
 
     /// Enable type variable joins. This will be on by default eventually.
     bool SolverEnableTypeVariableJoins = false;
+
+    /// Enable supertype binding promotion. This will be on by default eventually.
+    bool SolverEnablePromoteSupertypes = false;
+
+    /// Enable modeling optional conversions without disjunctions.
+    /// This will be on by default eventually.
+    bool SolverEnableShortConversions = false;
+
+    /// Enable more conditions for edge contraction for closure parameters.
+    /// This will be on by default eventually.
+    bool SolverEnableExtremeEdgeContraction = false;
   };
 
   /// Options for controlling the behavior of the Clang importer.

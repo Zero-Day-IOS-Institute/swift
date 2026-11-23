@@ -24,7 +24,6 @@
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/Decl.h" // FIXME: Bad dependency
 #include "swift/AST/ExistentialLayout.h"
-#include "swift/AST/MacroDiscriminatorContext.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/ASTWalker.h"
@@ -34,7 +33,6 @@
 #include "swift/AST/TypeLoc.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/PointerUnion.h"
-#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/Twine.h"
 using namespace swift;
 
@@ -110,7 +108,12 @@ namespace {
 } // end anonymous namespace
 
 void Expr::setType(Type T) {
-  assert(!T || !T->hasTypeVariable() || !T->hasPlaceholder());
+  if (T) {
+    // TypeJoinExpr is only present during solving and so can use type variables
+    ASSERT(isa<TypeJoinExpr>(this) || !T->hasTypeVariableOrHole());
+    // TypeExprs can have placeholder types, they get opened in CSGen.
+    ASSERT(isa<TypeExpr>(this) || !T->hasPlaceholder());
+  }
   Ty = T;
 }
 
@@ -300,7 +303,9 @@ DeclRefExpr *Expr::getMemberOperatorRef() {
   return operatorRef;
 }
 
-ConcreteDeclRef Expr::getReferencedDecl(bool stopAtParenExpr) const {
+ConcreteDeclRef
+Expr::getReferencedDecl(ReferencedDeclLookThrough lookThrough) const {
+  // clang-format off
   switch (getKind()) {
   // No declaration reference.
   #define NO_REFERENCE(Id) case ExprKind::Id: return ConcreteDeclRef()
@@ -309,8 +314,10 @@ ConcreteDeclRef Expr::getReferencedDecl(bool stopAtParenExpr) const {
       return cast<Id##Expr>(this)->Getter()
   #define PASS_THROUGH_REFERENCE(Id, GetSubExpr)                      \
     case ExprKind::Id:                                                \
+      if (lookThrough == ReferencedDeclLookThrough::None)             \
+        return ConcreteDeclRef();                                     \
       if (auto sub = cast<Id##Expr>(this)->GetSubExpr())              \
-        return sub->getReferencedDecl(stopAtParenExpr);               \
+        return sub->getReferencedDecl(lookThrough);                   \
       return ConcreteDeclRef();
 
   NO_REFERENCE(Error);
@@ -353,9 +360,9 @@ ConcreteDeclRef Expr::getReferencedDecl(bool stopAtParenExpr) const {
   NO_REFERENCE(Sequence);
 
   case ExprKind::Paren:
-    if (stopAtParenExpr) return ConcreteDeclRef();
-    return cast<ParenExpr>(this)
-               ->getSubExpr()->getReferencedDecl(stopAtParenExpr);
+    if (lookThrough != ReferencedDeclLookThrough::All)
+      return ConcreteDeclRef();
+    return cast<ParenExpr>(this)->getSubExpr()->getReferencedDecl(lookThrough);
 
   PASS_THROUGH_REFERENCE(UnresolvedMemberChainResult, getSubExpr);
   PASS_THROUGH_REFERENCE(DotSelf, getSubExpr);
@@ -472,6 +479,7 @@ ConcreteDeclRef Expr::getReferencedDecl(bool stopAtParenExpr) const {
 #undef NO_REFERENCE
 #undef PASS_THROUGH_REFERENCE
   }
+  // clang-format on
 
   return ConcreteDeclRef();
 }
@@ -1629,6 +1637,9 @@ static ValueDecl *getCalledValue(Expr *E, bool skipFunctionConversions) {
                             skipFunctionConversions);
   }
 
+  if (auto *DSBI = dyn_cast<DotSyntaxBaseIgnoredExpr>(E))
+    return getCalledValue(DSBI->getRHS(), skipFunctionConversions);
+
   Expr *E2 = E->getValueProvidingExpr();
 
   if (auto *L = dyn_cast<LoadExpr>(E2))
@@ -1978,9 +1989,7 @@ unsigned AbstractClosureExpr::getDiscriminator() const {
   if (raw != InvalidDiscriminator)
     return raw;
 
-  ASTContext &ctx = getASTContext();
-  evaluateOrDefault(
-      ctx.evaluator, LocalDiscriminatorsRequest{getParent()}, 0);
+  getParent()->assignLocalDiscriminators();
 
 #if NDEBUG
   static constexpr bool useFallbackDiscriminator = true;
@@ -1994,6 +2003,7 @@ unsigned AbstractClosureExpr::getDiscriminator() const {
   //   3. We are within top-level code where there's nothing to anchor to
   //
   // then assign the next discriminator now.
+  ASTContext &ctx = getASTContext();
   if (getRawDiscriminator() == InvalidDiscriminator &&
       (ctx.Diags.hadAnyError() ||
        getParentSourceFile()->getFulfilledMacroRole() != std::nullopt ||
@@ -2111,8 +2121,12 @@ bool AbstractClosureExpr::isBodyAsync() const {
   return getOrComputeExtInfo(this).isAsync();
 }
 
-bool AbstractClosureExpr::isCalledOnce() const {
-  return getOrComputeExtInfo(this).isCalledOnce();
+bool AbstractClosureExpr::hasCalledAtMostOnceSemantics() const {
+  return getOrComputeExtInfo(this).hasCalledAtMostOnceSemantics();
+}
+
+bool AbstractClosureExpr::isCallConsuming() const {
+  return getOrComputeExtInfo(this).isCallConsuming();
 }
 
 bool AbstractClosureExpr::hasSingleExpressionBody() const {
@@ -2198,7 +2212,7 @@ Type ClosureExpr::getExplicitThrownType() const {
 }
 
 void ClosureExpr::setExplicitResultType(Type ty) {
-  assert(ty && !ty->hasTypeVariable() && !ty->hasPlaceholder());
+  assert(ty && !ty->hasTypeVariableOrHole() && !ty->hasPlaceholder());
   ExplicitResultTypeAndBodyState.getPointer()
       ->setType(MetatypeType::get(ty));
 }
@@ -2546,7 +2560,7 @@ std::optional<unsigned> KeyPathExpr::findComponentWithSubscriptArg(Expr *arg) {
   return std::nullopt;
 }
 
-BoundGenericType *KeyPathExpr::getKeyPathType() const {
+NominalType *KeyPathExpr::getKeyPathType() const {
   auto type = getType();
   if (!type)
     return nullptr;
@@ -2560,7 +2574,7 @@ BoundGenericType *KeyPathExpr::getKeyPathType() const {
            type->isReferenceWritableKeyPath());
   }
 
-  return type->castTo<BoundGenericType>();
+  return type->castTo<NominalType>();
 }
 
 Type KeyPathExpr::getRootType() const {
@@ -2577,9 +2591,10 @@ Type KeyPathExpr::getValueType() const {
 
 KeyPathExpr::Component KeyPathExpr::Component::forSubscript(
     ASTContext &ctx, ConcreteDeclRef subscript, ArgumentList *argList,
-    Type elementType, ArrayRef<ProtocolConformanceRef> indexHashables) {
+    Type elementType, ArrayRef<ProtocolConformanceRef> indexHashables,
+    SourceLoc loc) {
   return Component(subscript, argList, indexHashables, Kind::Subscript,
-                   elementType, argList->getLParenLoc());
+                   elementType, loc);
 }
 
 KeyPathExpr::Component

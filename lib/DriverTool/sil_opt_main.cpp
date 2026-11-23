@@ -17,35 +17,27 @@
 
 #include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/AST/SILOptions.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/FileTypes.h"
-#include "swift/Basic/InitializeSwiftModules.h"
 #include "swift/Basic/LLVMInitialize.h"
 #include "swift/Basic/QuotedString.h"
-#include "swift/Frontend/DiagnosticVerifier.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/IRGen/IRGenPublic.h"
 #include "swift/IRGen/IRGenSILPasses.h"
 #include "swift/Parse/ParseVersion.h"
-#include "swift/SIL/SILRemarkStreamer.h"
 #include "swift/SILOptimizer/Analysis/Analysis.h"
 #include "swift/SILOptimizer/PassManager/PassManager.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/Serialization/SerializationOptions.h"
-#include "swift/Serialization/SerializedModuleLoader.h"
 #include "swift/Serialization/SerializedSILLoader.h"
 #include "swift/Subsystems.h"
 #include "swift/SymbolGraphGen/SymbolGraphOptions.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Signals.h"
-#include "llvm/Support/TargetSelect.h"
-#include "llvm/Support/YAMLTraits.h"
 #include <cstdio>
 using namespace swift;
 
@@ -101,6 +93,7 @@ convertSILOptToRawStrictConcurrencyLevel(SILOptStrictConcurrency level) {
   case SILOptStrictConcurrency::Minimal:
     return StrictConcurrency::Minimal;
   }
+  llvm_unreachable("covered switch");
 }
 
 namespace llvm {
@@ -226,12 +219,6 @@ struct SILOptOptions {
   StrictImplicitModuleContext = llvm::cl::opt<bool>("strict-implicit-module-context",
                               llvm::cl::desc("Enable the strict forwarding of compilation "
                                              "context to downstream implicit module dependencies"));
-
-  llvm::cl::opt<bool>
-  DisableSILOwnershipVerifier = llvm::cl::opt<bool>(
-      "disable-sil-ownership-verifier",
-      llvm::cl::desc(
-          "Do not verify SIL ownership invariants during SIL verification"));
 
   llvm::cl::opt<bool>
   EnableSILOpaqueValues = llvm::cl::opt<bool>("enable-sil-opaque-values",
@@ -543,6 +530,10 @@ struct SILOptOptions {
                        llvm::cl::desc("Enable C++ interop."),
                        llvm::cl::init(false));
 
+  llvm::cl::opt<bool> EnableCOMInterop{"enable-experimental-com-interop",
+                                       llvm::cl::desc("Enable COM interop."),
+                                       llvm::cl::init(false)};
+
   llvm::cl::opt<bool>
       IgnoreAlwaysInline = llvm::cl::opt<bool>("ignore-always-inline",
                          llvm::cl::desc("Ignore [always_inline] attribute."),
@@ -564,6 +555,16 @@ struct SILOptOptions {
   llvm::cl::opt<bool> DebugDiagnosticNames = llvm::cl::opt<bool>(
       "debug-diagnostic-names",
       llvm::cl::desc("Include diagnostic names when printing"));
+
+  llvm::cl::opt<bool> AssertOnDiagnosticError = llvm::cl::opt<bool>(
+      "assert-on-diagnostic-error",
+      llvm::cl::desc("Trap when an error diagnostic is emitted. For compiler "
+                     "developers only."));
+
+  llvm::cl::opt<bool> AssertOnDiagnosticWarning = llvm::cl::opt<bool>(
+      "assert-on-diagnostic-warning",
+      llvm::cl::desc("Trap when a warning diagnostic is emitted. For compiler "
+                     "developers only."));
 
   llvm::cl::opt<swift::UnavailableDeclOptimization>
       UnavailableDeclOptimization =
@@ -588,10 +589,6 @@ struct SILOptOptions {
       "swift-version",
       llvm::cl::desc(
           "The swift version to assume AST declarations correspond to"));
-
-  llvm::cl::opt<bool> EnableAddressDependencies = llvm::cl::opt<bool>(
-      "enable-address-dependencies",
-      llvm::cl::desc("Enable enforcement of lifetime dependencies on addressable values."));
 
   llvm::cl::opt<bool> DisaleAggressiveReg2Mem = llvm::cl::opt<bool>(
       "disable-aggressive-reg2mem",
@@ -640,9 +637,11 @@ static void runCommandLineSelectedPasses(SILModule *Module,
       isMandatory, IRGenMod);
 
   if (Module->getOptions().VerifyAll) {
-    Module->verify();
+    // If no passes were run, the module was already verified after parsing.
+    if (!options.Passes.empty())
+      Module->verify();
     SILPassManager pm(Module, isMandatory, IRGenMod);
-    pm.runSwiftModuleVerification();
+    pm.runMandatoryModuleVerification();
   }
 }
 
@@ -761,6 +760,10 @@ int sil_opt_main(ArrayRef<const char *> argv, void *MainAddr) {
     Invocation.getDiagnosticOptions().PrintDiagnosticNames =
         PrintDiagnosticNamesMode::Identifier;
   }
+  Invocation.getDiagnosticOptions().AssertOnError |=
+      options.AssertOnDiagnosticError;
+  Invocation.getDiagnosticOptions().AssertOnWarning |=
+      options.AssertOnDiagnosticWarning;
 
   for (auto &featureName : options.UpcomingFeatures) {
     auto feature = Feature::getUpcomingFeature(featureName);
@@ -811,6 +814,14 @@ int sil_opt_main(ArrayRef<const char *> argv, void *MainAddr) {
 
   Invocation.getLangOptions().EnableCXXInterop = options.EnableCxxInterop;
   Invocation.computeCXXStdlibOptions();
+
+  if (options.EnableCOMInterop) {
+    auto &LangOpts = Invocation.getLangOptions();
+    LangOpts.EnableCOMInterop = true;
+    LangOpts.COMModel = LangOpts.Target.isOSDarwin()
+                            ? LangOptions::COMInteropModel::CoreFoundation
+                            : LangOptions::COMInteropModel::Microsoft;
+  }
 
   Invocation.getLangOptions().UnavailableDeclOptimizationMode =
       options.UnavailableDeclOptimization;
@@ -863,7 +874,6 @@ int sil_opt_main(ArrayRef<const char *> argv, void *MainAddr) {
   SILOpts.VerifyNone = options.SILVerifyNone;
   SILOpts.RemoveRuntimeAsserts = options.RemoveRuntimeAsserts;
   SILOpts.AssertConfig = options.AssertConfId;
-  SILOpts.VerifySILOwnership = !options.DisableSILOwnershipVerifier;
   SILOpts.OptRecordFile = options.RemarksFilename;
   SILOpts.OptRecordPasses = options.RemarksPasses;
   SILOpts.EnableStackProtection = true;
@@ -931,7 +941,6 @@ int sil_opt_main(ArrayRef<const char *> argv, void *MainAddr) {
   SILOpts.EnablePackMetadataStackPromotion =
       options.EnablePackMetadataStackPromotion;
 
-  SILOpts.EnableAddressDependencies = options.EnableAddressDependencies;
   if (options.DisaleAggressiveReg2Mem)
     SILOpts.UseAggressiveReg2MemForCodeSize = false;
   if (options.EnableCalleeAllocatedCoroAbi)

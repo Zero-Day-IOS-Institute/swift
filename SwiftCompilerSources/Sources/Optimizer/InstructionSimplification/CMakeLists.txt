@@ -23,14 +23,17 @@ swift_compiler_sources(Optimizer
   SimplifyConvertEscapeToNoEscape.swift
   SimplifyCopyBlock.swift
   SimplifyCopyValue.swift
+  SimplifyDebugReconstruction.swift
   SimplifyDebugStep.swift
   SimplifyDestroyValue.swift
   SimplifyDestructure.swift
   SimplifyDifferentiableFunction.swift
+  SimplifyDynamicPackIndex.swift
   SimplifyEndCOWMutationAddr.swift
   SimplifyEndLifetime.swift
   SimplifyExplicitCopy.swift
   SimplifyFixLifetime.swift
+  SimplifyForwardingInstruction.swift
   SimplifyGlobalValue.swift
   SimplifyIndexingInstructions.swift
   SimplifyInitEnumDataAddr.swift
@@ -40,9 +43,11 @@ swift_compiler_sources(Optimizer
   SimplifyMarkDependence.swift
   SimplifyMoveValue.swift
   SimplifyOpenExistentialRef.swift
+  SimplifyPackLength.swift
   SimplifyPartialApply.swift
   SimplifyPhiArgument.swift
   SimplifyPointerToAddress.swift
+  SimplifyRawPointerToRef.swift
   SimplifyRefCasts.swift
   SimplifyRetainReleaseValue.swift
   SimplifyStoreBorrow.swift
@@ -51,12 +56,15 @@ swift_compiler_sources(Optimizer
   SimplifyStructExtract.swift
   SimplifySwitchEnum.swift
   SimplifySwitchEnumAddr.swift
+  SimplifyThinToThickFunction.swift
   SimplifyTuple.swift
   SimplifyTupleExtract.swift
   SimplifyTuplePackElementAddr.swift
   SimplifyTypeValue.swift
   SimplifyUncheckedAddrCast.swift
   SimplifyUncheckedEnumData.swift
+  SimplifyUncheckedOwnership.swift
   SimplifyUncheckedOwnershipConversion.swift
+  SimplifyUpcast.swift
   SimplifyValueToBridgeObject.swift
   SimplifyWitnessMethod.swift)

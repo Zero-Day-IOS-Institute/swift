@@ -19,9 +19,7 @@
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/PotentialMacroExpansions.h"
 #include "swift/AST/ProtocolConformance.h"
-#include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/ClangImporter/ClangImporterRequests.h"
 #include "swift/Subsystems.h"
 
@@ -264,17 +262,25 @@ GenericParamListRequest::getCachedResult() const {
   case GenericParamsState::Parsed:
     return std::nullopt;
   }
+  llvm_unreachable("covered switch");
 }
 
 void GenericParamListRequest::cacheResult(GenericParamList *params) const {
   using GenericParamsState = GenericContext::GenericParamsState;
   auto *context = std::get<0>(getStorage());
+
+  // If we hit a cycle we may already have the value cached, make sure it's
+  // the same.
+  if (context->GenericParamsAndState.getInt() != GenericParamsState::Parsed) {
+    ASSERT(context->GenericParamsAndState.getPointer() == params);
+    return;
+  }
+
   if (params)
     params->setDeclContext(context);
 
-  assert(context->GenericParamsAndState.getInt() == GenericParamsState::Parsed);
   bool hadParsedGenericParams =
-  context->GenericParamsAndState.getPointer() != nullptr;
+      context->GenericParamsAndState.getPointer() != nullptr;
   auto newState = hadParsedGenericParams
       ? GenericParamsState::ParsedAndTypeChecked
       : GenericParamsState::TypeChecked;

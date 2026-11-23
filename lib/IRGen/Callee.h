@@ -18,7 +18,6 @@
 #ifndef SWIFT_IRGEN_CALLEE_H
 #define SWIFT_IRGEN_CALLEE_H
 
-#include <type_traits>
 #include "swift/AST/IRGenOptions.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "swift/SIL/SILType.h"
@@ -591,7 +590,7 @@ namespace irgen {
     }
 
     bool hasSubstitutions() const {
-      return Info.Substitutions.hasAnySubstitutableParams();
+      return Info.Substitutions.isEffectivelyGeneric();
     }
     
     SubstitutionMap getSubstitutions() const { return Info.Substitutions; }
@@ -636,6 +635,9 @@ namespace irgen {
 
     /// Given that this callee is a C++ method, return the self argument.
     llvm::Value *getCXXMethodSelf() const;
+
+    /// Given that this callee is a COM method, return the interface pointer.
+    llvm::Value *getCOMMethodSelf() const;
 
     /// Given that this callee is an ObjC method, return the receiver
     /// argument.  This might not be 'self' anymore.

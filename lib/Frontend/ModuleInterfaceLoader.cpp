@@ -20,7 +20,6 @@
 #include "swift/AST/FileSystem.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/SearchPathOptions.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Platform.h"
 #include "swift/Basic/Sanitizers.h"
 #include "swift/Basic/StringExtras.h"
@@ -34,8 +33,6 @@
 #include "swift/Serialization/Validation.h"
 #include "swift/Strings.h"
 #include "clang/Basic/Module.h"
-#include "clang/Frontend/CompileJobCacheResult.h"
-#include "clang/Frontend/CompilerInstance.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/PreprocessorOptions.h"
@@ -48,7 +45,6 @@
 #include "llvm/CAS/ObjectStore.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/Errc.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/VirtualOutputBackend.h"
@@ -332,10 +328,11 @@ struct ModuleRebuildInfo {
                 StringRef prebuiltCacheDir, SourceLoc loc,
                 DiagArgs &&...diagArgs) {
     diags.diagnose(loc, std::forward<DiagArgs>(diagArgs)...);
-    auto SDKVer = getSDKBuildVersion(ctx.SearchPathOpts.getSDKPath());
+    auto &FS = *ctx.SourceMgr.getFileSystem();
+    auto SDKVer = getSDKBuildVersion(ctx.SearchPathOpts.getSDKPath(), FS);
     llvm::SmallString<64> buffer = prebuiltCacheDir;
     llvm::sys::path::append(buffer, "SystemVersion.plist");
-    auto PBMVer = getSDKBuildVersionFromPlist(buffer.str());
+    auto PBMVer = getSDKBuildVersionFromPlist(buffer.str(), FS);
     if (!SDKVer.empty() && !PBMVer.empty()) {
       // Remark the potential version difference.
       diags.diagnose(loc, diag::sdk_version_pbm_version, SDKVer,
@@ -1707,12 +1704,22 @@ void InterfaceSubContextDelegateImpl::inheritOptionsForBuildingInterface(
   // propagates the same flags into its Clang cc1 args. This is important because
   // -sanitize options can add target-features (e.g. MTE). These are checked when
   // loading a PCM (and mismatches are fatal).
+  //
+  // All sanitizers must be passed as a single comma-joined '-sanitize' flag.
+  // Swift has no '-fno-sanitize' equivalent, so if inheriting
+  // '-sanitize=undefined,address' it would not be possible to disable one of
+  // sanitizers without this 'last occurrence wins' behavior.
   genericSubInvocation.getSILOptions().Sanitizers = silOpts.Sanitizers;
+  std::string SanitizerList;
 #define SANITIZER(_, kind, name, __)                                           \
   if (silOpts.Sanitizers & SanitizerKind::kind) {                              \
-    GenericArgs.push_back("-sanitize=" #name);                                 \
+    if (!SanitizerList.empty())                                                \
+      SanitizerList += ',';                                                    \
+    SanitizerList += #name;                                                    \
   }
 #include "swift/Basic/Sanitizers.def"
+  if (!SanitizerList.empty())
+    GenericArgs.push_back(ArgSaver.save("-sanitize=" + SanitizerList).data());
 
   genericSubInvocation.setImportSearchPaths(
       SearchPathOpts.getImportSearchPaths());
@@ -1815,8 +1822,10 @@ void InterfaceSubContextDelegateImpl::inheritOptionsForBuildingInterface(
     GenericArgs.push_back(clangImporterOpts.BuildSessionFilePath);
   }
 
-  if (casOpts.EnableCaching) {
+  if (casOpts.EnableCaching || casOpts.ImportModuleFromCAS) {
     genericSubInvocation.getCASOptions().EnableCaching = casOpts.EnableCaching;
+    genericSubInvocation.getCASOptions().ImportModuleFromCAS =
+        casOpts.ImportModuleFromCAS;
     genericSubInvocation.getCASOptions().Config = casOpts.Config;
     genericSubInvocation.getCASOptions().HasImmutableFileSystem =
         casOpts.HasImmutableFileSystem;
@@ -1846,7 +1855,10 @@ bool InterfaceSubContextDelegateImpl::extractSwiftInterfaceVersionAndArgs(
   }
 
   SmallString<32> ExpectedModuleName = subInvocation.getModuleName();
-  if (subInvocation.parseArgs(interfaceInfo.Arguments, subInstanceDiags)) {
+  if (subInvocation.parseArgs(interfaceInfo.Arguments, subInstanceDiags,
+                              /*ConfigurationFileBuffers=*/nullptr,
+                              /*workingDirectory=*/{},
+                              /*mainExecutablePath=*/{}, SM.getFileSystem())) {
     return true;
   }
 
@@ -2106,7 +2118,8 @@ void InterfaceSubContextDelegateImpl::getCachedOutputPath(
       resolvedOutputPath, moduleName, interfacePath, sdkPath,
       genericSubInvocation,
       genericSubInvocation.getClangImporterOptions()
-          .getReducedExtraArgsForSwiftModuleDependency());
+          .getReducedExtraArgsForSwiftModuleDependency(),
+      *SM.getFileSystem());
 }
 
 std::error_code
@@ -2197,7 +2210,7 @@ InterfaceSubContextDelegateImpl::runInSubCompilerInstance(StringRef moduleName,
   // DiagnosticEngine holds raw pointers to them.
   ForwardingDiagnosticConsumer FDC(*Diags);
   NullDiagnosticConsumer noopConsumer;
-  CompilerInstance subInstance;
+  CompilerInstance subInstance(SM.getFileSystem());
   if (!silenceErrors) {
     subInstance.addDiagnosticConsumer(&FDC);
   } else {
@@ -2224,8 +2237,6 @@ InterfaceSubContextDelegateImpl::runInSubCompilerInstance(StringRef moduleName,
   SubCompilerInstanceInfo info;
   info.Instance = &subInstance;
   info.CompilerVersion = interfaceInfo.CompilerVersion;
-
-  subInstance.getSourceMgr().setFileSystem(SM.getFileSystem());
 
   std::string InstanceSetupError;
   if (CAS)
@@ -2278,7 +2289,7 @@ struct ExplicitSwiftModuleLoader::Implementation {
     ExplicitModuleMapParser parser(Allocator);
     // Load the input file.
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> fileBufOrErr =
-        llvm::MemoryBuffer::getFile(fileName);
+        Ctx.SourceMgr.getFileSystem()->getBufferForFile(fileName);
     if (!fileBufOrErr) {
       Ctx.Diags.diagnose(SourceLoc(), diag::explicit_swift_module_map_missing,
                          fileName);
@@ -2598,8 +2609,6 @@ struct ExplicitCASModuleLoader::Implementation {
                          ID);
       return;
     }
-    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> fileBufOrErr =
-        llvm::MemoryBuffer::getFile(ID);
 
     auto error = parser.parseSwiftExplicitModuleMap(
         buf->getMemBufferRef(), *ExplicitModuleMap, *ExplicitClangModuleMap,
@@ -2918,7 +2927,8 @@ static unsigned getCOMInteropCacheState(const LangOptions &langOpts) {
 static std::string getContextHash(const CompilerInvocation &CI,
                                   const StringRef &interfacePath,
                                   const StringRef &sdkPath,
-                                  const ArgListTy &extraArgs) {
+                                  const ArgListTy &extraArgs,
+                                  llvm::vfs::FileSystem &FS) {
   // When doing dependency scanning for explicit module, use strict context hash
   // to ensure sound module hash.
   bool useStrictCacheHash = CI.getFrontendOptions().RequestedAction ==
@@ -2936,7 +2946,22 @@ static std::string getContextHash(const CompilerInvocation &CI,
           ? CI.getLangOptions().Target
           : getTargetSpecificModuleTriple(CI.getLangOptions().Target);
 
-  std::string sdkBuildVersion = getSDKBuildVersion(sdkPath);
+  // Similarly, include the target variant triple. A zippered target passes the
+  // variant down to Clang as '-darwin-target-variant-triple'. A zippered and a
+  // plain target that share a '-target' therefore depend on different PCMs. If
+  // the variant was absent here, both would also agree on one '.swiftmodule'
+  // path, so the two configurations would share a single file in the module
+  // store that was built against only one of those PCMs.
+  std::string targetVariantStr = "";
+  if (CI.getLangOptions().TargetVariant) {
+    auto targetVariantToHash =
+        useStrictCacheHash
+            ? *CI.getLangOptions().TargetVariant
+            : getTargetSpecificModuleTriple(*CI.getLangOptions().TargetVariant);
+    targetVariantStr = targetVariantToHash.str();
+  }
+
+  std::string sdkBuildVersion = getSDKBuildVersion(sdkPath, FS);
 
   llvm::hash_code H = llvm::hash_combine(
       // Start with the compiler version (which will be either tag names or
@@ -2952,6 +2977,9 @@ static std::string getContextHash(const CompilerInvocation &CI,
 
       // The target triple to hash.
       targetToHash.str(),
+
+      // The target variant to hash.
+      targetVariantStr,
 
       // The SDK path is going to affect how this module is imported, so
       // include it.
@@ -2987,14 +3015,19 @@ static std::string getContextHash(const CompilerInvocation &CI,
 
       // COM model conditions can select different declarations from the same
       // textual interface.
-      getCOMInteropCacheState(CI.getLangOptions()));
+      getCOMInteropCacheState(CI.getLangOptions()),
+
+      // Sanitizers are forwarded to interface builds and change both the
+      // serialized SIL (e.g. TSan instrumentation) and the Clang dependencies.
+      CI.getSILOptions().Sanitizers.toRaw());
 
   return llvm::toString(llvm::APInt(64, H), 36, /*Signed=*/false);
 }
 
 void setOutputPath(ResultTy &resolvedOutputPath, const StringRef &moduleName,
                    const StringRef &interfacePath, const StringRef &sdkPath,
-                   const CompilerInvocation &CI, const ArgListTy &extraArgs) {
+                   const CompilerInvocation &CI, const ArgListTy &extraArgs,
+                   llvm::vfs::FileSystem &FS) {
   auto &outputPath = resolvedOutputPath.outputPath;
   outputPath = CI.getClangModuleCachePath();
   auto isPrefixedWith = [interfacePath](StringRef path) {
@@ -3017,7 +3050,7 @@ void setOutputPath(ResultTy &resolvedOutputPath, const StringRef &moduleName,
   llvm::sys::path::append(outputPath, moduleName);
   outputPath.append("-");
   auto hashStart = outputPath.size();
-  outputPath.append(getContextHash(CI, interfacePath, sdkPath, extraArgs));
+  outputPath.append(getContextHash(CI, interfacePath, sdkPath, extraArgs, FS));
   resolvedOutputPath.hash = outputPath.str().substr(hashStart);
   outputPath.append(".");
   auto outExt = file_types::getExtension(file_types::TY_SwiftModuleFile);

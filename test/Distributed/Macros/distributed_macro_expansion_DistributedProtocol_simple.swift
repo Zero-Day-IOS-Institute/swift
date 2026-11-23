@@ -22,15 +22,21 @@ protocol Greeter: DistributedActor where ActorSystem: DistributedActorSystem<any
 // CHECK-NEXT:   Distributed._DistributedActorStub
 // CHECK-NEXT:   where ActorSystem: DistributedActorSystem<any Codable>
 // CHECK-NEXT: {
-// CHECK:      }
+// CHECK-NEXT:   @available(*, unavailable, message: "stub '$Greeter' can only be resolved as a remote reference, use '$Greeter.resolve(id:using:)'")
+// CHECK-NEXT:   init(actorSystem: ActorSystem) {
+// CHECK-NEXT:     fatalError()
+// CHECK-NEXT:   }
+// CHECK-NEXT: }
 
 // CHECK:      extension Greeter where Self: Distributed._DistributedActorStub {
 // CHECK-NEXT:   distributed func greet(name: String) -> String {
+// CHECK-NEXT:     #if !$Embedded
 // CHECK-NEXT:     if #available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *) {
 // CHECK-NEXT:       Distributed._distributedStubFatalError()
-// CHECK-NEXT:     } else {
-// CHECK-NEXT:       fatalError()
 // CHECK-NEXT:     }
+// CHECK-NEXT:     #endif
+// CHECK-EMPTY:
+// CHECK-NEXT:     fatalError()
 // CHECK-NEXT:   }
 // CHECK-NEXT: }
 

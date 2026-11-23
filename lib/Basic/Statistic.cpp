@@ -10,9 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Statistic.h"
-#include "swift/Config.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "llvm/ADT/DenseMap.h"
@@ -218,16 +216,10 @@ class StatsProfiler {
     Node *getChild(StringRef Name,
                    const void *Entity,
                    const UnifiedStatsReporter::TraceFormatter *TF) {
-      Key K(Name, Entity, TF);
-      auto I = Children.find(K);
-      if (I != Children.end()) {
-        return I->getSecond().get();
-      } else {
-        auto N = std::make_unique<Node>(this);
-        auto P = N.get();
-        Children.insert(std::make_pair(K, std::move(N)));
-        return P;
-      }
+      auto &Child = Children[Key(Name, Entity, TF)];
+      if (!Child)
+        Child = std::make_unique<Node>(this);
+      return Child.get();
     }
   };
   Node Root;

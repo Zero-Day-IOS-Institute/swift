@@ -17,13 +17,11 @@
 #include "SourceKit/Support/Logging.h"
 #include "SourceKit/Support/UIdent.h"
 #include "swift/Basic/LoadDynamicLibrary.h"
-#include "swift/Basic/StringExtras.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Mutex.h"
 #include "llvm/Support/SourceMgr.h"
-#include "llvm/Support/Threading.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/YAMLParser.h"
 #include <mutex>
@@ -260,6 +258,7 @@ bool sourcekitd::initializeClient() {
 
   static std::once_flag flag;
   std::call_once(flag, []() {
+    llvm::remove_fatal_error_handler();
     llvm::install_fatal_error_handler(fatal_error_handler, 0);
     sourcekitd::enableLogging("sourcekit");
   });

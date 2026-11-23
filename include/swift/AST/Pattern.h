@@ -17,18 +17,16 @@
 #ifndef SWIFT_PATTERN_H
 #define SWIFT_PATTERN_H
 
-#include "swift/Basic/AnyValue.h"
 #include "swift/Basic/SourceLoc.h"
-#include "swift/Basic/type_traits.h"
 #include "swift/AST/ASTAllocated.h"
 #include "swift/AST/Decl.h"
+#include "swift/Basic/AnyValue.h"
 #include "swift/Basic/Debug.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/Types.h"
 #include "swift/AST/TypeAlignments.h"
 #include "swift/Basic/InlineBitfield.h"
-#include "swift/Basic/OptionSet.h"
 #include "llvm/Support/TrailingObjects.h"
 
 namespace swift {
@@ -75,7 +73,6 @@ protected:
   );
 
   SWIFT_INLINE_BITFIELD_FULL(TuplePattern, Pattern, 32,
-    : NumPadBits,
     NumElements : 32
   );
 
@@ -156,10 +153,7 @@ public:
 
   /// Set the type of this pattern, given that it was previously not
   /// type-checked.
-  void setType(Type ty) {
-    assert(!ty || !ty->hasTypeVariable());
-    Ty = ty;
-  }
+  void setType(Type ty);
 
   /// Retrieve the delayed interface type of this pattern, if it has one.
   ///
@@ -254,8 +248,8 @@ public:
   /// \c mostRestrictiveSubpatterns is non-null, the pointed-to vector will be
   /// populated with references to the subpatterns that cause the pattern to
   /// have stricter than "shared" ownership behavior for diagnostic purposes.
-  ValueOwnership getOwnership(
-    SmallVectorImpl<Pattern*> *mostRestrictiveSubpatterns = nullptr) const;
+  LoweredOwnership getOwnership(
+      SmallVectorImpl<Pattern *> *mostRestrictiveSubpatterns = nullptr) const;
 
   static bool classof(const Pattern *P) { return true; }
 
@@ -500,9 +494,9 @@ public:
   static TypedPattern *
   createImplicit(ASTContext &ctx, Pattern *pattern, Type type) {
     auto tp = new (ctx) TypedPattern(pattern, /*typeRepr*/nullptr);
+    tp->setImplicit();
     if (!type.isNull())
       tp->setType(type);
-    tp->setImplicit();
     return tp;
   }
 

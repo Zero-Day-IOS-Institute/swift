@@ -18,15 +18,11 @@
 #include "ManagedValue.h"
 #include "RValue.h"
 #include "SILGenFunction.h"
-#include "SILGenFunctionBuilder.h"
 #include "Scope.h"
-#include "swift/AST/ASTMangler.h"
-#include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/Basic/Assertions.h"
-#include "swift/Basic/Defer.h"
 #include "swift/Basic/Generators.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILInstruction.h"
@@ -357,6 +353,14 @@ static SubstitutionMap getSubstitutionsForPropertyInitializer(
   return SubstitutionMap();
 }
 
+/// Returns the C array projection of \p decl, or \c std::nullopt if it doesn't
+/// have any C arrays.
+static std::optional<CArrayProjection> getCArrayProjection(Decl *decl) {
+  if (auto cArrayAttr = decl->getAttrs().getAttribute<CArrayProjectionAttr>())
+    return cArrayAttr->getProjection();
+  return std::nullopt;
+}
+
 static void emitImplicitValueConstructor(SILGenFunction &SGF,
                                          ConstructorDecl *ctor,
                                          MemberwiseInitKind initKind) {
@@ -379,7 +383,7 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
   auto selfIfaceTy = selfDecl->getInterfaceType();
   SILType selfTy = SGF.getSILTypeInContext(selfResultInfo, loweredFunctionTy);
 
-  auto *decl = selfTy.getStructOrBoundGenericStruct();
+  auto *decl = selfTy.getStructDecl();
   assert(decl && "not a struct?!");
 
   std::multimap<VarDecl *, VarDecl *> initializedViaAccessor;
@@ -423,10 +427,12 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
 
   auto subs = getSubstitutionsForPropertyInitializer(decl, decl);
 
-  /// If the stored property has an attached result builder and its
-  /// type is not a function type, the argument is a noescape closure
-  /// that needs to be called.
-  auto emitResultBuilderCallIfNeeded = [&](VarDecl *field, RValue &&arg) -> RValue {
+  auto ctorProjection = getCArrayProjection(ctor);
+  auto convertArgumentForField = [&](VarDecl *field, SILType fieldTy,
+                                     RValue &&arg) -> RValue {
+    // If the stored property has an attached result builder and its
+    // type is not a function type, the argument is a noescape closure
+    // that needs to be called.
     if (field->getResultBuilderType()) {
       if (!field->getValueInterfaceType()
               ->lookThroughAllOptionalTypes()->is<AnyFunctionType>()) {
@@ -436,6 +442,25 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
             resultTy, ApplyOptions(), std::nullopt, std::nullopt);
       }
     }
+
+    // If the C array projection of this field does not match the projection of
+    // the constructor, bitcast away the resulting type mismatch.
+    if (ctorProjection &&
+          getCArrayProjection(field).value_or(*ctorProjection)
+              != ctorProjection) {
+      auto argValue = std::move(arg).getAsSingleValue(SGF, Loc);
+
+      // InlineArrays too large to be loadable are passed by address.
+      ManagedValue castValue;
+      if (argValue.getType().isAddress())
+        castValue = SGF.B.createUncheckedAddrCast(Loc, argValue,
+                                                  fieldTy.getAddressType());
+      else
+        castValue = SGF.B.createUncheckedBitCast(Loc, argValue,
+                                                 fieldTy.getObjectType());
+      arg = RValue(SGF, Loc, fieldTy.getASTType(), castValue);
+    }
+
     return std::move(arg);
   };
 
@@ -509,7 +534,7 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
         FullExpr scope(SGF.Cleanups, field->getParentPatternBinding());
 
         RValue arg = std::move(*elti);
-        arg = emitResultBuilderCallIfNeeded(field, std::move(arg));
+        arg = convertArgumentForField(field, fieldTy, std::move(arg));
 
         maybeEmitPropertyWrapperInitFromValue(SGF, Loc, field, subs,
                                               std::move(arg))
@@ -584,7 +609,7 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
       assert(elti != eltEnd && "number of args does not match number of fields");
       (void)eltEnd;
       value = std::move(*elti);
-      value = emitResultBuilderCallIfNeeded(field, std::move(value));
+      value = convertArgumentForField(field, fieldTy, std::move(value));
       ++elti;
     } else {
       // Otherwise, use its initializer.
@@ -655,6 +680,7 @@ static bool ctorHopsInjectedByDefiniteInit(ConstructorDecl *ctor,
   case ActorIsolation::NonisolatedNonsending:
     return false;
   }
+  llvm_unreachable("covered switch");
 }
 
 bool SILGenFunction::isCtorWithHopsInjectedByDefiniteInit() {
@@ -907,7 +933,7 @@ void SILGenFunction::emitEnumConstructor(EnumElementDecl *element) {
 
   // Emit the indirect return slot.
   InitializationPtr dest;
-  if (enumTI.isAddressOnly() && silConv.useLoweredAddresses()) {
+  if (!enumTI.isLoadableOrOpaque(F)) {
     auto &AC = getASTContext();
     auto VD = new (AC) ParamDecl(SourceLoc(), SourceLoc(),
                                  AC.getIdentifier("$return_value"),
@@ -965,7 +991,7 @@ void SILGenFunction::emitEnumConstructor(EnumElementDecl *element) {
     scope.pop();
     B.createReturn(ReturnLoc, emitEmptyTuple(CleanupLocation(Loc)));
   } else {
-    assert(enumTI.isLoadable() || !silConv.useLoweredAddresses());
+    assert(enumTI.isLoadableOrOpaque(F));
     SILValue result = mv.ensurePlusOne(*this, ReturnLoc).forward(*this);
     scope.pop();
     B.createReturn(ReturnLoc, result);
@@ -1204,6 +1230,7 @@ void SILGenFunction::emitClassConstructorInitializer(ConstructorDecl *ctor) {
     PrologueLoc.markAsPrologue();
     SILDebugVariable DbgVar(selfDecl->isLet(), ++ArgNo);
     B.emitDebugDescription(PrologueLoc, selfArg.getValue(), DbgVar);
+    enterFormalScopeCleanup(selfDecl, selfArg.getValue());
   }
 
   if (selfClassDecl->isRootDefaultActor() && !isDelegating) {
@@ -1607,17 +1634,19 @@ void SILGenFunction::emitMemberInitializationViaInitAccessor(
     B.createEndAccess(loc, selfRef.getValue(), /*aborted=*/false);
 }
 
-void SILGenFunction::emitMemberInitializer(DeclContext *dc, VarDecl *selfDecl,
-                                           PatternBindingDecl *field,
-                                           SubstitutionMap substitutions) {
+void SILGenFunction::emitMemberInitializer(
+    DeclContext *dc, VarDecl *selfDecl, PatternBindingDecl *field,
+    SubstitutionMap substitutions,
+    const llvm::SmallPtrSetImpl<VarDecl *> &initAccessorSubsumedStorage) {
   assert(!field->isStatic());
 
   for (auto i : range(field->getNumPatternEntries())) {
-    if (auto *var = field->getAnchoringVarDecl(i))
+    auto *var = field->getAnchoringVarDecl(i);
+    if (var)
       (void)var->getImplInfo(); // trigger expansion of attached accessor macros
 
     auto init = field->getExecutableInit(i);
-    if (!init)
+    if (!init || (var && initAccessorSubsumedStorage.count(var)))
       continue;
 
     // Member initializer expressions are only used in a constructor with
@@ -1625,7 +1654,6 @@ void SILGenFunction::emitMemberInitializer(DeclContext *dc, VarDecl *selfDecl,
     // initializer from being evaluated synchronously (or propagating required
     // isolation through closure bodies), then the default value cannot be used
     // and the member must be explicitly initialized in the constructor.
-    auto *var = field->getAnchoringVarDecl(i);
     auto requiredIsolation = var->getInitializerIsolation();
     auto contextIsolation = getActorIsolationOfContext(dc);
     switch (requiredIsolation) {
@@ -1718,10 +1746,38 @@ void SILGenFunction::emitMemberInitializer(DeclContext *dc, VarDecl *selfDecl,
   }
 }
 
+/// The stored properties of \p nominal whose own initializer is subsumed by an
+/// init accessor on another property. This is recomputing a fact that should
+/// be answered via some requestified bit of code that determine whether to call
+/// `setInitializerSubsumed`. That code in Sema is currently only run during
+/// primary-file type checking.
+static void collectInitAccessorSubsumedStorage(
+    NominalTypeDecl *nominal, llvm::SmallPtrSetImpl<VarDecl *> &subsumed) {
+  std::multimap<VarDecl *, VarDecl *> initializedViaAccessor;
+  nominal->collectPropertiesInitializableByInitAccessors(initializedViaAccessor);
+
+  for (auto &pair : initializedViaAccessor) {
+    VarDecl *backing = pair.first;
+    VarDecl *accessorProp = pair.second;
+    auto *pbd = accessorProp->getParentPatternBinding();
+    if (!pbd)
+      continue;
+    auto idx = pbd->getPatternEntryIndexForVarDecl(accessorProp);
+    // Subsumed only if the accessor has an initializer of its own; force its
+    // possibly synthesized default (e.g., an Optional's 'nil').
+    (void)pbd->getCheckedPatternBindingEntry(idx);
+    if (pbd->isInitialized(idx))
+      subsumed.insert(backing);
+  }
+}
+
 void SILGenFunction::emitMemberInitializers(DeclContext *dc,
                                             VarDecl *selfDecl,
                                             NominalTypeDecl *nominal) {
   auto subs = getSubstitutionsForPropertyInitializer(dc, nominal);
+
+  llvm::SmallPtrSet<VarDecl *, 4> initAccessorSubsumedStorage;
+  collectInitAccessorSubsumedStorage(nominal, initAccessorSubsumedStorage);
 
   llvm::SmallPtrSet<PatternBindingDecl *, 4> alreadyInitialized;
   for (auto member : nominal->getImplementationContext()->getAllMembers()) {
@@ -1742,7 +1798,8 @@ void SILGenFunction::emitMemberInitializers(DeclContext *dc,
           for (auto *property : initAccessor->getAccessedProperties()) {
             auto *PBD = property->getParentPatternBinding();
             if (alreadyInitialized.insert(PBD).second)
-              emitMemberInitializer(dc, selfDecl, PBD, subs);
+              emitMemberInitializer(dc, selfDecl, PBD, subs,
+                                    initAccessorSubsumedStorage);
           }
 
           emitMemberInitializationViaInitAccessor(dc, selfDecl, pbd, subs);
@@ -1750,7 +1807,7 @@ void SILGenFunction::emitMemberInitializers(DeclContext *dc,
         }
       }
 
-      emitMemberInitializer(dc, selfDecl, pbd, subs);
+      emitMemberInitializer(dc, selfDecl, pbd, subs, initAccessorSubsumedStorage);
     }
   }
 }

@@ -298,8 +298,11 @@ private:
 
     size_t capacity = std::max(SlabCapacity,
                                Allocation::includingHeader(size));
+    // The payload handed out of a slab lives at `this + headerSize()`, and
+    // headerSize() is rounded up to `alignment` (MaximumAlignment), so the slab
+    // buffer itself must be `alignment`-aligned for the payload to be aligned.
     void *slabBuffer = this->allocateGlobal(Slab::includingHeader(capacity),
-                                            alignof(Slab) - 1);
+                                            std::max(alignof(Slab), alignment) - 1);
     Slab *newSlab = ::new (slabBuffer) Slab(capacity);
     if (slab)
       slab->next = newSlab;
@@ -318,7 +321,10 @@ private:
       Slab *next = slab->next;
       freedCapacity += slab->capacity;
       slab->clearMetadata();
-      this->deallocateGlobal(slab, slab->capacity, alignof(Slab) - 1);
+      // Must match the alignMask used to allocate the slab in
+      // getSlabForAllocation, so the runtime picks the same free path
+      this->deallocateGlobal(slab, slab->capacity,
+                             std::max(alignof(Slab), alignment) - 1);
       numAllocatedSlabs--;
       slab = next;
     }
@@ -365,6 +371,15 @@ public:
 
   static constexpr size_t slabHeaderSize() {
     return Slab::headerSize();
+  }
+
+  /// The number of bytes an allocation of \p size takes up in a slab,
+  /// including the allocation header and the overhead for guardAllocations.
+  static size_t slabCapacityForAllocation(size_t size) {
+    if (guardAllocations)
+      size += sizeof(uintptr_t);
+    return Allocation::includingHeader(
+        llvm::alignTo(size, llvm::Align(alignment)));
   }
 
   /// Allocate a memory buffer of \p size.

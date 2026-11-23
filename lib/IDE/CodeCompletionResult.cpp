@@ -15,7 +15,6 @@
 #include "swift/AST/ASTDemangler.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Module.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/IDE/CodeCompletionResultPrinter.h"
 #include "swift/IDE/CodeCompletionResultSink.h"
 
@@ -207,7 +206,6 @@ getDeclNameForDiagnostics(const Decl *D, CodeCompletionResultSink &Sink) {
     llvm::SmallString<64> Name;
     llvm::raw_svector_ostream NameOS(Name);
     NameOS << "'";
-    llvm::SmallString<64> Scratch;
     VD->getName().printPretty(NameOS);
     NameOS << "'";
     return NullTerminatedStringRef(NameOS.str(), Sink.getAllocator());
@@ -315,7 +313,8 @@ ContextFreeCodeCompletionResult::getCodeCompletionDeclKind(const Decl *D) {
   case DeclKind::OpaqueType:
   case DeclKind::BuiltinTuple:
   case DeclKind::MacroExpansion:
-  case DeclKind::Using:
+  case DeclKind::FileDefault:
+  case DeclKind::HiddenTypeLayoutInfo:
     llvm_unreachable("not expecting such a declaration result");
   case DeclKind::Module:
     return CodeCompletionDeclKind::Module;

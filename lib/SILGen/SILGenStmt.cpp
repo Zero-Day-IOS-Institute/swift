@@ -10,7 +10,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "ArgumentScope.h"
 #include "ArgumentSource.h"
 #include "Condition.h"
 #include "Conversion.h"
@@ -709,9 +708,13 @@ SILGenFunction::prepareIndirectResultInit(
 }
 
 static Expr *lookThroughProjections(Expr *expr) {
-  auto *lookupExpr = dyn_cast<LookupExpr>(expr);
+  auto *semanticExpr = expr->getSemanticsProvidingExpr();
+  if (auto *inoutExpr = dyn_cast<InOutExpr>(semanticExpr)) {
+    return lookThroughProjections(inoutExpr->getSubExpr());
+  }
+  auto *lookupExpr = dyn_cast<LookupExpr>(semanticExpr);
   if (!lookupExpr) {
-    return expr;
+    return semanticExpr;
   }
   return lookThroughProjections(lookupExpr->getBase());
 }
@@ -849,15 +852,12 @@ bool SILGenFunction::emitBorrowOrMutateAccessorResult(
   }
 
   SILValue result = resultMV->getValue();
-  SILType selfType = F.getSelfArgument()->getType();
 
   if (F.getConventions().hasGuaranteedResult()) {
     // If we are returning the result of borrow accessor, strip the
     // unnecessary copy_value + mark_unresolved_non_copyable_value
     // instructions.
-    if (selfType.isMoveOnly()) {
-      result = lookThroughMoveOnlyCheckerPattern(result);
-    }
+    result = lookThroughMoveOnlyCheckerPattern(result);
     // If the SIL convention is @guaranteed and the generated result is an
     // address, emit a load_borrow.
     if (result->getType().isAddress()) {
@@ -983,7 +983,7 @@ void StmtEmitter::visitDiscardStmt(DiscardStmt *S) {
     assert(varDecl->hasStorage());
     auto varType = varDecl->getTypeInContext();
     auto &varTypeLowering = SGF.getTypeLowering(varType);
-    if (!varTypeLowering.isTrivial()) {
+    if (!varTypeLowering.isTrivial(&SGF.F)) {
       diagnose(getASTContext(),
                S->getStartLoc(),
                diag::discard_nontrivial_storage,
@@ -1801,7 +1801,7 @@ void SILGenFunction::emitThrow(SILLocation loc, ManagedValue exnMV,
 
             return ManagedValue::forForwardedRValue(*this, exn);
           }).forward(*this);
-    } else if (destASTType->getClassOrBoundGenericClass()) {
+    } else if (destASTType->getClassDecl()) {
       // Class upcast: the in-flight error is a reference to a subclass of
       // the destination. SIL's `upcast` instruction additionally verifies
       // the subclass relationship in asserts builds; release builds rely
@@ -1845,9 +1845,9 @@ void SILGenFunction::emitThrow(SILLocation loc, ManagedValue exnMV,
     args.push_back(exn);
   } else if (shouldDiscard) {
     if (exn->getType().isAddress())
-      B.createDestroyAddr(loc, exn);
+      B.emitDestroyAddrAndFold(loc, exn);
     else
-      B.createDestroyValue(loc, exn);
+      B.emitDestroyValueOperation(loc, exn);
   }
 
   // Emit clean-ups needed prior to entering throw block.

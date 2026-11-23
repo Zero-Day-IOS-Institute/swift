@@ -16,7 +16,6 @@
 #include "SemanticARCOptVisitor.h"
 #include "Transforms.h"
 
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SILOptimizer/Analysis/Analysis.h"
 #include "swift/SILOptimizer/Analysis/DeadEndBlocksAnalysis.h"
@@ -146,11 +145,6 @@ struct SemanticARCOpts : SILFunctionTransform {
     if (!f.getModule().getOptions().EnableOSSAOptimizations ||
         !f.hasOwnership())
       return;
-
-    // Make sure we are running with ownership verification enabled.
-    assert(f.getModule().getOptions().VerifySILOwnership &&
-           "Can not perform semantic arc optimization unless ownership "
-           "verification is enabled");
 
     auto *deBlocksAnalysis = getAnalysis<DeadEndBlocksAnalysis>();
     SemanticARCOptVisitor visitor(f, getPassManager(), *deBlocksAnalysis->get(&f),

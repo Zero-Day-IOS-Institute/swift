@@ -55,6 +55,7 @@ fileprivate class ConcurrencyDumper {
     var isFuture: Bool
     var isGroupChildTask: Bool
     var isAsyncLetTask: Bool
+    var hasSynchronousOperation: Bool
     var maxPriority: UInt32
     var isCancelled: Bool
     var isStatusRecordLocked: Bool
@@ -116,13 +117,23 @@ fileprivate class ConcurrencyDumper {
 
   func gatherHeapInfo() -> HeapInfo {
     var result = HeapInfo()
+    var usedRegistry = false
+
+    do {
+      try context.iterateTaskRegistry { taskAddr in
+        result.tasks.append(taskAddr)
+      }
+      usedRegistry = true
+    } catch {
+      // Fallback to heap scan if task registry fails (e.g. older runtime)
+    }
 
     process.iterateHeap { (pointer, size) in
       let metadata = swift_reflection_ptr_t(swift_reflection_metadataForObject(context, UInt(pointer)))
       if metadata == 0 || metadata == .max { return }
       if metadata == jobMetadata {
         result.jobs.append(swift_reflection_ptr_t(pointer))
-      } else if metadata == taskMetadata {
+      } else if !usedRegistry && metadata == taskMetadata {
         result.tasks.append(swift_reflection_ptr_t(pointer))
       } else if isActorMetadata(metadata) {
         result.actors.append(swift_reflection_ptr_t(pointer))
@@ -189,14 +200,15 @@ fileprivate class ConcurrencyDumper {
       return nil
     }
 
-    // These arrays are temporary pointers which we must copy out before we call
-    // into Remote Mirror again.
+    // These arrays and the name are temporary pointers which we must copy out
+    // before we call into Remote Mirror again.
     let children = Array(UnsafeBufferPointer(
         start: reflectionInfo.ChildTasks,
         count: Int(reflectionInfo.ChildTaskCount)))
     let asyncBacktraceFrames = Array(UnsafeBufferPointer(
         start: reflectionInfo.AsyncBacktraceFrames,
         count: Int(reflectionInfo.AsyncBacktraceFramesCount)))
+    let name = reflectionInfo.Name.map { String(cString: $0) }
 
     var allocatorSlab = reflectionInfo.AllocatorSlabPtr
     var allocatorTotalSize = 0
@@ -219,6 +231,7 @@ fileprivate class ConcurrencyDumper {
       isFuture: reflectionInfo.IsFuture,
       isGroupChildTask: reflectionInfo.IsGroupChildTask,
       isAsyncLetTask: reflectionInfo.IsAsyncLetTask,
+      hasSynchronousOperation: reflectionInfo.HasSynchronousOperation,
       maxPriority: reflectionInfo.MaxPriority,
       isCancelled: reflectionInfo.IsCancelled,
       isStatusRecordLocked: reflectionInfo.IsStatusRecordLocked,
@@ -236,7 +249,7 @@ fileprivate class ConcurrencyDumper {
       allocatorTotalChunks: allocatorTotalChunks,
       childTasks: children,
       asyncBacktrace: asyncBacktraceFrames,
-      name: reflectionInfo.Name.map { String(cString: $0) }
+      name: name
     )
   }
 
@@ -285,6 +298,7 @@ fileprivate class ConcurrencyDumper {
     if info.isFuture { flags.append("future") }
     if info.isGroupChildTask { flags.append("groupChildTask") }
     if info.isAsyncLetTask { flags.append("asyncLetTask") }
+    if info.hasSynchronousOperation { flags.append("synchronousOperation") }
     if info.isCancelled { flags.append("cancelled") }
     if info.isStatusRecordLocked { flags.append("statusRecordLocked") }
     if info.isEscalated { flags.append("escalated") }

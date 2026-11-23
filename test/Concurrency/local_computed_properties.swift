@@ -1,5 +1,5 @@
-// RUN: %target-swift-frontend -target %target-swift-5.1-abi-triple %s -emit-sil -o - -verify -strict-concurrency=complete -enable-actor-data-race-checks -disable-availability-checking | %FileCheck %s
-// RUN: %target-swift-frontend -target %target-swift-5.1-abi-triple %s -emit-module -o /dev/null -strict-concurrency=complete -disable-availability-checking
+// RUN: %target-swift-frontend -target %target-swift-5.1-abi-triple %s -emit-sil -o - -verify -strict-concurrency=complete -enable-actor-data-race-checks | %FileCheck %s
+// RUN: %target-swift-frontend -target %target-swift-5.1-abi-triple %s -emit-module -o /dev/null -strict-concurrency=complete
 
 // REQUIRES: concurrency
 
@@ -26,9 +26,9 @@ class MainActorClass {
     _ = y
   }
 
-  // CHECK-LABEL: // getter of z #1 in MainActorClass.testComputedGetSet()
+  // CHECK-LABEL: // specialized getter of z #1 in MainActorClass.testComputedGetSet()
   // CHECK-NEXT:  // Isolation: global_actor. type: MainActor
-  // CHECK-LABEL: // setter of z #1 in MainActorClass.testComputedGetSet()
+  // CHECK-LABEL: // specialized setter of z #1 in MainActorClass.testComputedGetSet()
   // CHECK-NEXT:  // Isolation: global_actor. type: MainActor
   func testComputedGetSet() {
     var holder = field

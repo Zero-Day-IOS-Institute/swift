@@ -12,19 +12,14 @@
 
 #include "LocalizationTest.h"
 #include "swift/Localization/LocalizationFormat.h"
-#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
-#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/ToolOutputFile.h"
-#include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 #include <cstdlib>
 #include <random>
 #include <string>
-#include <system_error>
 
 using namespace swift;
 using namespace swift::diag;
@@ -56,7 +51,7 @@ TEST_F(LocalizationTest, MissingLocalizationFiles) {
 }
 
 TEST_F(LocalizationTest, ConverterTestMatchDiagnosticMessagesSequentially) {
-  StringsLocalizationProducer strings(DiagsPath);
+  StringsLocalizationProducer strings(getDiagsBuffer());
   strings.forEachAvailable([](swift::DiagID id, llvm::StringRef translation) {
     llvm::StringRef msg = diagnosticMessages[static_cast<uint32_t>(id)];
     ASSERT_EQ(msg, translation);
@@ -64,7 +59,7 @@ TEST_F(LocalizationTest, ConverterTestMatchDiagnosticMessagesSequentially) {
 }
 
 TEST_F(LocalizationTest, ConverterTestMatchDiagnosticMessagesRandomly) {
-  StringsLocalizationProducer strings(DiagsPath);
+  StringsLocalizationProducer strings(getDiagsBuffer());
 
   std::random_device rd;
   std::mt19937 gen(rd());

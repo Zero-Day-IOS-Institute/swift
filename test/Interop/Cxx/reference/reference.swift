@@ -5,7 +5,6 @@
 // RUN: %target-run %t/reference
 //
 // REQUIRES: executable_test
-// XFAIL: swift_test_mode_optimize_none_with_opaque_values
 
 import Reference
 import StdlibUnittest
@@ -75,6 +74,14 @@ ReferenceTestSuite.test("func-rvalue-reference") {
   expectEqual(61, cxxF())
 }
 
+ReferenceTestSuite.test("pass-func-reference") {
+  expectNotEqual(73, getStaticInt())
+  setStaticInt(73)
+  expectEqual(73, callFuncRef(getStaticInt))
+  expectEqual(73, callFuncRvalueRef(consuming: getStaticInt))
+  expectEqual(73, callFuncRef(getFuncRef()))
+}
+
 ReferenceTestSuite.test("pod-struct-const-lvalue-reference") {
   expectNotEqual(getStaticInt(), 78)
   takeConstRef(78)
@@ -131,6 +138,15 @@ ReferenceTestSuite.test("const reference to array typealias") {
   let bytes: ByteArray16Typealias = (7, 0, 0, 0, 0, 0, 0, 0,
                                      0, 0, 0, 0, 0, 0, 0, 0)
   expectEqual(7, firstByteOfArrayRefTypealias(bytes))
+}
+
+ReferenceTestSuite.test("reference parameter of a C function pointer") {
+  callWithIntRef { $0.pointee = 99 }
+  expectEqual(99, getStaticInt())
+
+  callWithConstIntRef { expectEqual(43, $0) }
+  callWithIntRvalueRef { expectEqual(44, $0) }
+  callWithConstIntRvalueRef { expectEqual(45, $0) }
 }
 
 runAllTests()

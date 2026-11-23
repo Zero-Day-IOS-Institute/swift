@@ -16,7 +16,6 @@
 #include "swift/AST/DiagnosticConsumer.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/Frontend/FrontendOptions.h"
-#include "swift/Option/Options.h"
 #include "llvm/Option/ArgList.h"
 
 #include <vector>
@@ -28,6 +27,7 @@ private:
   DiagnosticEngine &Diags;
   const llvm::opt::ArgList &Args;
   FrontendOptions &Opts;
+  llvm::vfs::FileSystem &FS;
 
   std::optional<std::vector<std::string>>
       cachedOutputFilenamesFromCommandLineOrFilelist;
@@ -61,8 +61,9 @@ private:
 public:
   ArgsToFrontendOptionsConverter(DiagnosticEngine &Diags,
                                  const llvm::opt::ArgList &Args,
-                                 FrontendOptions &Opts)
-      : Diags(Diags), Args(Args), Opts(Opts) {}
+                                 FrontendOptions &Opts,
+                                 llvm::vfs::FileSystem &FS)
+      : Diags(Diags), Args(Args), Opts(Opts), FS(FS) {}
 
   /// Populates the FrontendOptions the converter was initialized with.
   ///

@@ -22,7 +22,6 @@
 #include "swift/AST/DiagnosticsIRGen.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/Types.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILModule.h"
 #include "EnumPayload.h"
 #include "IRGenDebugInfo.h"
@@ -316,7 +315,7 @@ void IRGenModule::emitTypeVerifier() {
     llvm::BasicBlock *EntryBB = &EntryFunction->getEntryBlock();
     llvm::BasicBlock::iterator IP = EntryBB->getFirstInsertionPt();
     IRBuilder Builder(getLLVMContext(), DebugInfo != nullptr);
-    Builder.llvm::IRBuilderBase::SetInsertPoint(EntryBB, IP);
+    Builder.llvm::IRBuilderBase::SetInsertPoint(IP);
     if (DebugInfo)
       DebugInfo->setEntryPointLoc(Builder);
     Builder.CreateCall(fnTy, VerifierFunction, {});

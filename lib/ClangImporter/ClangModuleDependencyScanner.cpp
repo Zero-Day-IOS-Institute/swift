@@ -14,23 +14,16 @@
 //
 //===----------------------------------------------------------------------===//
 #include "ImporterImpl.h"
-#include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ModuleDependencies.h"
 #include "swift/AST/SILOptions.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/CASOptions.h"
-#include "swift/Basic/SourceManager.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/CAS/CASOptions.h"
-#include "clang/DependencyScanning/DependencyScanningService.h"
 #include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Frontend/FrontendOptions.h"
-#include "clang/Tooling/DependencyScanningTool.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Allocator.h"
-#include "llvm/Support/FileSystem.h"
-#include "llvm/Support/Path.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/StringSaver.h"
 
@@ -165,6 +158,11 @@ void ClangImporter::getBridgingHeaderOptions(
   depsInvocation.getFrontendOpts().ModuleCacheKeys.clear();
   depsInvocation.getFrontendOpts().PathPrefixMappings.clear();
   depsInvocation.getFrontendOpts().OutputFile.clear();
+
+  // Reset CASOptions since that should be coming from swift. The include tree
+  // is passed via `-clang-include-tree-root`.
+  depsInvocation.getCASOpts() = clang::CASOptions();
+  depsInvocation.getFrontendOpts().CASIncludeTreeID.clear();
 
   llvm::BumpPtrAllocator allocator;
   llvm::StringSaver saver(allocator);

@@ -10,10 +10,17 @@
 // CHECK: func setConstStaticIntRef(_: CInt)
 // CHECK: func getFuncRef() -> @convention(c) () -> CInt
 // CHECK: func getFuncRvalueRef() -> @convention(c) () -> CInt
+// CHECK: func callFuncRef(_: @convention(c) () -> CInt) -> CInt
+// CHECK: func callFuncRvalueRef(consuming _: @convention(c) () -> CInt) -> CInt
 // CHECK: func setConstStaticIntRefTypealias(_ ref: CInt)
 // CHECK: func setStaticIntRefTypealias(_ ref: inout CInt)
 // CHECK: func refToTemplate<T>(_ t: inout T) -> UnsafeMutablePointer<T>
 // CHECK: func constRefToTemplate<T>(_ t: T) -> UnsafePointer<T>
+
+// CHECK: func callWithIntRef(_ callback: (@convention(c) (UnsafeMutablePointer<CInt>) -> Void)!)
+// CHECK: func callWithConstIntRef(_ callback: (@convention(c) (CInt) -> Void)!)
+// CHECK: func callWithIntRvalueRef(_ callback: (@convention(c) (CInt) -> Void)!)
+// CHECK: func callWithConstIntRvalueRef(_ callback: (@convention(c) (CInt) -> Void)!)
 
 // CHECK-NOT: refToDependent
 // CHECK-NOT: refToDependentParam

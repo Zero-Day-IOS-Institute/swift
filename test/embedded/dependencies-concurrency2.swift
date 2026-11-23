@@ -1,6 +1,6 @@
 // RUN: %empty-directory(%t)
 // RUN: split-file %s %t
-// RUN: %target-swift-frontend -target %target-cpu-apple-macos14 -disable-availability-checking -parse-as-library -enable-experimental-feature Embedded %t/test.swift -c -o %t/a.o
+// RUN: %target-swift-frontend -target %target-cpu-apple-macos14 -parse-as-library -enable-experimental-feature Embedded %t/test.swift -c -o %t/a.o
 // RUN: %target-embedded-link -nostdlib -lSystem %t/a.o -o %t/a.out -L%swift_obj_root/lib/swift/embedded/%target-cpu-apple-macos -lswift_Concurrency %target-embedded-concurrency-threading-shim -dead_strip -Wl,-undefined,dynamic_lookup
 
 // RUN: %llvm-nm --undefined-only --format=just-symbols %t/a.out | sort | tee %t/actual-dependencies.txt
@@ -13,9 +13,17 @@
 ___assert_rtn
 ___stack_chk_fail
 ___stack_chk_guard
+___stdoutp
+__swift_concurrency_asyncMain
+__swift_concurrency_enqueueGlobal
+__swift_concurrency_enqueueMainExecutor
+__swift_concurrency_getMainExecutor
+__swift_concurrency_isMainExecutor
 _abort
 _exit
+_flockfile
 _free
+_funlockfile
 _malloc
 _memcpy
 _memmove
@@ -36,18 +44,6 @@ _putchar
 _puts
 _strlen
 _strncpy
-_swift_task_asyncMainDrainQueueImpl
-_swift_task_enqueueGlobalImpl
-_swift_task_getMainExecutorImpl
-_swift_task_asyncMainDrainQueueImpl
-_swift_task_checkIsolatedImpl
-_swift_task_donateThreadToGlobalExecutorUntilImpl
-_swift_task_enqueueGlobalImpl
-_swift_task_enqueueGlobalWithDeadlineImpl
-_swift_task_enqueueGlobalWithDelayImpl
-_swift_task_enqueueMainExecutorImpl
-_swift_task_getMainExecutorImpl
-_swift_task_isMainExecutorImpl
 _vprintf
 _vsnprintf
 dyld_stub_binder

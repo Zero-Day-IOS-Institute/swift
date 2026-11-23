@@ -33,6 +33,7 @@ endif()
 set(backtracing_sources
   Address.swift
   AggregatingSymbolSource.swift
+  ApkFile.swift
   Backtrace.swift
   Backtrace+Codable.swift
   BacktraceFormatter.swift
@@ -87,6 +88,8 @@ set(backtracing_sources
   SymbolLocator.swift
   Utils.swift
   Win32Unwinder.swift
+
+  SafeReadMemory.cpp
 )
 
 set(runtime_sources
@@ -171,7 +174,7 @@ add_swift_target_library(swiftRuntime ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_STD
   INSTALL_IN_COMPONENT stdlib
   MACCATALYST_BUILD_FLAVOR "zippered"
 
-  TARGET_SDKS OSX LINUX LINUX_STATIC WINDOWS
+  TARGET_SDKS OSX LINUX LINUX_STATIC WINDOWS ANDROID
 )
 
 if(SWIFT_ENABLE_BACKTRACING)

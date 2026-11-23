@@ -30,13 +30,9 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/TypeRepr.h"
-#include "swift/Parse/Lexer.h"
 #include "swift/Basic/Assertions.h"
 #include "swift/Basic/Debug.h"
-#include "swift/Basic/STLExtras.h"
-#include "llvm/Support/Compiler.h"
 #include <algorithm>
-#include <unordered_set>
 
 using namespace swift;
 using namespace ast_scope;
@@ -404,7 +400,8 @@ public:
   VISIT_AND_IGNORE(ParamDecl)
   VISIT_AND_IGNORE(MissingDecl)
   VISIT_AND_IGNORE(MissingMemberDecl)
-  VISIT_AND_IGNORE(UsingDecl)
+  VISIT_AND_IGNORE(FileDefaultDecl)
+  VISIT_AND_IGNORE(HiddenTypeLayoutInfoDecl)
 
   // This declaration is handled from the PatternBindingDecl
   VISIT_AND_IGNORE(VarDecl)
@@ -450,7 +447,22 @@ public:
         WhatScope, GenericTypeOrExtensionWholePortion>(p, w);                  \
   }
 
-  VISIT_AND_CREATE_WHOLE_PORTION(ExtensionDecl, ExtensionScope)
+  ASTScopeImpl *visitExtensionDecl(ExtensionDecl *e, ASTScopeImpl *p,
+                                   ScopeCreator &scopeCreator) {
+    // Give its '@specialized' attributes their own scopes, so that names like
+    // 'T' in their 'where' clauses resolve. They come before the extended
+    // type, outside the extension's scope, so their scopes go in the parent,
+    // in source order (the attributes are in reverse order).
+    SmallVector<AbstractSpecializeAttr *, 2> attrs;
+    for (auto *attr : e->getAttrs().getAttributes<AbstractSpecializeAttr>())
+      if (!attr->isImplicit())
+        attrs.push_back(const_cast<AbstractSpecializeAttr *>(attr));
+    for (auto *attr : llvm::reverse(attrs))
+      scopeCreator.constructExpandAndInsert<SpecializeAttributeScope>(p, attr,
+                                                                      e);
+    return scopeCreator.constructWithPortionExpandAndInsert<
+        ExtensionScope, GenericTypeOrExtensionWholePortion>(p, e);
+  }
   VISIT_AND_CREATE_WHOLE_PORTION(StructDecl, NominalTypeScope)
   VISIT_AND_CREATE_WHOLE_PORTION(ClassDecl, NominalTypeScope)
   VISIT_AND_CREATE_WHOLE_PORTION(ProtocolDecl, NominalTypeScope)

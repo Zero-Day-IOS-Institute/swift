@@ -1,6 +1,6 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend -emit-module -emit-module-path %t/GlobalVariables.swiftmodule -module-name GlobalVariables -parse-as-library -strict-concurrency=minimal -swift-version 5 %S/Inputs/GlobalVariables.swift
-// RUN: %target-swift-frontend -disable-availability-checking -parse-as-library -swift-version 6 -I %t -emit-sil -o /dev/null -verify -verify-ignore-unrelated %s
+// RUN: %target-swift-frontend -target %target-swift-5.1-abi-triple -emit-module -emit-module-path %t/GlobalVariables.swiftmodule -module-name GlobalVariables -parse-as-library -strict-concurrency=minimal -swift-version 5 %S/Inputs/GlobalVariables.swift
+// RUN: %target-swift-frontend -target %target-swift-5.1-abi-triple -parse-as-library -swift-version 6 -I %t -emit-sil -o /dev/null -verify -verify-ignore-unrelated %s
 
 // REQUIRES: concurrency
 
@@ -30,6 +30,10 @@ final class TestNonsendable { // expected-note 3{{class 'TestNonsendable' does n
 }
 
 nonisolated(unsafe) let immutableNonisolatedUnsafeTopLevelGlobal = TestNonsendable()
+
+// The counterpart in an @abi attribute isn't checked as storage of its own.
+@abi(var abiMainActorGlobal: Int)
+@MainActor var mainActorGlobal = 1
 
 @propertyWrapper
 public struct TestWrapper {
@@ -105,6 +109,71 @@ public actor GlobalActorComputed: GlobalActor {
     Self.storage
   }
 }
+
+// A Sendable conformance that is unavailable on some platforms still makes
+// the type Sendable in contexts that are also unavailable on those platforms.
+@available(macOS, unavailable)
+@available(iOS, unavailable)
+@available(tvOS, unavailable)
+@available(watchOS, unavailable)
+@available(visionOS, unavailable)
+struct TestUnavailableOnApplePlatforms {
+  static let immutableStatic = TestUnavailableOnApplePlatforms()
+}
+
+@available(macOS, unavailable)
+@available(iOS, unavailable)
+@available(tvOS, unavailable)
+@available(watchOS, unavailable)
+@available(visionOS, unavailable)
+extension TestUnavailableOnApplePlatforms: Sendable {}
+
+@available(macOS, unavailable)
+@available(iOS, unavailable)
+@available(tvOS, unavailable)
+@available(watchOS, unavailable)
+@available(visionOS, unavailable)
+let immutableUnavailableOnApplePlatformsGlobal = TestUnavailableOnApplePlatforms()
+
+@available(macOS, unavailable)
+@available(iOS, unavailable)
+@available(tvOS, unavailable)
+@available(watchOS, unavailable)
+@available(visionOS, unavailable)
+enum UnavailableOnApplePlatformsEnumSpace {
+  static let enumStaticLet = TestUnavailableOnApplePlatforms()
+}
+
+@available(macOS, unavailable)
+@available(iOS, unavailable)
+@available(tvOS, unavailable)
+@available(watchOS, unavailable)
+@available(visionOS, unavailable)
+struct TestInferredSendableUnavailableOnApplePlatforms {
+  var stored: TestUnavailableOnApplePlatforms
+  static let immutableStatic = TestInferredSendableUnavailableOnApplePlatforms(
+    stored: TestUnavailableOnApplePlatforms())
+}
+
+@available(*, unavailable)
+let immutableUniversallyUnavailableGlobal = TestUnavailableOnApplePlatforms()
+
+struct TestExplicitlyNonsendable { // expected-note 2{{consider making struct 'TestExplicitlyNonsendable' conform to the 'Sendable' protocol}}
+}
+
+@available(*, unavailable)
+extension TestExplicitlyNonsendable: Sendable {}
+
+let immutableExplicitlyNonsendableGlobal = TestExplicitlyNonsendable()
+// expected-error@-1 {{let 'immutableExplicitlyNonsendableGlobal' is not concurrency-safe because non-'Sendable' type 'TestExplicitlyNonsendable' may have shared mutable state}}
+// expected-note@-2 {{add '@MainActor' to make let 'immutableExplicitlyNonsendableGlobal' part of global actor 'MainActor'}}
+// expected-note@-3 {{disable concurrency-safety checks if accesses are protected by an external synchronization mechanism}}
+
+@available(macOS, unavailable)
+let immutableExplicitlyNonsendableUnavailableOnMacOSGlobal = TestExplicitlyNonsendable()
+// expected-error@-1 {{let 'immutableExplicitlyNonsendableUnavailableOnMacOSGlobal' is not concurrency-safe because non-'Sendable' type 'TestExplicitlyNonsendable' may have shared mutable state}}
+// expected-note@-2 {{add '@MainActor' to make let 'immutableExplicitlyNonsendableUnavailableOnMacOSGlobal' part of global actor 'MainActor'}}
+// expected-note@-3 {{disable concurrency-safety checks if accesses are protected by an external synchronization mechanism}}
 
 @TestGlobalActor
 func f() {

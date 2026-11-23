@@ -38,6 +38,8 @@ extension ASTGenVisitor {
       return self.generate(enumDecl: node)?.asDecl
     case .extensionDecl(let node):
       return self.generate(extensionDecl: node).asDecl
+    case .fileDefaultDecl(let node):
+      return self.generate(fileDefaultDecl: node)?.asDecl
     case .functionDecl(let node):
       return self.generate(functionDecl: node)?.asDecl
     case .ifConfigDecl:
@@ -72,8 +74,6 @@ extension ASTGenVisitor {
       return nil
     case .variableDecl(let node):
       return self.generate(variableDecl: node)
-    case .usingDecl(let node):
-      return self.generate(usingDecl: node)?.asDecl
     }
   }
 
@@ -617,7 +617,9 @@ extension ASTGenVisitor {
     return entries.reversed().bridgedArray(in: self)
   }
 
-  func generate(variableDecl node: VariableDeclSyntax) -> BridgedDecl? {
+  /// - Parameter isABIOnly: Whether `node` is the counterpart in an `@abi`
+  ///   attribute.
+  func generate(variableDecl node: VariableDeclSyntax, isABIOnly: Bool = false) -> BridgedDecl? {
     let attrs = self.generateDeclAttributes(node, allowStatic: true)
     let introducer: BridgedVarDeclIntroducer
     switch node.bindingSpecifier.rawText {
@@ -633,13 +635,14 @@ extension ASTGenVisitor {
     }
 
     // @const/@section globals are not top-level, per SE-0492.
-    // We follow the same rule for @_extern.
+    // We follow the same rule for @_extern. The counterpart in an @abi
+    // attribute is not executable code, either.
     let isConst = attrs.attributes.hasAttribute(.Section)
       || attrs.attributes.hasAttribute(.ConstVal)
       || attrs.attributes.hasAttribute(.Extern)
 
     let topLevelDecl: BridgedTopLevelCodeDecl?
-    if self.declContext.isModuleScopeContext, self.declContext.parentSourceFile.isScriptMode, !isConst {
+    if self.declContext.isModuleScopeContext, self.declContext.parentSourceFile.isScriptMode, !isConst, !isABIOnly {
       topLevelDecl = BridgedTopLevelCodeDecl.create(self.ctx, declContext: self.declContext)
     } else {
       topLevelDecl = nil
@@ -729,6 +732,7 @@ extension ASTGenVisitor {
     var throwsLoc: SourceLoc
     var isRethrows: Bool
     var thrownType: BridgedTypeRepr?
+    var yieldList: BridgedYieldList?
     var returnType: BridgedTypeRepr?
   }
   
@@ -743,6 +747,7 @@ extension ASTGenVisitor {
     let isRethrows = node.effectSpecifiers?.throwsClause?.throwsSpecifier.rawText == "rethrows"
     let thrownType = (node.effectSpecifiers?.thrownError).map(self.generate(type:))
     let returnType = (node.returnClause?.type).map(self.generate(type:))
+    let yieldList = self.generate(functionYieldClause: node.yieldClause)
     return GeneratedFunctionSignature(
       parameterList: parameterList,
       asyncLoc: asyncLoc,
@@ -750,6 +755,7 @@ extension ASTGenVisitor {
       throwsLoc: throwsLoc,
       isRethrows: isRethrows,
       thrownType: thrownType,
+      yieldList: yieldList,
       returnType: returnType
     )
   } 
@@ -777,6 +783,7 @@ extension ASTGenVisitor {
       asyncSpecifierLoc: signature.asyncLoc,
       throwsSpecifierLoc: signature.throwsLoc,
       thrownType: signature.thrownType.asNullable,
+      yieldList: signature.yieldList.asNullable,
       returnType: signature.returnType.asNullable,
       genericWhereClause: self.generate(genericWhereClause: node.genericWhereClause)
     )
@@ -1141,7 +1148,7 @@ extension ASTGenVisitor {
 }
 
 extension ASTGenVisitor {
-  func generate(usingDecl node: UsingDeclSyntax) -> BridgedUsingDecl? {
+  func generate(fileDefaultDecl node: FileDefaultDeclSyntax) -> BridgedFileDefaultDecl? {
     var attrs = BridgedDeclAttributes()
     var addedAny = false
 
@@ -1153,7 +1160,7 @@ extension ASTGenVisitor {
       }
     case .modifier(let modifier):
       guard case .identifier("nonisolated") = modifier.tokenKind else {
-        self.diagnose(.invalidDefaultSpecifier(node.specifier))
+        self.diagnose(.invalidFileDefaultSpecifier(node.specifier))
         return nil
       }
       let nonisolatedAttr = BridgedNonisolatedAttr.createParsed(
@@ -1166,14 +1173,14 @@ extension ASTGenVisitor {
       addedAny = true
     }
     guard addedAny else {
-      self.diagnose(.invalidDefaultSpecifier(node.specifier))
+      self.diagnose(.invalidFileDefaultSpecifier(node.specifier))
       return nil
     }
 
-    return BridgedUsingDecl.createParsed(
+    return BridgedFileDefaultDecl.createParsed(
       self.ctx,
       declContext: self.declContext,
-      usingKeywordLoc: self.generateSourceLoc(node.usingKeyword),
+      defaultKeywordLoc: self.generateSourceLoc(node.defaultKeyword),
       specifiedAttributes: attrs
     )
   }

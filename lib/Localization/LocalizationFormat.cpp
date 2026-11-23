@@ -15,18 +15,15 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/Localization/LocalizationFormat.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Range.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/Bitstream/BitstreamReader.h"
-#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/VirtualFileSystem.h"
 #include <cstdint>
 #include <map>
-#include <optional>
 #include <string>
 #include <system_error>
 #include <type_traits>
@@ -120,24 +117,24 @@ SerializedLocalizationProducer::getMessage(swift::DiagID id) const {
 }
 
 std::unique_ptr<LocalizationProducer>
-LocalizationProducer::producerFor(llvm::StringRef locale,
-                                  llvm::StringRef path) {
+LocalizationProducer::producerFor(llvm::StringRef locale, llvm::StringRef path,
+                                  llvm::vfs::FileSystem &fs) {
   llvm::SmallString<128> filePath(path);
   llvm::sys::path::append(filePath, locale);
   llvm::sys::path::replace_extension(filePath, ".db");
 
   // If the serialized diagnostics file not available,
   // fallback to the `.strings` file.
-  if (llvm::sys::fs::exists(filePath)) {
-    if (auto file = llvm::MemoryBuffer::getFile(filePath)) {
+  if (fs.exists(filePath)) {
+    if (auto file = fs.getBufferForFile(filePath)) {
       return std::make_unique<diag::SerializedLocalizationProducer>(
           std::move(file.get()));
     }
   } else {
     llvm::sys::path::replace_extension(filePath, ".strings");
-    if (llvm::sys::fs::exists(filePath)) {
+    if (auto file = fs.getBufferForFile(filePath)) {
       return std::make_unique<diag::StringsLocalizationProducer>(
-          filePath.str());
+          std::move(file.get()));
     }
   }
 
@@ -166,9 +163,7 @@ void DefToStringsConverter::convert(llvm::raw_ostream &out) {
 }
 
 bool StringsLocalizationProducer::initializeImpl() {
-  auto FileBufOrErr = llvm::MemoryBuffer::getFileOrSTDIN(filePath);
-  llvm::MemoryBuffer *document = FileBufOrErr->get();
-  readStringsFile(document, diagnostics);
+  readStringsFile(buffer.get(), diagnostics);
   return true;
 }
 

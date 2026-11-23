@@ -15,7 +15,6 @@
 
 #include "swift/AST/DiagnosticGroups.h"
 #include "swift/Basic/Feature.h"
-#include "swift/Frontend/Frontend.h"
 
 #include "llvm/Support/raw_ostream.h"
 
@@ -50,6 +49,7 @@ static std::vector<DiagGroupID> migratableCategories(Feature feature) {
 #include "swift/Basic/Features.def"
     llvm_unreachable("Not a migratable feature");
   }
+  llvm_unreachable("covered switch");
 }
 
 /// For optional language features, return the flag name used by the compiler to enable the feature. For all others,
@@ -67,6 +67,7 @@ static std::optional<std::string_view> optionalFlagName(Feature feature) {
 #include "swift/Basic/Features.def"
     return std::nullopt;
   }
+  llvm_unreachable("covered switch");
 }
 
 /// Print information about what features upcoming/experimental are

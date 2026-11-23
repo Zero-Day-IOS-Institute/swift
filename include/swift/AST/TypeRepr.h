@@ -19,7 +19,6 @@
 
 #include "swift/AST/Attr.h"
 #include "swift/AST/DeclContext.h"
-#include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/LifetimeDependence.h"
@@ -27,7 +26,6 @@
 #include "swift/AST/TypeAlignments.h"
 #include "swift/Basic/Debug.h"
 #include "swift/Basic/InlineBitfield.h"
-#include "swift/Basic/Located.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/STLExtras.h"
@@ -88,23 +86,21 @@ protected:
   SWIFT_INLINE_BITFIELD_FULL(DeclRefTypeRepr, TypeRepr, 1+32,
     /// Whether this instance has a valid angle bracket source range.
     HasAngleBrackets: 1,
-    : NumPadBits,
 
     NumGenericArgs : 32
   );
 
   SWIFT_INLINE_BITFIELD_FULL(CompositionTypeRepr, TypeRepr, 32,
-    : NumPadBits,
     NumTypes : 32
   );
 
-  SWIFT_INLINE_BITFIELD_FULL(SILBoxTypeRepr, TypeRepr, 32,
-    NumGenericArgs : NumPadBits,
+  SWIFT_INLINE_BITFIELD_FULL(SILBoxTypeRepr, TypeRepr,
+                             32 + (32 - NumberOfTypeReprBits),
+    NumGenericArgs : 32 - NumberOfTypeReprBits,
     NumFields : 32
   );
 
   SWIFT_INLINE_BITFIELD_FULL(AttributedTypeRepr, TypeRepr, 32,
-    : NumPadBits,
     NumAttributes : 32
   );
 
@@ -178,7 +174,8 @@ public:
   ///
   /// \returns true if the predicate returns true for the given type or any of
   /// its children.
-  bool findIf(llvm::function_ref<bool(TypeRepr *)> pred);
+  bool findIf(llvm::function_ref<bool(TypeRepr *)> pred,
+              bool walkIntoGenericArgumentExprs = false);
 
   /// Check recursively whether this type repr or any of its descendants are
   /// opaque return type reprs.
@@ -538,6 +535,7 @@ class FunctionTypeRepr : public TypeRepr {
   ArrayRef<TypeRepr *> PatternSubs;
 
   TupleTypeRepr *ArgsTy;
+  TupleTypeRepr *YieldsTy;
   TypeRepr *RetTy;
   TypeRepr *ThrownTy;
   SourceLoc AsyncLoc;
@@ -546,21 +544,16 @@ class FunctionTypeRepr : public TypeRepr {
 
 public:
   FunctionTypeRepr(GenericParamList *genericParams, TupleTypeRepr *argsTy,
-                   SourceLoc asyncLoc, SourceLoc throwsLoc, 
-                   TypeRepr *thrownTy,
-                   SourceLoc arrowLoc,
-                   TypeRepr *retTy,
+                   SourceLoc asyncLoc, SourceLoc throwsLoc, TypeRepr *thrownTy,
+                   TupleTypeRepr *yieldsTy, SourceLoc arrowLoc, TypeRepr *retTy,
                    GenericParamList *patternGenericParams = nullptr,
                    ArrayRef<TypeRepr *> patternSubs = {},
                    ArrayRef<TypeRepr *> invocationSubs = {})
-    : TypeRepr(TypeReprKind::Function),
-      GenericParams(genericParams),
-      InvocationSubs(invocationSubs),
-      PatternGenericParams(patternGenericParams),
-      PatternSubs(patternSubs),
-      ArgsTy(argsTy), RetTy(retTy), ThrownTy(thrownTy),
-      AsyncLoc(asyncLoc), ThrowsLoc(throwsLoc), ArrowLoc(arrowLoc) {
-  }
+      : TypeRepr(TypeReprKind::Function), GenericParams(genericParams),
+        InvocationSubs(invocationSubs),
+        PatternGenericParams(patternGenericParams), PatternSubs(patternSubs),
+        ArgsTy(argsTy), YieldsTy(yieldsTy), RetTy(retTy), ThrownTy(thrownTy),
+        AsyncLoc(asyncLoc), ThrowsLoc(throwsLoc), ArrowLoc(arrowLoc) {}
 
   GenericParamList *getGenericParams() const { return GenericParams; }
   GenericSignature getGenericSignature() const { return GenericSig; }
@@ -589,9 +582,11 @@ public:
 
   TupleTypeRepr *getArgsTypeRepr() const { return ArgsTy; }
   TypeRepr *getThrownTypeRepr() const { return ThrownTy; }
+  TupleTypeRepr *getYieldsTypeRepr() const { return YieldsTy; }
   TypeRepr *getResultTypeRepr() const { return RetTy; }
   bool isAsync() const { return AsyncLoc.isValid(); }
   bool isThrowing() const { return ThrowsLoc.isValid(); }
+  bool isCoroutine() const;
 
   SourceLoc getAsyncLoc() const { return AsyncLoc; }
   SourceLoc getThrowsLoc() const { return ThrowsLoc; }
@@ -801,7 +796,7 @@ public:
   static bool classof(const VarargTypeRepr *T) { return true; }
 
 private:
-  SourceLoc getStartLocImpl() const { return Element->getEndLoc(); }
+  SourceLoc getStartLocImpl() const { return Element->getStartLoc(); }
   SourceLoc getEndLocImpl() const { return EllipsisLoc; }
   SourceLoc getLocImpl() const { return EllipsisLoc; }
   void printImpl(ASTPrinter &Printer, const PrintOptions &opts,

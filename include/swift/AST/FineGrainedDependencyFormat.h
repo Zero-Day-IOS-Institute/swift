@@ -14,11 +14,11 @@
 #define SWIFT_AST_FINEGRAINEDDEPENDENCYFORMAT_H
 
 #include "llvm/Bitcode/BitcodeConvenience.h"
-#include "llvm/Bitstream/BitCodes.h"
 
 namespace llvm {
 class MemoryBuffer;
 namespace vfs {
+class FileSystem;
 class OutputBackend;
 }
 }
@@ -127,10 +127,10 @@ bool readFineGrainedDependencyGraph(llvm::MemoryBuffer &buffer,
 bool readFineGrainedDependencyGraphFromSwiftModule(llvm::MemoryBuffer &buffer,
                                                    SourceFileDepGraph &g);
 
-/// Tries to read the dependency graph from the given path name.
+/// Tries to read the dependency graph from the given path name in \p fs.
 /// Returns true if there was an error.
-bool readFineGrainedDependencyGraph(llvm::StringRef path,
-                                    SourceFileDepGraph &g);
+bool readFineGrainedDependencyGraph(llvm::StringRef path, SourceFileDepGraph &g,
+                                    llvm::vfs::FileSystem &fs);
 
 /// Tries to write the dependency graph to the given path name.
 /// Returns true if there was an error.

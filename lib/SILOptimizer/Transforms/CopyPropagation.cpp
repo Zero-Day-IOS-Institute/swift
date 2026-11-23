@@ -49,7 +49,6 @@
 
 #define DEBUG_TYPE "copy-propagation"
 
-#include "swift/Basic/Assertions.h"
 #include "swift/SIL/BasicBlockDatastructures.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/DebugUtils.h"
@@ -446,8 +445,6 @@ public:
   void propagateCopies(CanonicalDefWorklist &defWorklist, bool &changed,
                        NonLocalAccessBlockAnalysis *accessBlockAnalysis,
                        InstructionDeleter &deleter);
-
-  void verifyOwnership();
 };
 
 } // end anonymous namespace
@@ -683,14 +680,7 @@ void CopyPropagation::run() {
     accessBlockAnalysis->lockInvalidation();
     invalidateAnalysis(SILAnalysis::InvalidationKind::Instructions);
     accessBlockAnalysis->unlockInvalidation();
-    if (f->getModule().getOptions().VerifySILOwnership) {
-      verifyOwnership();
-    }
   }
-}
-
-void CopyPropagation::verifyOwnership() {
-  getFunction()->verifyOwnership();
 }
 
 // MandatoryCopyPropagation runs in the -Onone pipeline and needs to be more

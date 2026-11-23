@@ -23,7 +23,6 @@
 
 #include "swift/AST/AnyFunctionRef.h"
 #include "swift/AST/Decl.h"
-#include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/ForeignInfo.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/LocalArchetypeRequirementCollector.h"
@@ -31,7 +30,6 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/ModuleLoader.h"
 #include "swift/AST/TypeCheckRequests.h"
-#include "swift/AST/TypeTransform.h"
 #include "swift/Basic/Assertions.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/SIL/SILModule.h"
@@ -43,10 +41,8 @@
 #include "clang/AST/DeclObjC.h"
 #include "clang/Analysis/DomainSpecific/CocoaConventions.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/SipHash.h"
 
 using namespace swift;
@@ -270,7 +266,7 @@ SILFunctionType::getWitnessMethodClass(SILModule &M,
     assert(paramTy->getDepth() == 0 && paramTy->getIndex() == 0);
     auto superclass = genericSig->getSuperclassBound(paramTy);
     if (superclass)
-      return superclass->getClassOrBoundGenericClass();
+      return superclass->getClassDecl();
   }
 
   return nullptr;
@@ -354,6 +350,7 @@ CanSILFunctionType SILFunctionType::getLinearComponentType(
         getDifferentiabilityParameterIndices(), module.Types,
         LookUpConformanceInModule());
   }
+  llvm_unreachable("covered switch");
 }
 
 CanSILFunctionType
@@ -886,10 +883,9 @@ static SILFunctionType *getConstrainedAutoDiffOriginalFunctionType(
     CanGenericSignature constrainedInvocationGenSig) {
   auto originalInvocationGenSig = original->getInvocationGenericSignature();
   if (!originalInvocationGenSig) {
-    assert(!constrainedInvocationGenSig ||
-           constrainedInvocationGenSig->areAllParamsConcrete() &&
-               "derivative function cannot have invocation generic signature "
-               "when original function doesn't");
+    assert(!constrainedInvocationGenSig.isEffectivelyGeneric() &&
+           "derivative function cannot have invocation generic signature "
+           "when original function doesn't");
     if (auto patternSig = original->getPatternGenericSignature()) {
       auto constrainedPatternSig =
         autodiff::getConstrainedDerivativeGenericSignature(
@@ -940,9 +936,9 @@ static SILFunctionType *getConstrainedAutoDiffOriginalFunctionType(
             constrainedInvocationGenSig)));
   }
   return SILFunctionType::get(
-      constrainedInvocationGenSig->areAllParamsConcrete()
-          ? GenericSignature()
-          : constrainedInvocationGenSig,
+      constrainedInvocationGenSig->isEffectivelyGeneric()
+          ? constrainedInvocationGenSig
+          : GenericSignature(),
       original->getExtInfo(), original->getCoroutineKind(),
       original->getCalleeConvention(), newParameters, original->getYields(),
       newResults, original->getOptionalErrorResult(),
@@ -1772,7 +1768,7 @@ static bool isClangTypeMoreIndirectThanSubstType(TypeConverter &TC,
 
     if (clangTy->getPointeeType()->getAs<clang::RecordType>()) {
       // Foreign reference types
-      if (substTy->getClassOrBoundGenericClass()) {
+      if (substTy->getClassDecl()) {
         return false;
       }
     }
@@ -1786,19 +1782,19 @@ static bool isClangTypeMoreIndirectThanSubstType(TypeConverter &TC,
     return true;
   }
 
-  // Pass C++ const reference types indirectly. Right now there's no way to
-  // express immutable borrowed params, so we have to have this hack.
+  // Every C++ reference kind but a mutable lvalue reference is imported as the
+  // pointee and passed indirectly. Right now there's no way to express
+  // immutable borrowed params, so we have to have this hack.
   // Eventually, we should just express these correctly: rdar://89647503
-  // If this is a const reference to a foreign reference type (const FRT&), this
-  // is equivalent to a pointer to the foreign reference type, which are passed
-  // directly.
-  if (importer::isCxxConstReferenceType(clangTy) &&
-      !(clangTy->getPointeeType()->getAs<clang::RecordType>() &&
-        substTy->isForeignReferenceType()))
-    return true;
-
-  if (clangTy->isRValueReferenceType())
-    return true;
+  // A reference to a foreign reference type is equivalent to a pointer to it,
+  // which is passed directly.
+  if (auto ref = importer::classifyCxxReferenceParameter(
+          clang::QualType(clangTy, 0))) {
+    if (ref->kind == importer::CxxReferenceParameterKind::Mutating)
+      return false;
+    return !(clangTy->getPointeeType()->getAs<clang::RecordType>() &&
+             substTy->isForeignReferenceType());
+  }
 
   return false;
 }
@@ -1811,7 +1807,7 @@ static bool isFormallyPassedIndirectly(TypeConverter &TC,
   // as indirect.
   if (origType.isClangType()) {
     if (auto *classDecl = substType->lookThroughAllOptionalTypes()
-                              ->getClassOrBoundGenericClass()) {
+                              ->getClassDecl()) {
       if (!classDecl->isForeignReferenceType()) {
         if (origType.getClangType()
                 ->getUnqualifiedDesugaredType()
@@ -2188,16 +2184,27 @@ private:
 
     CanType loweredType = substTL.getLoweredType().getASTType();
 
+    // A C++ method takes 'this' as a pointer, so self must be passed
+    // indirectly even when the Swift value type is loadable. An lvalue 'this'
+    // already lands there via isClangTypeMoreIndirectThanSubstType.
+    // A type imported as a class is itself the reference, so it stays direct.
+    bool isCxxMethodSelf =
+        Convs.getKind() == ConventionsKind::CXXMethod &&
+        Foreign.self.isInstance() &&
+        formalParamIndex == (int)Foreign.self.getSelfIndex() &&
+        !substType->hasReferenceSemantics();
+
     ParameterConvention convention;
     if (ownership == ValueOwnership::InOut) {
       convention = ParameterConvention::Indirect_Inout;
-    } else if (isFormallyPassedIndirectly(origType, substType, substTLConv)) {
+    } else if (isCxxMethodSelf ||
+               isFormallyPassedIndirectly(origType, substType, substTLConv)) {
       convention = Convs.getIndirect(ownership, forSelf, origParamIndex,
                                      origType, substTLConv);
       assert(isIndirectFormalParameter(convention));
     } else if (substTL.isTrivial() ||
                // Foreign reference types are passed trivially.
-               (substType->getClassOrBoundGenericClass() &&
+               (substType->getClassDecl() &&
                 substType->isForeignReferenceType())) {
       convention = ParameterConvention::Direct_Unowned;
     } else {
@@ -2634,16 +2641,15 @@ lowerCaptureContextParameters(TypeConverter &TC, SILDeclRef function,
          "iterating over loweredCaptures.getCaptures().");
 }
 
-static AccessorDecl *
-getAsCoroutineAccessor(std::optional<SILDeclRef> constant) {
+static FuncDecl *getAsCoroutine(std::optional<SILDeclRef> constant) {
   if (!constant || !constant->hasDecl())
     return nullptr;;
 
-  auto accessor = dyn_cast<AccessorDecl>(constant->getDecl());
-  if (!accessor || !accessor->isCoroutine())
+  auto fd = dyn_cast<FuncDecl>(constant->getDecl());
+  if (!fd || !fd->isCoroutine())
     return nullptr;
 
-  return accessor;
+  return fd;
 }
 
 static void destructureYieldsForReadAccessor(TypeConverter &TC,
@@ -2680,19 +2686,13 @@ static void destructureYieldsForReadAccessor(TypeConverter &TC,
                                 convention));
 }
 
-static void destructureYieldsForCoroutine(TypeConverter &TC,
-                                          TypeExpansionContext expansion,
-                                          std::optional<SILDeclRef> constant,
-                                          AbstractionPattern origType,
-                                          CanType canValueType,
-                                          SmallVectorImpl<SILYieldInfo> &yields,
-                                          SILCoroutineKind &coroutineKind) {
-  auto accessor = getAsCoroutineAccessor(constant);
-  if (!accessor)
-    return;
-
+static void
+destructureYieldsForCoroutine(TypeConverter &TC, TypeExpansionContext expansion,
+                              AbstractionPattern origType, CanType canValueType,
+                              bool isInOutYield,
+                              SmallVectorImpl<SILYieldInfo> &yields) {
   // 'modify' yields an inout of the target type.
-  if (isYieldingMutableAccessor(accessor->getAccessorKind())) {
+  if (isInOutYield) {
     auto loweredValueTy =
         TC.getLoweredType(origType, canValueType, expansion);
     yields.push_back(SILYieldInfo(loweredValueTy.getASTType(),
@@ -2700,7 +2700,6 @@ static void destructureYieldsForCoroutine(TypeConverter &TC,
   } else {
     // 'read' yields a borrowed value of the target type, destructuring
     // tuples as necessary.
-    assert(isYieldingImmutableAccessor(accessor->getAccessorKind()));
     destructureYieldsForReadAccessor(TC, expansion, origType, canValueType,
                                      yields);
   }
@@ -2828,38 +2827,71 @@ static CanSILFunctionType getSILFunctionType(
 
   bool hasSendingResult = substFnInterfaceType->getExtInfo().hasSendingResult();
 
-  // Get the yield type for an accessor coroutine.
+  // Get the yield type for coroutine.
   SILCoroutineKind coroutineKind = SILCoroutineKind::None;
   AbstractionPattern coroutineOrigYieldType = AbstractionPattern::getInvalid();
   CanType coroutineSubstYieldType;
-  
-  if (auto accessor = getAsCoroutineAccessor(constant)) {
-    auto origAccessor = cast<AccessorDecl>(origConstant->getDecl());
-    auto &ctx = origAccessor->getASTContext();
-    coroutineKind =
-        (requiresFeatureCoroutineAccessors(accessor->getAccessorKind()) &&
-         ctx.SILOpts.CoroutineAccessorsUseYieldOnce2)
-            ? SILCoroutineKind::YieldOnce2
-            : SILCoroutineKind::YieldOnce;
 
-    // Coroutine accessors are always native, so fetch the native
-    // abstraction pattern.
-    auto origStorage = origAccessor->getStorage();
-    coroutineOrigYieldType = TC.getAbstractionPattern(origStorage,
-                                                      /*nonobjc*/ true)
-                               .getReferenceStorageReferentType();
+  bool isInOutYield = false;
+  if (auto fd = getAsCoroutine(constant)) { // Derive yield type for declaration
+    auto origFd = cast<FuncDecl>(origConstant->getDecl());
+    auto &ctx = origFd->getASTContext();
+    if (auto accessor = dyn_cast<AccessorDecl>(origFd)) {
+      coroutineKind =
+          (requiresFeatureCoroutineAccessors(accessor->getAccessorKind()) &&
+           ctx.SILOpts.CoroutineAccessorsUseYieldOnce2)
+              ? SILCoroutineKind::YieldOnce2
+              : SILCoroutineKind::YieldOnce;
+    } else {
+      coroutineKind = SILCoroutineKind::YieldOnce2;
+    }
 
-    auto storage = accessor->getStorage();
-    auto valueType = storage->getValueInterfaceType();
+    // Coroutines are always native, so fetch the native abstraction pattern.
+    auto sig = origFd->getGenericSignatureOfContext().getCanonicalSignature();
+    const auto *origYL = origFd->getYields();
+    assert(origYL->size() == 1 && "only support a single yield type");
+    
+    auto origYieldType = origYL->front().getInterfaceType(origFd);
+    if (auto inoutTy = origYieldType->getAs<InOutType>()) {
+      isInOutYield = true;
+      origYieldType = inoutTy->getObjectType();
+    }
+    auto reducedYieldType = sig.getReducedType(origYieldType);
+    coroutineOrigYieldType = AbstractionPattern(sig, reducedYieldType);
+
+    Type valueType = fd->getYields()->front().getInterfaceType(fd);
+    if (isInOutYield)
+      valueType = valueType->castTo<InOutType>()->getObjectType();
 
     if (reqtSubs) {
       valueType = valueType.subst(*reqtSubs);
       coroutineSubstYieldType = valueType->getReducedType(
           genericSig);
     } else {
-      coroutineSubstYieldType = valueType->getReducedType(
-          accessor->getGenericSignature());
+      coroutineSubstYieldType =
+          valueType->getReducedType(fd->getGenericSignature());
     }
+  } else if (substFnInterfaceType
+                 ->isCoroutine()) { // Derive yield type for function type
+    coroutineKind = SILCoroutineKind::YieldOnce2;
+    assert(substFnInterfaceType->getYields().size() == 1 &&
+           "only support a single yield type");
+
+    auto sig = origType.hasGenericSignature() ? origType.getGenericSignature()
+                                              : genericSig;
+    auto origYieldType = origType.getFunctionYieldType(0);
+    auto reducedYieldType = sig.getReducedType(origYieldType.getType());
+    coroutineOrigYieldType = AbstractionPattern(sig, reducedYieldType);
+
+    auto yieldType = substFnInterfaceType->getYields().front();
+    auto valueType = yieldType.getType();
+    isInOutYield = yieldType.isInOut();
+    assert(isInOutYield == origType.getFunctionYieldFlags(0).isInOut());
+
+    if (reqtSubs)
+      valueType = valueType.subst(*reqtSubs);
+
+    coroutineSubstYieldType = valueType->getReducedType(genericSig);
   }
 
   bool shouldBuildSubstFunctionType = [&]{
@@ -2883,7 +2915,7 @@ static CanSILFunctionType getSILFunctionType(
     // for class override thunks.  This is required to make the yields
     // match in abstraction to the base method's yields, which is necessary
     // to make the extracted continuation-function signatures match.
-    if (constant != origConstant && getAsCoroutineAccessor(constant))
+    if (constant != origConstant && getAsCoroutine(constant))
       return true;
 
     // We don't currently use substituted function types for generic function
@@ -2999,9 +3031,11 @@ static CanSILFunctionType getSILFunctionType(
 
   // Destructure the coroutine yields.
   SmallVector<SILYieldInfo, 8> yields;
-  destructureYieldsForCoroutine(TC, expansionContext, constant,
-                                coroutineOrigYieldType, coroutineSubstYieldType,
-                                yields, coroutineKind);
+  if (coroutineKind != SILCoroutineKind::None) {
+    destructureYieldsForCoroutine(TC, expansionContext, coroutineOrigYieldType,
+                                  coroutineSubstYieldType, isInOutYield,
+                                  yields);
+  }
 
   // Destructure the result tuple type.
   SmallVector<SILResultInfo, 8> results;
@@ -3536,12 +3570,12 @@ struct DefaultBlockConventions : Conventions {
   }
 };
 
-/// The default conventions for `@called(once)` closures.
+/// The default conventions for at-most-once closures.
 ///
 /// Calling such a value is itself the consuming use that enforces
 /// call-at-most-once, so its context must be owned rather than guaranteed.
-struct DefaultCalledOnceConventions : DefaultConventions {
-  DefaultCalledOnceConventions()
+struct DefaultCalledAtMostOnceSemanticsConventions : DefaultConventions {
+  DefaultCalledAtMostOnceSemanticsConventions()
       : DefaultConventions(NormalParameterConvention::Guaranteed) {}
 
   ParameterConvention getCallee() const override {
@@ -3578,6 +3612,7 @@ static CanSILFunctionType getNativeSILFunctionType(
         TC, origType, substInterfaceType, extInfoBuilder, constant);
 
   case SILFunctionType::Representation::Thin:
+  case SILFunctionType::Representation::COMMethod:
   case SILFunctionType::Representation::ObjCMethod:
   case SILFunctionType::Representation::Thick:
   case SILFunctionType::Representation::Method:
@@ -3595,21 +3630,24 @@ static CanSILFunctionType getNativeSILFunctionType(
       return getSILFunctionTypeForConventions(DefaultAllocatorConventions());
     case SILDeclRef::Kind::Func:
     case SILDeclRef::Kind::DistributedThunk: {
-      // If we have a setter, use the special setter convention. This ensures
-      // that we take normal parameters at +1.
-      if (constant) {
-        if (constant->isSetter()) {
-          return getSILFunctionTypeForConventions(DefaultSetterConventions());
-        }
+      // A setter or an init accessor takes its normal parameters at +1, which
+      // must agree with the ownership that the AST assigns to them.
+      auto *accessor = constant ? constant->getAccessorDecl() : nullptr;
+      if (accessor &&
+          getLoweredOwnership(ValueOwnership::Default, accessor,
+                              /*isSelf=*/false) == LoweredOwnership::Owned) {
         if (constant->isInitAccessor()) {
           return getSILFunctionTypeForInitAccessor(
               TC, context, origType, substInterfaceType, extInfoBuilder,
               DefaultSetterConventions(), *constant);
         }
+        ASSERT(constant->isSetter());
+        return getSILFunctionTypeForConventions(DefaultSetterConventions());
       }
 
-      if (substInterfaceType->isCalledOnce())
-        return getSILFunctionTypeForConventions(DefaultCalledOnceConventions());
+      if (substInterfaceType->isCallConsuming())
+        return getSILFunctionTypeForConventions(
+            DefaultCalledAtMostOnceSemanticsConventions());
 
       return getSILFunctionTypeForConventions(
           DefaultConventions(NormalParameterConvention::Guaranteed));
@@ -3732,11 +3770,11 @@ CanSILFunctionType swift::buildSILFunctionThunkType(
   if (withoutActuallyEscaping)
     extInfoBuilder = extInfoBuilder.withNoEscape(false);
 
-  // The thunk itself cannot be `@called(once)` just like a closure cannot
+  // The thunk itself cannot be at-most-once just like a closure cannot
   // be since the constraint is about the value and is expressed on
   // `partial_apply` instruction that forms the value of the thunk.
-  if (extInfoBuilder.isCalledOnce())
-    extInfoBuilder = extInfoBuilder.withCalledOnce(false);
+  if (extInfoBuilder.hasCalledAtMostOnceSemantics())
+    extInfoBuilder = extInfoBuilder.withExecutionSemantics(std::nullopt);
 
   // Does the thunk type involve a local archetype type?
   SmallVector<GenericEnvironment *, 2> capturedEnvs;
@@ -3818,12 +3856,12 @@ CanSILFunctionType swift::buildSILFunctionThunkType(
 
   // Add the formal parameters of the expected type to the thunk.
   //
-  // A `@called(once)` source function is applied inside the thunk body,
-  // which is itself the consuming use that enforces call-at-most-once, so
-  // it must be captured as `Direct_Owned`.
+  // A source function whose call consumes it is applied inside the thunk
+  // body, which is itself the consuming use, so it must be captured as
+  // `Direct_Owned`.
   auto contextConvention = fn->getTypeProperties(sourceType).isTrivial()
                                ? ParameterConvention::Direct_Unowned
-                           : sourceType->isCalledOnce()
+                           : sourceType->isCallConsuming()
                                ? ParameterConvention::Direct_Owned
                                : ParameterConvention::Direct_Guaranteed;
   SmallVector<SILParameterInfo, 4> params;
@@ -3904,9 +3942,10 @@ CanSILFunctionType swift::buildSILFunctionThunkType(
 //                          Foreign SILFunctionTypes
 //===----------------------------------------------------------------------===//
 
-static bool isCFTypedef(const TypeLowering &tl, clang::QualType type) {
-  // If we imported a C pointer type as a non-trivial type, it was
-  // a foreign class type.
+/// Whether a C pointer type was imported as a Swift class reference: either a
+/// CF type or a pointer to a C++ foreign reference type.
+static bool isPointerImportedAsClass(const TypeLowering &tl,
+                                     clang::QualType type) {
   return !tl.isTrivial() && type->isPointerType();
 }
 
@@ -3917,10 +3956,17 @@ static bool isCFTypedef(const TypeLowering &tl, clang::QualType type) {
 static ParameterConvention getIndirectCParameterConvention(clang::QualType type) {
   // Non-trivial C++ types would be Indirect_Inout (at least in Itanium).
   // A trivial const * parameter in C should be considered @in.
-  if (importer::isCxxConstReferenceType(type.getTypePtr()))
-    return ParameterConvention::Indirect_In_Guaranteed;
-  if (type->isRValueReferenceType())
-    return ParameterConvention::Indirect_In_CXX;
+  if (auto ref = importer::classifyCxxReferenceParameter(type)) {
+    switch (ref->kind) {
+    case importer::CxxReferenceParameterKind::Borrowed:
+      return ParameterConvention::Indirect_In_Guaranteed;
+    case importer::CxxReferenceParameterKind::Consuming:
+      return ParameterConvention::Indirect_In_CXX;
+    case importer::CxxReferenceParameterKind::Mutating:
+      // Imported as a pointer or as `inout`; fall through to the record cases.
+      break;
+    }
+  }
   if (auto *decl = type->getAsRecordDecl()) {
     if (!decl->isParamDestroyedInCallee())
       return ParameterConvention::Indirect_In_CXX;
@@ -4094,7 +4140,8 @@ public:
 
     // Otherwise, the return type had better be a retainable object pointer.
     auto resultType = Method->getReturnType();
-    assert(resultType->isObjCRetainableType() || isCFTypedef(tl, resultType));
+    assert(resultType->isObjCRetainableType() ||
+           isPointerImportedAsClass(tl, resultType));
 
     // If it's retainable for the purposes of ObjC ARC, we can trust
     // the presence of ns_returns_retained, because Clang will add
@@ -4109,13 +4156,16 @@ public:
     // we can't just trust getMethodFamily().  We should really just
     // change that, but that's an annoying change to make to Clang
     // right now.
-    assert(isCFTypedef(tl, resultType));
+    assert(isPointerImportedAsClass(tl, resultType));
 
     // Trust the explicit attributes.
     if (Method->hasAttr<clang::CFReturnsRetainedAttr>())
       return ResultConvention::Owned;
     if (Method->hasAttr<clang::CFReturnsNotRetainedAttr>())
-      return ResultConvention::Autoreleased;
+      // Foreign reference types are never autoreleased.
+      return tl.getLoweredType().isForeignReferenceType()
+                 ? ResultConvention::Unowned
+                 : ResultConvention::Autoreleased;
 
     // Otherwise, infer based on the method family.
     if (isImplicitPlusOneCFResult())
@@ -4177,7 +4227,7 @@ public:
         auto t = substTL.getLoweredType().getASTType();
         if (auto *classDecl = t.getPointer()
                                   ->lookThroughAllOptionalTypes()
-                                  ->getClassOrBoundGenericClass()) {
+                                  ->getClassDecl()) {
           if (!classDecl->isForeignReferenceType()) {
             assert(!classDecl->hasClangNode() &&
                    "unexpected imported class type in C function");
@@ -4284,7 +4334,7 @@ public:
         return convention.value();
     }
 
-    if (isCFTypedef(tl, TheDecl->getReturnType())) {
+    if (isPointerImportedAsClass(tl, TheDecl->getReturnType())) {
       // The CF attributes aren't represented in the type, so we need
       // to check them here.
       if (TheDecl->hasAttr<clang::CFReturnsRetainedAttr>()) {
@@ -4331,6 +4381,11 @@ public:
         TheDecl(decl), isMutating(isMutating), Ctx(ctx) {}
   ParameterConvention
   getIndirectSelfParameter(const AbstractionPattern &type) const override {
+    // The callee may move from '*this', but the caller still owns and destroys
+    // it: the same convention an rvalue-reference parameter gets from
+    // getIndirectCParameterConvention.
+    if (TheDecl->getRefQualifier() == clang::RefQualifierKind::RQ_RValue)
+      return ParameterConvention::Indirect_In_CXX;
     if (isMutating)
       return ParameterConvention::Indirect_Inout;
     return ParameterConvention::Indirect_In_Guaranteed;
@@ -4368,10 +4423,11 @@ public:
     if (resultTL.getLoweredType().isForeignReferenceType()) {
       if (auto convention = importer::getOwnershipOfReturnedFRT(TheDecl, Ctx))
         return convention.value();
-
-      if (TheDecl->hasAttr<clang::CFReturnsRetainedAttr>())
-        return ResultConvention::Owned;
     }
+
+    if (isPointerImportedAsClass(resultTL, TheDecl->getReturnType()) &&
+        TheDecl->hasAttr<clang::CFReturnsRetainedAttr>())
+      return ResultConvention::Owned;
 
     return CFunctionTypeConventions::getResult(resultTL);
   }
@@ -4415,12 +4471,18 @@ static CanSILFunctionType getSILFunctionTypeForClangDecl(
   }
 
   if (auto func = dyn_cast<clang::FunctionDecl>(clangDecl)) {
-    auto clangType = func->getType().getTypePtr();
+    auto clangType = func->getType();
     AbstractionPattern origPattern =
         foreignInfo.self.isImportAsMember()
-            ? AbstractionPattern::getCFunctionAsMethod(origType, clangType,
+            ? AbstractionPattern::getCFunctionAsMethod(origType,
+                                                       clangType.getTypePtr(),
                                                        foreignInfo.self)
-            : AbstractionPattern(origType, clangType);
+            : AbstractionPattern(origType, clangType.getTypePtr());
+    if (shouldStoreClangType(extInfoBuilder.getRepresentation())) {
+      auto clangPointerType =
+          func->getASTContext().getPointerType(clangType).getTypePtr();
+      extInfoBuilder = extInfoBuilder.withClangFunctionType(clangPointerType);
+    }
     return getSILFunctionType(
         TC, TypeExpansionContext::minimal(), origPattern, substInterfaceType,
         extInfoBuilder, CFunctionConventions(func, TC.Context), foreignInfo,
@@ -4467,6 +4529,23 @@ static CanSILFunctionType getSILFunctionTypeForAbstractCFunction(
                             substType, extInfoBuilder,
                             DefaultBlockConventions(), ForeignInfo(), constant,
                             constant, std::nullopt, ProtocolConformanceRef());
+}
+
+/// If \p decl is a `@cxx @implementation` function that implements a C++
+/// method, return that method.
+static const clang::CXXMethodDecl *
+getImplementedCXXMethod(const ValueDecl *decl) {
+  if (!decl->getAttrs().hasAttribute<CxxDeclAttr>())
+    return nullptr;
+  const Decl *interface = decl->getImplementedObjCDecl();
+  if (!interface)
+    return nullptr;
+  if (const auto *thunk = dyn_cast<FuncDecl>(interface))
+    if (const auto *original = decl->getASTContext()
+                                   .getClangModuleLoader()
+                                   ->getOriginalForVirtualThunk(thunk))
+      interface = original;
+  return dyn_cast_or_null<clang::CXXMethodDecl>(interface->getClangDecl());
 }
 
 /// Try to find a clang method declaration for the given function.
@@ -4673,9 +4752,54 @@ static bool isImporterGeneratedAccessor(const clang::Decl *clangDecl,
   return true;
 }
 
+/// Compute the type of the initializing entry point of a constructor of a C++
+/// foreign reference type, which constructs the C++ base subobject of a Swift
+/// subclass in place.
+///
+/// It takes the constructor's arguments exactly as its allocating entry point,
+/// the static factory that ClangImporter synthesized for the constructor, does.
+/// It then takes `self`, which the C++ constructor only borrows as `this`.
+/// Since `self` is not consumed, the arguments may borrow from it across the
+/// call, e.g. a stored property of the subclass passed to a `const &`
+/// parameter.
+///
+/// The C++ constructor initializes the reference count of `self`, so it returns
+/// `self` with the same ownership as the factory returns a new object: +1 for a
+/// constructor that returns retained, +0 for one that returns unretained.
+static CanSILFunctionType
+getSILFunctionTypeForForeignReferenceInitializer(TypeConverter &TC,
+                                                 TypeExpansionContext context,
+                                                 SILDeclRef constant) {
+  auto allocatorType = TC.getConstantFunctionType(
+      context, SILDeclRef(constant.getDecl(), SILDeclRef::Kind::Allocator)
+                   .asForeign());
+  auto selfType = allocatorType->getSingleResult().getInterfaceType();
+
+  SmallVector<SILParameterInfo, 4> params(allocatorType->getParameters());
+  params.push_back(
+      SILParameterInfo(selfType, ParameterConvention::Direct_Guaranteed));
+  SILResultInfo result(selfType,
+                       allocatorType->getSingleResult().getConvention());
+
+  auto extInfo = allocatorType->getExtInfo()
+                     .intoBuilder()
+                     .withRepresentation(SILFunctionTypeRepresentation::CXXMethod)
+                     .build();
+  return SILFunctionType::get(
+      allocatorType->getInvocationGenericSignature(), extInfo,
+      allocatorType->getCoroutineKind(), allocatorType->getCalleeConvention(),
+      params, /*yields=*/{}, result, allocatorType->getOptionalErrorResult(),
+      allocatorType->getPatternSubstitutions(),
+      allocatorType->getInvocationSubstitutions(), TC.Context);
+}
+
 static CanSILFunctionType getUncachedSILFunctionTypeForConstant(
     TypeConverter &TC, TypeExpansionContext context, SILDeclRef constant,
     TypeConverter::LoweredFormalTypes bridgedTypes) {
+  if (constant.isCXXForeignReferenceInitializer())
+    return getSILFunctionTypeForForeignReferenceInitializer(TC, context,
+                                                            constant);
+
   auto silRep = TC.getDeclRefRepresentation(constant);
   assert(silRep != SILFunctionTypeRepresentation::Thick &&
          silRep != SILFunctionTypeRepresentation::Block);
@@ -4690,6 +4814,8 @@ static CanSILFunctionType getUncachedSILFunctionTypeForConstant(
     const clang::Type *clangType = nullptr;
     if (bridgedTypes.Pattern.isClangType()) {
       clangType = bridgedTypes.Pattern.getClangType();
+    } else if (bridgedTypes.Pattern.isCXXMethod()) {
+      clangType = bridgedTypes.Pattern.getCXXMethod()->getType().getTypePtr();
     }
     if (clangType) {
       // According to [NOTE: ClangTypeInfo-contents], we need to wrap a function
@@ -4772,6 +4898,16 @@ static CanSILFunctionType getUncachedSILFunctionTypeForConstant(
         foreignInfo.self.setSelfIndex(selfIndex);
       }
 
+      // A `@cxx @implementation` function is lowered to the entry point of the
+      // C++ declaration it implements, so its `self` (if any) must be lowered
+      // the way the importer lowers that declaration's `self`.
+      if (!foreignInfo.self.isImportAsMember() &&
+          decl->getAttrs().hasAttribute<CxxDeclAttr>()) {
+        if (auto *interface = dyn_cast_or_null<AbstractFunctionDecl>(
+                decl->getImplementedObjCDecl()))
+          foreignInfo.self = interface->getImportAsMemberStatus();
+      }
+
       return getSILFunctionTypeForClangDecl(
           TC, clangDecl, origLoweredInterfaceType, origLoweredInterfaceType,
           extInfoBuilder, foreignInfo, constant);
@@ -4819,7 +4955,7 @@ static bool isObjCMethod(ValueDecl *vd) {
   if (!contextType)
     return false;
 
-  bool isRefCountedClass = contextType->getClassOrBoundGenericClass() &&
+  bool isRefCountedClass = contextType->getClassDecl() &&
                            !contextType->isForeignReferenceType();
   return isRefCountedClass || contextType->isClassExistentialType();
 }
@@ -4830,6 +4966,16 @@ TypeConverter::getDeclRefRepresentation(SILDeclRef c) {
   if (c.isForeign) {
     if (!c.hasDecl())
       return SILFunctionTypeRepresentation::CFunctionPointer;
+
+    // A C++ constructor applied to a subclass's storage takes it as `this`.
+    if (c.isCXXForeignReferenceInitializer())
+      return SILFunctionTypeRepresentation::CXXMethod;
+
+    if (const auto *method = getImplementedCXXMethod(c.getDecl())) {
+      return method->isStatic()
+                 ? SILFunctionTypeRepresentation::CFunctionPointer
+                 : SILFunctionTypeRepresentation::CXXMethod;
+    }
 
     if (auto clangDecl = c.getDecl()->getClangDecl()) {
       if (auto method = dyn_cast<clang::CXXMethodDecl>(clangDecl)) {
@@ -5087,6 +5233,7 @@ static bool checkASTTypeForABIDifferences(CanType type1,
 
 // FIXME: This makes me very upset. Can we do without this?
 static CanType copyOptionalityFromDerivedToBase(TypeConverter &tc,
+                                                ValueDecl *baseDecl,
                                                 CanType derived,
                                                 CanType base) {
   // Unwrap optionals, but remember that we did.
@@ -5102,10 +5249,10 @@ static CanType copyOptionalityFromDerivedToBase(TypeConverter &tc,
   // T? +> S = (T +> S)?
   // T? +> S? = (T +> S)?
   if (derivedWasOptional) {
-    base = copyOptionalityFromDerivedToBase(tc, derived, base);
+    base = copyOptionalityFromDerivedToBase(tc, nullptr, derived, base);
 
     auto optDecl = tc.Context.getOptionalDecl();
-    return CanType(BoundGenericEnumType::get(optDecl, Type(), base));
+    return CanType(EnumType::get(optDecl, Type(), base, tc.Context));
   }
 
   // (T1, T2, ...) +> (S1, S2, ...) = (T1 +> S1, T2 +> S2, ...)
@@ -5118,6 +5265,7 @@ static CanType copyOptionalityFromDerivedToBase(TypeConverter &tc,
           baseTuple->getElement(i).getWithType(
             copyOptionalityFromDerivedToBase(
               tc,
+              nullptr,
               derivedTuple.getElementType(i),
               baseTuple.getElementType(i))));
       }
@@ -5129,29 +5277,38 @@ static CanType copyOptionalityFromDerivedToBase(TypeConverter &tc,
   if (auto derivedFunc = dyn_cast<AnyFunctionType>(derived)) {
     if (auto baseFunc = dyn_cast<AnyFunctionType>(base)) {
       SmallVector<FunctionType::Param, 8> params;
+      for (auto [baseParam, derivedParam] :
+           llvm::zip_equal(baseFunc.getParams(), derivedFunc.getParams())) {
+        ASSERT(paramSpecifiersMatch(
+            baseDecl,
+            baseParam.getParameterFlags().getOwnershipSpecifier(),
+            derivedParam.getParameterFlags().getOwnershipSpecifier()));
+        params.push_back(baseParam.getWithoutLabels().withType(
+            copyOptionalityFromDerivedToBase(tc,
+                                             nullptr,
+                                             derivedParam.getPlainType(),
+                                             baseParam.getPlainType())));
+      }
 
-      auto derivedParams = derivedFunc.getParams();
-      auto baseParams = baseFunc.getParams();
-      assert(derivedParams.size() == baseParams.size());
-      for (unsigned i = 0, e = derivedParams.size(); i < e; ++i) {
-        assert(derivedParams[i].getParameterFlags() ==
-               baseParams[i].getParameterFlags());
-
-        params.emplace_back(
-          copyOptionalityFromDerivedToBase(
-            tc,
-            derivedParams[i].getPlainType(),
-            baseParams[i].getPlainType()),
-          Identifier(),
-          baseParams[i].getParameterFlags());
+      SmallVector<FunctionType::Yield, 1> yields;
+      for (auto [baseYield, derivedYield] :
+           llvm::zip_equal(baseFunc.getYields(), derivedFunc.getYields())) {
+        assert(derivedYield.getFlags() == baseYield.getFlags());
+        yields.emplace_back(
+            copyOptionalityFromDerivedToBase(tc,
+                                             nullptr,
+                                             derivedYield.getType(),
+                                             baseYield.getType()),
+            baseYield.getFlags());
       }
 
       auto result = copyOptionalityFromDerivedToBase(tc,
+                                                     nullptr,
                                                      derivedFunc.getResult(),
                                                      baseFunc.getResult());
-      return CanAnyFunctionType::get(baseFunc.getOptGenericSignature(),
-                                     llvm::ArrayRef(params), result,
-                                     baseFunc->getExtInfo());
+      return CanAnyFunctionType::get(
+          baseFunc.getOptGenericSignature(), llvm::ArrayRef(params),
+          llvm::ArrayRef(yields), result, baseFunc->getExtInfo());
     }
   }
 
@@ -5211,19 +5368,19 @@ TypeConverter::getConstantOverrideInfo(TypeExpansionContext context,
     basePattern = AbstractionPattern(
       copyOptionalityFromDerivedToBase(
         *this,
+        base.getDecl(),
         derivedInfo.LoweredType,
         baseInfo.LoweredType));
     overrideInterfaceTy = derivedInfo.FormalType;
   }
 
-  if (genericSig && !genericSig->areAllParamsConcrete()) {
-    overrideInterfaceTy =
-      cast<AnyFunctionType>(
-        GenericFunctionType::get(genericSig,
-                                 overrideInterfaceTy->getParams(),
+  if (genericSig.isEffectivelyGeneric()) {
+    overrideInterfaceTy = cast<AnyFunctionType>(
+        GenericFunctionType::get(genericSig, overrideInterfaceTy->getParams(),
+                                 overrideInterfaceTy->getYields(),
                                  overrideInterfaceTy->getResult(),
                                  overrideInterfaceTy->getExtInfo())
-          ->getCanonicalType());
+            ->getCanonicalType());
   }
 
   // Build the lowered AST function type for the class method call.
@@ -5273,8 +5430,8 @@ CanAnyFunctionType TypeConverter::getBridgedFunctionType(
                                        bridging,
                                        suppressOptional);
 
-    return CanAnyFunctionType::get(genericSig, llvm::ArrayRef(params), result,
-                                   t->getExtInfo());
+    return CanAnyFunctionType::get(genericSig, llvm::ArrayRef(params), {},
+                                   result, t->getExtInfo());
   }
   }
   llvm_unreachable("bad calling convention");
@@ -5325,8 +5482,30 @@ getAbstractionPatternForConstant(TypeConverter &converter, ASTContext &ctx,
   if (!bridgedFn)
     return AbstractionPattern(fnType);
 
+  // The initializing entry point of a C++ foreign reference type's constructor
+  // is bridged like that constructor applied to `this`, rather than like the
+  // static factory that the initializer was imported from.
+  if (constant.isCXXForeignReferenceInitializer()) {
+    auto cxxCtor =
+        ctx.getClangModuleLoader()->getOriginalForeignReferenceConstructor(
+            cast<ConstructorDecl>(bridgedFn));
+    ASSERT(cxxCtor && "initializer was not synthesized for a C++ constructor");
+    ASSERT(numParameterLists == 2 && "C++ constructor not curried?");
+    return AbstractionPattern::getCurriedCXXMethod(fnType, cxxCtor,
+                                                   ImportAsMemberStatus());
+  }
+
   const clang::Decl *clangDecl = bridgedFn->getClangDecl();
   if (!clangDecl) {
+    // A `@cxx @implementation` of a C++ method is bridged like the method it
+    // implements.
+    if (const auto *cxxMethod = getImplementedCXXMethod(bridgedFn)) {
+      assert(numParameterLists == 2 &&
+             "C++ method implementation not curried?");
+      return AbstractionPattern::getCurriedCXXMethod(
+          fnType, cxxMethod, bridgedFn->getImportAsMemberStatus());
+    }
+
     // If this function only has a C entrypoint, create a Clang type to
     // use when referencing it.
     if (bridgedFn->hasOnlyCEntryPoint()) {
@@ -5407,6 +5586,7 @@ TypeConverter::getLoweredFormalTypes(SILDeclRef constant,
   auto innerExtInfo =
     fnType->getExtInfo().withRepresentation(FunctionTypeRepresentation::Swift);
   auto methodParams = fnType->getParams();
+  auto methodYields = fnType->getYields();
 
   auto resultType = fnType.getResult();
   bool suppressOptionalResult =
@@ -5414,6 +5594,7 @@ TypeConverter::getLoweredFormalTypes(SILDeclRef constant,
 
   // Bridge input and result types.
   SmallVector<AnyFunctionType::Param, 8> bridgedParams;
+  SmallVector<AnyFunctionType::Yield, 1> bridgedYields;
   CanType bridgedResultType;
 
   switch (rep) {
@@ -5428,12 +5609,15 @@ TypeConverter::getLoweredFormalTypes(SILDeclRef constant,
   case SILFunctionTypeRepresentation::KeyPathAccessorHash:
     // Native functions don't need bridging.
     bridgedParams.append(methodParams.begin(), methodParams.end());
+    bridgedYields.append(methodYields.begin(), methodYields.end());
     bridgedResultType = resultType;
     break;
 
+  case SILFunctionTypeRepresentation::COMMethod:
   case SILFunctionTypeRepresentation::CXXMethod:
   case SILFunctionTypeRepresentation::ObjCMethod:
   case SILFunctionTypeRepresentation::CFunctionPointer: {
+    assert(methodYields.empty() && !innerExtInfo.isCoroutine());
     if (rep == SILFunctionTypeRepresentation::ObjCMethod) {
       // The "self" parameter should not get bridged unless it's a metatype.
       if (selfParam.getPlainType()->is<AnyMetatypeType>()) {
@@ -5463,10 +5647,10 @@ TypeConverter::getLoweredFormalTypes(SILDeclRef constant,
 
   // Build the curried function type.
   auto inner = CanFunctionType::get(llvm::ArrayRef(bridgedParams),
+                                    llvm::ArrayRef(bridgedYields),
                                     bridgedResultType, innerExtInfo);
-
-  auto curried =
-    CanAnyFunctionType::get(genericSig, {selfParam}, inner, extInfo);
+  auto curried = CanAnyFunctionType::get(genericSig, {selfParam},
+                                         /* yields */ {}, inner, extInfo);
 
   // Replace the type in the abstraction pattern with the curried type.
   bridgingFnPattern.rewriteType(genericSig, curried);
@@ -5488,6 +5672,8 @@ TypeConverter::getLoweredFormalTypes(SILDeclRef constant,
         /* numOuterParams */ curried.getParams().size());
     extInfo = extInfo.withLifetimeDependencies(uncurriedLifetimes);
   }
+  if (innerExtInfo.isCoroutine())
+    extInfo = extInfo.withCoroutine(true);
 
   // Distributed thunks are always `async throws`
   if (constant.isDistributedThunk()) {
@@ -5513,8 +5699,11 @@ TypeConverter::getLoweredFormalTypes(SILDeclRef constant,
   if (innerExtInfo.hasSendingResult())
     extInfo = extInfo.withSendingResult();
 
+  // FIXME: Bring the scopes bound by the curried function types, like
+  // `self`'s access, into the uncurried one.
   auto uncurried = CanAnyFunctionType::get(
-      genericSig, llvm::ArrayRef(bridgedParams), bridgedResultType, extInfo);
+      genericSig, llvm::ArrayRef(bridgedParams), llvm::ArrayRef(bridgedYields),
+      bridgedResultType, extInfo);
 
   return { bridgingFnPattern, uncurried };
 }

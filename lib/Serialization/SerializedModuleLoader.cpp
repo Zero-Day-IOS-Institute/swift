@@ -19,15 +19,13 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/ModuleDependencies.h"
 #include "swift/AST/PluginLoader.h"
-#include "swift/Basic/Assertions.h"
-#include "swift/Basic/Defer.h"
 #include "swift/Basic/FileTypes.h"
 #include "swift/Basic/Platform.h"
-#include "swift/Basic/STLExtras.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Version.h"
 #include "swift/Frontend/ModuleInterfaceLoader.h"
 #include "swift/Option/Options.h"
+#include "swift/Parse/ParseVersion.h"
 #include "swift/Serialization/Validation.h"
 
 #include "llvm/Option/OptTable.h"
@@ -35,7 +33,6 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/VersionTuple.h"
 #include "llvm/TargetParser/Host.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -1463,10 +1460,11 @@ bool swift::extractCompilerFlagsFromInterface(
 }
 
 llvm::VersionTuple
-swift::extractUserModuleVersionFromInterface(StringRef moduleInterfacePath) {
+swift::extractUserModuleVersionFromInterface(StringRef moduleInterfacePath,
+                                             llvm::vfs::FileSystem &FS) {
   llvm::VersionTuple result;
   // Read the interface file and extract its compiler arguments line
-  if (auto file = llvm::MemoryBuffer::getFile(moduleInterfacePath)) {
+  if (auto file = FS.getBufferForFile(moduleInterfacePath)) {
     llvm::BumpPtrAllocator alloc;
     llvm::StringSaver argSaver(alloc);
     SmallVector<const char*, 8> args;
@@ -1476,11 +1474,8 @@ swift::extractUserModuleVersionFromInterface(StringRef moduleInterfacePath) {
       // Check the version number specified via -user-module-version.
       StringRef current(args[I]), next(args[I + 1]);
       if (current == "-user-module-version") {
-        // Sanitize versions that are too long
-        while(next.count('.') > 3) {
-          next = next.rsplit('.').first;
-        }
-        result.tryParse(next);
+        if (auto version = VersionParser::parseUserModuleVersion(next))
+          result = *version;
         break;
       }
     }
@@ -1537,8 +1532,8 @@ bool SerializedModuleLoaderBase::canImportModule(
     if (!versionInfo)
       return true;
 
-    auto moduleVersion =
-        extractUserModuleVersionFromInterface(moduleInterfaceSourcePath);
+    auto moduleVersion = extractUserModuleVersionFromInterface(
+        moduleInterfaceSourcePath, *Ctx.SourceMgr.getFileSystem());
 
     // If version is requested and found in interface, return the version.
     // Otherwise fallback to binary module handling.

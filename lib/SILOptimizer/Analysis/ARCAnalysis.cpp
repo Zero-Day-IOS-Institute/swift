@@ -13,7 +13,6 @@
 #define DEBUG_TYPE "sil-arc-analysis"
 
 #include "swift/SILOptimizer/Analysis/ARCAnalysis.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/Projection.h"
@@ -21,12 +20,6 @@
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SILOptimizer/Analysis/AliasAnalysis.h"
 #include "swift/SILOptimizer/Analysis/RCIdentityAnalysis.h"
-#include "swift/SILOptimizer/Analysis/ValueTracking.h"
-#include "swift/SILOptimizer/Utils/InstOptUtils.h"
-#include "llvm/ADT/BitVector.h"
-#include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/StringSwitch.h"
-#include "llvm/Support/Debug.h"
 
 using namespace swift;
 
@@ -484,6 +477,15 @@ mayGuaranteedUseValue(SILInstruction *User, SILValue Ptr, AliasAnalysis *AA) {
   CanSILFunctionType FType = FAS.getSubstCalleeType();
   if (FType->isCalleeGuaranteed() && AA->mayAlias(FAS.getCallee(), Ptr)) {
     return true;
+  }
+
+  // A non-escapable argument, e.g. a `Span`, can depend on Ptr via a
+  // `mark_dependence` without containing a reference to Ptr. In this case alias
+  // analysis cannot tell that the argument requires Ptr to be alive.
+  // Be conservative, regardless of the argument convention.
+  for (SILValue Op : FAS.getArgumentsWithoutIndirectResults()) {
+    if (!Op->getType().isEscapable(*FAS.getFunction()))
+      return true;
   }
 
   // Ok, we have a full apply site and our callee is a normal use. Thus if the

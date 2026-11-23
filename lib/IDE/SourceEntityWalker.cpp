@@ -22,11 +22,11 @@
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/AST/Types.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/IDE/SourceEntityWalker.h"
 #include "swift/IDE/Utils.h"
+#include "swift/Parse/Lexer.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "clang/Basic/Module.h"
 
@@ -65,6 +65,11 @@ private:
 
   MacroWalking getMacroWalkingBehavior() const override {
     return SEWalker.getMacroWalkingBehavior();
+  }
+
+  bool shouldWalkTopLevelAuxiliaryDecls() const override {
+    // Walk top-level expansions whenever we're walking expansions.
+    return shouldWalkMacroArgumentsAndExpansion().second;
   }
 
   QualifiedIdentTypeReprWalkingScheme
@@ -244,8 +249,10 @@ ASTWalker::PostWalkAction SemaAnnotator::walkToDeclPost(Decl *D) {
   if (Action.Action == PostWalkAction::Stop)
     return Action;
 
-  // Walk into peer and conformance expansions if walking expansions
-  if (shouldWalkMacroArgumentsAndExpansion().second) {
+  // Walk into peer and conformance expansions if walking expansions. Avoid
+  // doing this for top-level decls since their auxiliary decls are walked
+  // separately by `SourceFile::walk`.
+  if (shouldWalkMacroArgumentsAndExpansion().second && !Parent.getAsModule()) {
     D->visitAuxiliaryDecls([&](Decl *auxDecl) {
       if (Action.Action == PostWalkAction::Stop)
         return;
@@ -509,12 +516,14 @@ ASTWalker::PreWalkResult<Expr *> SemaAnnotator::walkToExprPre(Expr *E) {
         auto *decl = component.getDeclRef().getDecl();
         auto loc = component.getLoc();
         SourceRange range(loc, loc);
+        auto *args = component.getArgs();
+        bool isImplicit = args && args->isImplicit();
         auto Continue = passReference(
             decl, component.getComponentType(), loc, range,
             ReferenceMetaData((isa<SubscriptDecl>(decl)
                                    ? SemaReferenceKind::SubscriptRef
                                    : SemaReferenceKind::DeclMemberRef),
-                              OpAccess));
+                              OpAccess, isImplicit));
         if (!Continue)
           return Action::Stop();
         break;
@@ -899,7 +908,22 @@ bool SemaAnnotator::passCallAsFunctionReference(ValueDecl *D, SourceLoc Loc,
 
 bool SemaAnnotator::
 passReference(ValueDecl *D, Type Ty, DeclNameLoc Loc, ReferenceMetaData Data) {
-  return passReference(D, Ty, Loc.getBaseNameLoc(), Loc.getSourceRange(), Data);
+  if (auto SelectorLoc = Loc.getModuleSelectorLoc(); SelectorLoc.isValid()) {
+    auto &Ctx = D->getASTContext();
+    auto SelectorToken = Lexer::getTokenAtLocation(Ctx.SourceMgr, SelectorLoc);
+    auto Selector = Ctx.getIdentifier(SelectorToken.getText());
+    // Resolve the written selector, which may re-export the declaration's
+    // module.
+    auto *Mod = Ctx.getLoadedModule(Selector);
+    if (!Mod && Selector == Ctx.TheBuiltinModule->getName())
+      Mod = Ctx.TheBuiltinModule;
+    // Include backticks in the reference range for an escaped selector.
+    if (Mod && !SEWalker.visitModuleReference(Mod, SelectorToken.getRange()))
+      return false;
+  }
+  return passReference(D, Ty, Loc.getBaseNameLoc(),
+                       SourceRange(Loc.getBaseNameLoc(), Loc.getEndLoc()),
+                       Data);
 }
 
 bool SemaAnnotator::

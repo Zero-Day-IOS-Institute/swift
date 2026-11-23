@@ -18,11 +18,10 @@
 #define TYPECHECKING_H
 
 #include "swift/AST/ASTContext.h"
-#include "swift/AST/AccessScope.h"
-#include "swift/AST/AnyFunctionRef.h"
 #include "swift/AST/Attr.h"
 #include "swift/AST/AvailabilityRange.h"
 #include "swift/AST/AvailabilityScope.h"
+#include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/GenericParamList.h"
 #include "swift/AST/GenericSignature.h"
@@ -31,14 +30,14 @@
 #include "swift/AST/LookupKinds.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/PropertyWrappers.h"
+#include "swift/Basic/LLVMExtras.h"
 #include "swift/Basic/OptionSet.h"
-#include "swift/Config.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Sema/CompletionContextFinder.h"
 #include "swift/Sema/ConstraintSystem.h"
-#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include <functional>
+#include "llvm/ADT/SetVector.h"
 
 namespace swift {
 
@@ -75,6 +74,10 @@ enum class DeclTypeCheckingSemantics {
   /// The withoutActuallyEscaping(_:do:) declaration, which makes a nonescaping
   /// closure temporarily escapable.
   WithoutActuallyEscaping,
+
+  /// The withoutActuallyDeiniting(_:do:) declaration, which temporarily
+  /// converts an exactly-once function to an at-most-once function.
+  WithoutActuallyDeiniting,
 
   /// The _openExistential(_:do:) declaration, which extracts the value inside
   /// an existential and passes it as a value of its own dynamic type.
@@ -421,12 +424,8 @@ bool isSubtypeOf(Type t1, Type t2, DeclContext *dc);
 ///
 /// \param dc The context of the conversion.
 ///
-/// \param unwrappedIUO If non-null, will be set to indicate whether the
-/// conversion force-unwrapped an implicitly-unwrapped optional.
-///
 /// \returns true if \c t1 can be implicitly converted to \c t2.
-bool isConvertibleTo(Type t1, Type t2, DeclContext *dc,
-                     bool *unwrappedIUO = nullptr);
+bool isConvertibleTo(Type t1, Type t2, DeclContext *dc);
 
 /// Determine whether one type is explicitly convertible to another,
 /// i.e. using an 'as' expression.
@@ -448,12 +447,8 @@ bool isExplicitlyConvertibleTo(Type t1, Type t2, DeclContext *dc);
 ///
 /// \param dc The context of the conversion.
 ///
-/// \param unwrappedIUO If non-null, will be set to indicate whether the
-/// conversion force-unwrapped an implicitly-unwrapped optional.
-///
 /// \returns true if \c t1 can be explicitly converted to \c t2.
-bool isObjCBridgedTo(Type t1, Type t2, DeclContext *dc,
-                     bool *unwrappedIUO = nullptr);
+bool isObjCBridgedTo(Type t1, Type t2, DeclContext *dc);
 
 /// Return true if performing a checked cast from one type to another
 /// with the "as!" operator could possibly succeed.
@@ -481,13 +476,9 @@ bool checkedCastMaySucceed(Type t1, Type t2, DeclContext *dc);
 ///
 /// \param dc The context of the conversion.
 ///
-/// \param unwrappedIUO   If non-null, will be set to \c true if the coercion
-/// or bridge operation force-unwraps an implicitly-unwrapped optional.
-///
 /// \returns true if \c t1 and \c t2 satisfy the constraint.
 bool typesSatisfyConstraint(Type t1, Type t2, bool openArchetypes,
-                            constraints::ConstraintKind kind, DeclContext *dc,
-                            bool *unwrappedIUO = nullptr);
+                            constraints::ConstraintKind kind, DeclContext *dc);
 
 /// If the inputs to an apply expression use a consistent "sugar" type
 /// (that is, a typealias or shorthand syntax) equivalent to the result type
@@ -532,9 +523,11 @@ void checkCircularOpaqueReturnTypeDecl(OpaqueTypeDecl *opaqueDecl);
 
 void addImplicitDynamicAttribute(Decl *D);
 void checkDeclAttributes(Decl *D);
+void checkTailAllocatedCounts(ClassDecl *classDecl);
 void checkDeclABIAttribute(Decl *apiDecl, ABIAttr *abiAttr);
 void checkClosureAttributes(ClosureExpr *closure);
 void checkParameterList(ParameterList *params, DeclContext *owner);
+void checkYieldList(YieldList *yields, AbstractFunctionDecl *AFD);
 
 void diagnoseDuplicateBoundVars(Pattern *pattern);
 
@@ -750,6 +743,26 @@ void checkSwitchExhaustiveness(const SwitchStmt *stmt, const DeclContext *DC,
 /// \returns true if an error occurred, false otherwise.
 bool typeCheckCondition(Expr *&expr, DeclContext *dc);
 
+/// True if a dynamic cast between \p fromType and \p toType can never succeed
+/// because one side is a fully concrete non-`Copyable` type and the other can
+/// only hold `Copyable` values. Casts whose answer depends on a dynamic type --
+/// an existential, a generic parameter, or an Optional the runtime unwraps --
+/// are not decided here.
+bool isStaticallyImpossibleNoncopyableCast(Type fromType, Type toType);
+
+/// If a cast from \p fromType to \p toType should be applied to an Optional
+/// source as it stands rather than to its unwrapped payload, the kind of the
+/// cast of the payload; otherwise None.
+///
+/// This is the case when \p fromType is one level of Optional around a
+/// non-`Copyable` payload and \p toType is not optional. Unwrapping it would
+/// consume it, even when the cast then fails; a cast of the Optional itself
+/// fails on `nil` and otherwise casts the payload, so the runtime unwraps it
+/// only on success.
+std::optional<CheckedCastKind>
+noncopyableOptionalPayloadCastKind(Type fromType, Type toType,
+                                   DeclContext *dc);
+
 /// Determine the semantics of a checked cast operation.
 ///
 /// \param fromType       The source type of the cast.
@@ -927,9 +940,18 @@ TypeExpr *simplifyGenericArgumentTypeExpr(DeclContext *DC, Expr *E);
 /// \param name The name of the entity to look for.
 /// \param loc The source location at which name lookup occurs.
 /// \param options Options that control name lookup.
-LookupResult lookupUnqualified(
-    DeclContext *dc, DeclNameRef name, SourceLoc loc,
-    NLOptions options = defaultUnqualifiedLookupOptions);
+/// \param filter If provided, only the declarations found by lookup for which
+/// the filter returns true are considered for the result. The filter runs
+/// before overridden and shadowed declarations are removed, which avoids the
+/// cost of computing overrides and shadowing for declarations that the caller
+/// would discard anyway. As a result, the filter must make the same decision
+/// for any declarations that could override or shadow one another, such as
+/// functions with the same signature. Otherwise, a rejected declaration could
+/// fail to hide an accepted one.
+LookupResult
+lookupUnqualified(DeclContext *dc, DeclNameRef name, SourceLoc loc,
+                  NLOptions options = defaultUnqualifiedLookupOptions,
+                  llvm::function_ref<bool(ValueDecl *)> filter = nullptr);
 
 /// Perform unqualified type lookup at the given source location
 /// within a particular declaration context.
@@ -1172,6 +1194,12 @@ FuncDecl *getForEachIteratorNextFunction(
 /// Otherwise, return nil.
 VarDecl *getSelfForInitDelegationInConstructor(DeclContext *DC,
                                                UnresolvedDotExpr *UDE);
+
+/// If an initializer of a C++ foreign reference type called with `super.init`
+/// from a Swift subclass cannot construct the base subobject of the subclass,
+/// diagnose it.
+bool diagnoseForeignReferenceSuperInit(ConstructorDecl *ctor, SourceLoc loc,
+                                       bool implicitlyGenerated);
 
 /// Diagnose assigning variable to itself.
 bool diagnoseSelfAssignment(const Expr *E);
@@ -1467,25 +1495,6 @@ diagnoseAndRemoveAttr(const Decl *D, const DeclAttribute *attr,
   return diagnoseAttrWithRemovalFixIt(D, attr, std::forward<ArgTypes>(Args)...);
 }
 
-/// Look for closure discriminators within an AST.
-class DiscriminatorFinder : public ASTWalker {
-  unsigned FirstDiscriminator = AbstractClosureExpr::InvalidDiscriminator;
-  unsigned NextDiscriminator = 0;
-
-public:
-  MacroWalking getMacroWalkingBehavior() const override {
-    return MacroWalking::Expansion;
-  }
-
-  PostWalkResult<Expr *> walkToExprPost(Expr *E) override;
-
-  // Get the next available closure discriminator.
-  unsigned getNextDiscriminator();
-
-  unsigned getFirstDiscriminator() const {
-    return FirstDiscriminator;
-  }
-};
 
 using RequiredImportAccessLevelCallback =
     std::function<void(AttributedImport<ImportedModule>)>;
@@ -1525,6 +1534,13 @@ bool maybeDiagnoseMissingImportForMember(
 /// Emit delayed diagnostics regarding imports that should be added to the
 /// source file.
 void diagnoseMissingImports(SourceFile &sf);
+
+/// Emit a note with a fix-it that adds an import of \p mod to \p sf, at least
+/// as permissive as \p requiredAccessLevel and consistent with how other files
+/// in the module import \p mod. Emits nothing if \p mod is imported as
+/// implementation-only elsewhere.
+void noteAddImportOfModule(SourceFile &sf, ModuleDecl *mod,
+                           AccessLevel requiredAccessLevel);
 
 // Guide ForEachStmt type-checking by indicating whether the Iterable
 // protocol should be used, thus enabling Borrowing iteration for a given

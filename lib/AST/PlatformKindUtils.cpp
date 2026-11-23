@@ -15,7 +15,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/PlatformKindUtils.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/Platform.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -263,6 +262,7 @@ static bool inheritsAvailabilityFromAnyAppleOS(PlatformKind platform) {
   case PlatformKind::Android:
     return false;
   }
+  llvm_unreachable("covered switch");
 }
 
 bool swift::inheritsAvailabilityFromPlatform(PlatformKind Child,

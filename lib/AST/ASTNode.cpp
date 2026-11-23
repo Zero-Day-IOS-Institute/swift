@@ -20,7 +20,6 @@
 #include "swift/AST/Stmt.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/TypeRepr.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceLoc.h"
 #include "swift/Parse/Token.h"
 
@@ -134,6 +133,7 @@ void ASTNode::dump(raw_ostream &OS, unsigned Indent) const {
 
 void ASTNode::dump() const {
   dump(llvm::errs());
+  llvm::errs() << '\n';
 }
 
 StringRef swift::getTokenText(tok kind) {
@@ -174,11 +174,14 @@ SourceRange swift::getUnexpandedMacroRange(const SourceManager &SM,
             ASTNode::getFromOpaqueValue(info->astNode).getSourceRange();
       bufferID = SM.findBufferContainingLoc(outerRange.Start);
       continue;
+    case GeneratedSourceInfo::SyntheticMacro:
+      outerRange = SourceRange(info->originalSourceRange.getStart());
+      bufferID = SM.findBufferContainingLoc(outerRange.Start);
+      continue;
     case GeneratedSourceInfo::ReplacedFunctionBody:
     case GeneratedSourceInfo::PrettyPrinted:
     case GeneratedSourceInfo::DefaultArgument:
     case GeneratedSourceInfo::AttributeFromClang:
-    case GeneratedSourceInfo::SyntheticMacro:
       return SourceRange();
     }
   }

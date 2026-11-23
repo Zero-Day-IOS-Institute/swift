@@ -191,7 +191,7 @@ enum class CodeCompletionKeywordKind : uint8_t {
 enum class CompletionKind : uint8_t {
   None,
   Import,
-  Using,
+  FileDefault,
   UnresolvedMember,
   DotExpr,
   StmtOrExpr,
@@ -725,6 +725,7 @@ public:
     case ContextualNotRecommendedReason::VariableUsedInOwnDefinition:
       return NotRecommendedReason::VariableUsedInOwnDefinition;
     }
+    llvm_unreachable("covered switch");
   }
 
   /// Finds the associated declaration on-demand and caches it.

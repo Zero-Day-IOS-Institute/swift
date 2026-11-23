@@ -24,9 +24,7 @@
 #include "swift/AST/Types.h"
 #include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceManager.h"
-#include "swift/Basic/STLExtras.h"
 #include "RequirementMachine/RequirementMachine.h"
-#include <functional>
 
 using namespace swift;
 
@@ -163,7 +161,7 @@ void GenericSignatureImpl::forEachParam(
     callback(genericParams[index], genericParamsAreCanonical[index]);
 }
 
-bool GenericSignatureImpl::areAllParamsConcrete() const {
+bool GenericSignatureImpl::isEffectivelyGeneric() const {
   unsigned numConcreteGenericParams = 0;
   for (const auto &req : getRequirements()) {
     switch (req.getKind()) {
@@ -184,7 +182,7 @@ bool GenericSignatureImpl::areAllParamsConcrete() const {
     }
   }
 
-  return numConcreteGenericParams == getGenericParams().size();
+  return numConcreteGenericParams != getGenericParams().size();
 }
 
 bool GenericSignatureImpl::hasParameterPack() const {
@@ -245,6 +243,10 @@ ArrayRef<Requirement> GenericSignature::getRequirements() const {
   return isNull()
       ? ArrayRef<Requirement>{}
       : getPointer()->getRequirements();
+}
+
+bool GenericSignature::isEffectivelyGeneric() const {
+  return !isNull() && getPointer()->isEffectivelyGeneric();
 }
 
 rewriting::RequirementMachine *
@@ -539,6 +541,7 @@ bool GenericSignatureImpl::isRequirementSatisfied(
   case CheckRequirementResult::SubstitutionFailure:
     return false;
   }
+  llvm_unreachable("covered switch");
 }
 
 SmallVector<Requirement, 4>
@@ -828,7 +831,7 @@ Type GenericSignatureImpl::getExistentialType(Type paramTy) const {
                                   /*includeParameterizedProtocols=*/true);
   if (upperBound->isConstraintType())
     return ExistentialType::get(upperBound);
-  assert(upperBound->getClassOrBoundGenericClass());
+  assert(upperBound->getClassDecl());
   return upperBound;
 }
 
@@ -1322,6 +1325,7 @@ void swift::validateGenericSignature(ASTContext &context,
         return (layout && layout == victim.getLayoutConstraint());
       }
       }
+      llvm_unreachable("covered switch");
     };
 
     if (satisfied(requirements[victimIndex])) {

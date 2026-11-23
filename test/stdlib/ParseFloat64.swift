@@ -72,6 +72,16 @@ tests.test("Invalids") {
   expectParseFails("&")
   expectParseFails("+x")
   expectParseFails("x")
+  expectParseFails("1e5 ")
+  expectParseFails(" 1e5")
+  expectParseFails(" 1e5 ")
+  expectParseFails("1 e5")
+  expectParseFails("1e 5")
+  expectParseFails("1 ")
+  expectParseFails(" 1")
+  expectParseFails("1. ")
+  expectParseFails("1e ")
+  expectParseFails("1e+ ")
 }
 
 tests.test("Infinities") {
@@ -335,6 +345,9 @@ tests.test("Decimal Floats") {
   expectParse("1e309", Float64.infinity)
   expectParse("1e9999999999999999999999999999999999", Float64.infinity)
   expectParse("999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999.999999999999999999999999999", Float64.infinity)
+
+  expectParse("98888888888888888888888888888888888888888888.88887888888888",
+              9.8888888888888879e+43)
 }
 
 tests.test("Substring - short") {
@@ -435,6 +448,24 @@ func viaLegacy(_ text: String) -> Double? {
       return Double?.none
     }
   }
+}
+
+// Digits beyond the maximum needed to resolve a midpoint are summarized by a
+// single digit, which must only be non-zero if one of those digits is non-zero.
+tests.test("Summarized digits") {
+  func zeros(_ count: Int) -> String { String(repeating: "0", count: count) }
+  let midpoint = "9007199254740993"
+  let below: Float64 = 9007199254740992.0
+  let above: Float64 = 9007199254740994.0
+
+  expectParse(midpoint + "." + zeros(752), below)
+  expectParse(midpoint + "." + zeros(753), below)
+  expectParse(midpoint + "." + zeros(800), below)
+  expectParse(midpoint + "." + zeros(800) + "1", above)
+
+  // The decimal point can fall within the summarized digits.
+  expectParse(midpoint + zeros(760) + ".0000e-760", below)
+  expectParse(midpoint + zeros(760) + ".0001e-760", above)
 }
 
 tests.test("Legacy ABI") {

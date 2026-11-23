@@ -21,13 +21,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/SmallString.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/ABI/MetadataValues.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/IRGen/ValueWitness.h"
-#include "swift/SIL/TypeLowering.h"
 
 #include "Callee.h"
 #include "ComputedWitnessIndex.h"
@@ -39,6 +36,7 @@
 #include "IRGenModule.h"
 #include "ProtocolInfo.h"
 
+#include "GenBorrow.h"
 #include "GenOpaque.h"
 
 using namespace swift;
@@ -494,8 +492,13 @@ llvm::Value *IRGenFunction::emitValueWitnessValue(SILType type,
     return witness;
   }
   
-  auto vwtable = emitValueWitnessTableRef(type);
-  auto witness = emitLoadOfValueWitnessValue(*this, vwtable, index);
+  llvm::Value *witness;
+  if (shouldComputeBorrowLayoutInline(*this, type)) {
+    witness = emitInlineBorrowValueWitnessValue(*this, type, index);
+  } else {
+    auto vwtable = emitValueWitnessTableRef(type);
+    witness = emitLoadOfValueWitnessValue(*this, vwtable, index);
+  }
   setScopedLocalTypeDataForLayout(type, key, witness);
   return witness;
 }

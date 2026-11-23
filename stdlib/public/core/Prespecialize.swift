@@ -103,7 +103,7 @@ internal func _prespecialize() {
   consume(Optional<Set<String>>.self)
   consume(Optional<TextOutputStreamable>.self)
   consume(Optional<UInt8>.self)
-  unsafe consume(Optional<UnsafeBufferPointer<AnyObject>>.self)
+  consume(Optional<UnsafeBufferPointer<AnyObject>>.self)
   consume(PartialRangeFrom<Int>.self)
   consume(Range<String.Index>.self)
   consume(ReversedCollection<Range<Int>>.self)
@@ -112,10 +112,10 @@ internal func _prespecialize() {
   consume(Set<String>.self)
   consume(Set<String>.Iterator.self)
   consume(Set<String>.self)
-  unsafe consume(Unmanaged<AnyObject>.self)
-  unsafe consume(UnsafeBufferPointer<AnyObject>.self)
-  unsafe consume(UnsafeBufferPointer<Int8>.self)
-  unsafe consume(UnsafePointer<Int8>.self)
+  consume(Unmanaged<AnyObject>.self)
+  consume(UnsafeBufferPointer<AnyObject>.self)
+  consume(UnsafeBufferPointer<Int8>.self)
+  consume(UnsafePointer<Int8>.self)
 }
 
 @_specializeExtension
@@ -163,7 +163,7 @@ extension _ArrayBuffer {
                where @_noMetadata Element : _Class)
   @available(SwiftStdlib 5.9, *)
   @usableFromInline
-  func __specialize_class__consumeAndCreateNew(bufferIsUnique: Bool, minimumCapacity: Int, growForAppend: Bool) -> _ArrayBuffer<Element> { Builtin.unreachable() }
+  __consuming func __specialize_class__consumeAndCreateNew(bufferIsUnique: Bool, minimumCapacity: Int, growForAppend: Bool) -> _ArrayBuffer<Element> { Builtin.unreachable() }
 
   @_specialize(exported: true,
                availability: SwiftStdlib 5.9, *;
@@ -259,5 +259,5 @@ extension _ContiguousArrayBuffer {
                where @_noMetadata Element : _Class)
   @available(SwiftStdlib 5.9, *)
   @usableFromInline
-  func __specialize_class__consumeAndCreateNew(bufferIsUnique: Bool, minimumCapacity: Int, growForAppend: Bool) -> _ContiguousArrayBuffer<Element> { Builtin.unreachable() }
+  __consuming func __specialize_class__consumeAndCreateNew(bufferIsUnique: Bool, minimumCapacity: Int, growForAppend: Bool) -> _ContiguousArrayBuffer<Element> { Builtin.unreachable() }
 }

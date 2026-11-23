@@ -1,4 +1,4 @@
-//===--- KnuthBendix.cpp - Confluent completion procedure -----------------===//
+//===--- KnuthBendix.cpp - Knuth-Bendix completion procedure --------------===//
 //
 // This source file is part of the Swift.org open source project
 //
@@ -30,7 +30,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/Basic/Assertions.h"
-#include "swift/Basic/Range.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>

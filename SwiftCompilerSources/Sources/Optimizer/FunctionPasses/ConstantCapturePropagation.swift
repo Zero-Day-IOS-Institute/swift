@@ -85,8 +85,9 @@ let constantCapturePropagation = FunctionPass(name: "constant-capture-propagatio
 }
 
 private func optimizeClosureWithDeadCaptures(of partialApply: PartialApplyInst, _ context: FunctionPassContext) {
-  if let callee = getSpecializedCalleeWithDeadParams(of: partialApply, context) {
-    rewritePartialApply(partialApply, withSpecialized: callee, arguments: [], context)
+  if let (callee, substitutions) = getSpecializedCalleeWithDeadParams(of: partialApply, context) {
+    rewritePartialApply(partialApply, withSpecialized: callee, substitutions: substitutions,
+                        arguments: [], context)
   }
 }
 
@@ -113,12 +114,56 @@ private func constantPropagateCaptures(of partialApply: PartialApplyInst, _ cont
                                           constantArguments: constArgs, nonConstantArguments: nonConstArgs,
                                           context)
   }
+  // A noncopyable constant is moved into the closure (see `classifyArgumentsForConstness`).
+  // Destroying the caller's original would destroy the value a second time, so delete it instead.
+  var noncopyableConstants = [Value]()
+  var copyableConstArgs = [Operand]()
+  for argOp in constArgs {
+    if argOp.value.type.isMoveOnly {
+      noncopyableConstants.append(argOp.value)
+    } else {
+      copyableConstArgs.append(argOp)
+    }
+  }
   if !partialApply.isOnStack {
     // Escaping closures consume their arguments. Therefore we need to destroy the removed argument values.
-    addCompensatingDestroys(for: constArgs, context)
+    addCompensatingDestroys(for: copyableConstArgs, context)
   }
   let newArguments = Array(nonConstArgs.values)
-  rewritePartialApply(partialApply, withSpecialized: specializedCallee, arguments: newArguments, context)
+  rewritePartialApply(partialApply, withSpecialized: specializedCallee,
+                      substitutions: partialApply.substitutionMap, arguments: newArguments, context)
+  for constant in noncopyableConstants {
+    eraseDeadConstant(constant, context)
+  }
+}
+
+/// Deletes `value` and the values it's computed from that have no uses other than debug uses.
+private func eraseDeadConstant(_ value: Value, _ context: FunctionPassContext) {
+  guard let inst = value.definingInstruction, inst.isTriviallyDeadIgnoringDebugUses else {
+    return
+  }
+  var operandValues = [Value]()
+  for operand in inst.operands where !operandValues.contains(where: { $0 == operand.value }) {
+    operandValues.append(operand.value)
+  }
+  context.erase(instruction: inst)
+  for operandValue in operandValues {
+    eraseDeadConstant(operandValue, context)
+  }
+}
+
+/// True if `use` consumes its value, and its value and each noncopyable value that it's computed
+/// from has no other use than its consumer, apart from debug uses. A value without ownership, such
+/// as a `thin_to_thick_function`, isn't consumed, but it must not have other uses either.
+private func isOnlyConsumed(by use: Operand) -> Bool {
+  let value = use.value
+  guard use.endsLifetime || value.ownership == .none,
+        value.uses.ignoreDebugUses.allSatisfy({ $0 == use }),
+        let inst = value.definingInstruction
+  else {
+    return false
+  }
+  return inst.operands.allSatisfy { !$0.value.type.isMoveOnly || isOnlyConsumed(by: $0) }
 }
 
 // Propagating a concrete-typed closure into an argument slot whose declared type still has
@@ -134,27 +179,37 @@ private func hasConcreteClosureArgForGenericParam(_ constArgs: [Operand], callee
 
 private func getSpecializedCalleeWithDeadParams(of partialApply: PartialApplyInst,
                                                 _ context: FunctionPassContext
-) -> Function? {
-  guard let specialized = partialApply.getCalleeOfForwardingThunkWithDeadCaptures(),
-        specialized.abi == .Swift
+) -> (callee: Function, substitutions: SubstitutionMap)? {
+  guard let (callee, calleeSubs) = partialApply.getCalleeOfForwardingThunkWithDeadCaptures(),
+        callee.abi == .Swift
   else {
     return nil
   }
 
-  // Specialize the callee if it is generic
-  if partialApply.substitutionMap.hasAnySubstitutableParams {
-    guard specialized.isDefinition,
-          partialApply.referencedFunction!.shouldOptimize, specialized.shouldOptimize
+  // `calleeSubs` are the substitutions with which the thunk calls the callee. They are written in
+  // terms of the thunk's generic environment. Map them into the context of the `partial_apply` to
+  // get the substitutions which the new `partial_apply` of the callee needs to use.
+  let substitutions = calleeSubs.substitute(with: partialApply.substitutionMap)
+
+  // Any remaining archetype - e.g. a local archetype of an opened existential in the thunk - does
+  // not exist in the context of the `partial_apply`.
+  guard !substitutions.replacementTypes.contains(where: { $0.hasArchetype }) else {
+    return nil
+  }
+
+  // Specialize the callee if it is still generic
+  if substitutions.isEffectivelyGeneric {
+    guard callee.isDefinition,
+          partialApply.referencedFunction!.shouldOptimize, callee.shouldOptimize,
+          let genericSpecialized = context.specialize(function: callee, for: substitutions,
+                                                      convertIndirectToDirect: false, isMandatory: false)
     else {
       return nil
     }
-
-    let genericSpecialized = context.specialize(function: specialized, for: partialApply.substitutionMap,
-                                                convertIndirectToDirect: false, isMandatory: false)
-    return genericSpecialized
+    return (genericSpecialized, SubstitutionMap())
   }
 
-  return specialized
+  return (callee, substitutions)
 }
 
 private func specializeClosure(specializedName: String,
@@ -254,20 +309,22 @@ private func addCompensatingDestroys(for constantArguments: [Operand], _ context
 }
 
 private func rewritePartialApply(_ partialApply: PartialApplyInst, withSpecialized specialized: Function,
-                                 arguments: [Value], _ context: FunctionPassContext) {
+                                 substitutions: SubstitutionMap, arguments: [Value],
+                                 _ context: FunctionPassContext) {
   let builder = Builder(before: partialApply, context)
   let fri = builder.createFunctionRef(specialized)
+  let calleeSubs = specialized.genericSignature.isEmpty ? SubstitutionMap() : substitutions
   let newClosure: Value
-  if arguments.isEmpty, specialized.genericSignature.isEmpty, fri.type.functionTypeRepresentation == .thin {
+  if arguments.isEmpty, calleeSubs.isEmpty, fri.type.functionTypeRepresentation == .thin {
     newClosure = builder.createThinToThickFunction(thinFunction: fri, resultType: partialApply.type)
     context.erase(instructions: partialApply.uses.users(ofType: DeallocStackInst.self))
   } else {
     let newPartialApply = builder.createPartialApply(
       function: fri,
-      substitutionMap: specialized.genericSignature.isEmpty ? SubstitutionMap() : partialApply.substitutionMap,
+      substitutionMap: calleeSubs,
       capturedArguments: arguments, calleeConvention: partialApply.calleeConvention,
       hasUnknownResultIsolation: partialApply.hasUnknownResultIsolation, isOnStack: partialApply.isOnStack,
-      isNested: partialApply.isNested, isCalledOnce: partialApply.isCalledOnce)
+      isNested: partialApply.isNested, executionSemantics: partialApply.executionSemantics)
     newClosure = newPartialApply
   }
   partialApply.uses.replaceAll(with: newClosure, context)
@@ -288,9 +345,10 @@ private func rewritePartialApply(_ partialApply: PartialApplyInst, withSpecializ
 
 private extension PartialApplyInst {
 
-  /// Returns the callee if this is a `partial_apply` of a thunk which directly forwards all arguments
-  /// to the callee and has no other side-effects.
-  func getCalleeOfForwardingThunkWithDeadCaptures() -> Function? {
+  /// Returns the callee - and the substitutions with which it is called - if this is a
+  /// `partial_apply` of a thunk which directly forwards all arguments to the callee and has no
+  /// other side-effects.
+  func getCalleeOfForwardingThunkWithDeadCaptures() -> (callee: Function, substitutions: SubstitutionMap)? {
     guard let thunk = referencedFunction,
           let thunkEntryBlock = thunk.blocks.first
     else {
@@ -305,7 +363,7 @@ private extension PartialApplyInst {
       return nil
     }
 
-    var callee: Function? = nil
+    var callee: (callee: Function, substitutions: SubstitutionMap)? = nil
     var returnValue: Value? = nil
     var errorValue: Value? = nil
 
@@ -350,6 +408,17 @@ private extension PartialApplyInst {
     var nonConstArgs = [Operand]()
     var hasKeypath = false
     for argOp in argumentOperands {
+      // A noncopyable constant, such as an exactly-once function or a noncopyable struct, can't be
+      // copied, only moved into the closure. That only keeps its lifetime if the closure is
+      // exactly-once, so that it consumes the constant when it's called, and nothing else uses
+      // the constant. Otherwise, a dropped closure wouldn't destroy the constant, and a borrowed
+      // constant would be destroyed in each call.
+      if argOp.value.type.isMoveOnly,
+         executionSemantics != .once || !isOnlyConsumed(by: argOp)
+      {
+        nonConstArgs.append(argOp)
+        continue
+      }
       // In non-OSSA we don't know where to insert the compensating release for a propagated keypath.
       // Therefore bail if a keypath has multiple uses.
       switch argOp.value.isConstant() {
@@ -377,12 +446,12 @@ private extension PartialApplyInst {
 }
 
 private extension FullApplySite {
-  func getCalleeWithForwardedArguments(numArguments: Int) -> Function? {
+  func getCalleeWithForwardedArguments(numArguments: Int) -> (callee: Function, substitutions: SubstitutionMap)? {
     if let callee = referencedFunction,
        callee.numArguments == numArguments,
        zip(parentFunction.entryBlock.arguments, arguments).allSatisfy({ $0.0 == $0.1 })
     {
-      return callee
+      return (callee, substitutionMap)
     }
     return nil
   }
@@ -420,7 +489,7 @@ private extension Value {
     case let keyPath as KeyPathInst:
       guard keyPath.operands.isEmpty,
             keyPath.hasPattern,
-            !keyPath.substitutionMap.hasAnySubstitutableParams
+            !keyPath.substitutionMap.isEffectivelyGeneric
       else {
         return .notConstant
       }

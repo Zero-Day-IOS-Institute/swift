@@ -96,6 +96,11 @@ foreach(library ${CoreLibs})
   copy_library_sources(${library} "public" "Core")
 endforeach()
 
+# ExecutorImpl.h includes SwiftPlatform/ExecutorTypes.h relative to its
+# own directory.
+copy_files("public/EmbeddedPlatform/include" "Core/Concurrency"
+  FILES "SwiftPlatform/ExecutorTypes.h")
+
 # copying Core/core separately, so we can specify the case of the target folder
 # correctly on case sensitive file systems
 copy_library_sources("" "public/core" "Core/Core")
@@ -125,6 +130,9 @@ message(STATUS "plist[${StdlibSources}/Info.plist.in] -> Supplemental/Runtime/In
 copy_files("" "Supplemental/Runtime" FILES "Info.plist.in")
 
 # Platform Overlays
+
+# Copy the shared static standard library linker argument template.
+copy_files(public/Resources Overlay FILES static-stdlib-args.lnk.in)
 
 # Copy magic linker symbols
 copy_library_sources("linker-support" "public/ClangOverlays" "Overlay")
@@ -175,7 +183,17 @@ copy_files(public/Platform Overlay/Linux/glibc
     TiocConstants.swift
     tgmath.swift.gyb)
 
+message(STATUS "Linux resources[${StdlibSources}/public/Resources/linux] -> ${CMAKE_CURRENT_LIST_DIR}/Overlay/Linux/Resources")
+copy_files(public/Resources/linux Overlay/Linux/Resources
+  FILES
+    static-executable-args.lnk)
+
 # WASI Overlay
+message(STATUS "WASI resources[${StdlibSources}/public/Resources/wasi] -> ${CMAKE_CURRENT_LIST_DIR}/Overlay/WASI/Resources")
+copy_files(public/Resources/wasi Overlay/WASI/Resources
+  FILES
+    static-executable-args.lnk)
+
 message(STATUS "WASI[${StdlibSources}/Platform] -> ${CMAKE_CURRENT_LIST_DIR}/Overlay/WASI/WASILibc")
 copy_files(public/Platform Overlay/WASI/WASILibc
   FILES
@@ -199,9 +217,13 @@ message(STATUS "Windows modulemaps[${StdlibSources}/Platform] -> ${CMAKE_CURRENT
 copy_files(public/Platform Overlay/Windows/clang
   FILES
     ucrt.modulemap
+    SwiftUCRT.h
+    SwiftWinRT.h
     WinSDK.apinotes
-    winsdk_um.modulemap
-    winsdk_shared.modulemap
+    winrt.modulemap
+    winsdk.modulemap
+    um.modulemap
+    shared.modulemap
     vcruntime.modulemap
     vcruntime.apinotes)
 
@@ -242,3 +264,4 @@ copy_library_sources(RegexBuilder "Sources" "Supplemental/StringProcessing"
 
 copy_library_sources("linker-support" "" "Supplemental/Differentiation")
 copy_library_sources(include "" "Supplemental/Distributed")
+copy_library_sources(include "" "Supplemental/Observation")

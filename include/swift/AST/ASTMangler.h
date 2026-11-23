@@ -16,7 +16,6 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/FreestandingMacroExpansion.h"
-#include "swift/ABI/InvertibleProtocols.h"
 #include "swift/AST/SILThunkKind.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/Mangler.h"
@@ -216,6 +215,10 @@ public:
 
   ASTContext &getASTContext() { return Context; }
 
+  /// Whether the conformance contains a retroactive conformance anywhere, and
+  /// is therefore mangled after the generic arguments of a type.
+  static bool containsRetroactiveConformance(ProtocolConformanceRef conformance);
+
   void addTypeSubstitution(Type type, GenericSignature sig) {
     type = dropProtocolsFromAssociatedTypes(type, sig);
     addSubstitution(type.getPointer());
@@ -398,8 +401,9 @@ public:
   
   std::string mangleObjCRuntimeName(const NominalTypeDecl *Nominal);
 
-  std::string mangleTypeWithoutPrefix(Type type) {
-    appendType(type, nullptr);
+  std::string mangleTypeWithoutPrefix(Type type,
+                                      GenericSignature sig = nullptr) {
+    appendType(type, sig);
     return finalize();
   }
 
@@ -619,6 +623,10 @@ protected:
       Type resultType, GenericSignature sig,
       std::optional<LifetimeDependenceInfo> lifetimeDependence,
       const ValueDecl *forDecl = nullptr);
+  void appendFunctionYieldTypes(AnyFunctionType *fnType,
+                                ArrayRef<AnyFunctionType::Yield> yields,
+                                GenericSignature sig, const ValueDecl *forDecl = nullptr,
+                                bool isRecursedInto = true);
 
   void appendTypeList(Type listTy, GenericSignature sig,
                       const ValueDecl *forDecl = nullptr);

@@ -23,8 +23,6 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/Types.h"
-#include "swift/AST/ExistentialLayout.h"
-#include "swift/AST/RequirementSignature.h"
 #include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Version.h"
@@ -56,6 +54,7 @@ std::optional<ScoreKind> ConstraintFix::impact() const {
   case FixBehavior::Suppress:
     return std::nullopt;
   }
+  llvm_unreachable("covered switch");
 }
 
 ASTNode ConstraintFix::getAnchor() const { return getLocator()->getAnchor(); }
@@ -186,15 +185,28 @@ bool CoerceToCheckedCast::diagnose(const Solution &solution,
 CoerceToCheckedCast *CoerceToCheckedCast::attempt(ConstraintSystem &cs,
                                                   Type fromType, Type toType,
                                                   bool useConditionalCast,
-                                                  ConstraintLocator *locator) {
-  // If any of the types have type variables or placeholders, don't add the fix.
+                                                  ConstraintLocatorBuilder locator) {
+  // If any of the types have type variables or holes, don't add the fix.
   // `typeCheckCheckedCast` doesn't support checking such types.
-  if (fromType->hasTypeVariableOrPlaceholder() ||
-      toType->hasTypeVariableOrPlaceholder()) {
+  if (fromType->hasTypeVariableOrHole() || toType->hasTypeVariableOrHole()) {
     return nullptr;
   }
 
-  auto anchor = locator->getAnchor();
+  // FIXME: Is there a better way of doing this? trySimplifyToExpr() returns
+  // the operand, not the CoerceExpr itself.
+  SmallVector<LocatorPathElt, 4> pathBuffer;
+  auto anchor = locator.getLocatorParts(pathBuffer);
+
+  if (!pathBuffer.empty() &&
+      pathBuffer.back().is<LocatorPathElt::CoercionOperand>()) {
+    pathBuffer.pop_back();
+  }
+
+  ArrayRef<LocatorPathElt> path = pathBuffer;
+
+  SourceRange range;
+  simplifyLocator(anchor, path, range);
+
   if (auto *assignExpr = getAsExpr<AssignExpr>(anchor))
     anchor = assignExpr->getSrc();
   auto *coerceExpr = getAsExpr<CoerceExpr>(anchor);
@@ -209,7 +221,8 @@ CoerceToCheckedCast *CoerceToCheckedCast::attempt(ConstraintSystem &cs,
     return nullptr;
 
   return new (cs.getAllocator())
-      CoerceToCheckedCast(cs, fromType, toType, useConditionalCast, locator);
+      CoerceToCheckedCast(cs, fromType, toType, useConditionalCast,
+                          cs.getConstraintLocator(locator));
 }
 
 bool TreatArrayLiteralAsDictionary::diagnose(const Solution &solution,
@@ -253,6 +266,123 @@ TreatArrayLiteralAsDictionary::attempt(ConstraintSystem &cs, Type dictionaryTy,
   auto arrayLoc = cs.getConstraintLocator(arrayExpr);
   return new (cs.getAllocator())
       TreatArrayLiteralAsDictionary(cs, dictionaryTy, arrayTy, arrayLoc);
+}
+
+bool TreatArrayLiteralAsTuple::diagnose(const Solution &solution,
+                                             bool asNote) const {
+  ArrayLiteralToTupleConversionFailure failure(solution,
+                                               getToType(), getFromType(),
+                                               getLocator());
+  return failure.diagnose(asNote);
+}
+
+TreatArrayLiteralAsTuple *
+TreatArrayLiteralAsTuple::attempt(ConstraintSystem &cs, Type tupleTy,
+                                  Type arrayTy,
+                                  ConstraintLocator *locator) {
+  if (!arrayTy->isArray())
+    return nullptr;
+
+  // Determine the ArrayExpr from the locator.
+  auto *expr = getAsExpr(simplifyLocatorToAnchor(locator));
+  if (!expr)
+    return nullptr;
+
+  if (auto *AE = dyn_cast<AssignExpr>(expr))
+    expr = AE->getSrc();
+
+  auto *arrayExpr = dyn_cast<ArrayExpr>(expr);
+  if (!arrayExpr)
+    return nullptr;
+
+  // This fix only applies if the array is used as a correctly-sized
+  // homogeneous tuple.
+  auto unwrappedTuple = tupleTy->lookThroughAllOptionalTypes();
+  if (unwrappedTuple->isTypeVariableOrMember())
+    return nullptr;
+
+  auto castedTupleTy = unwrappedTuple->getAs<TupleType>();
+  if (!castedTupleTy || !castedTupleTy->isHomogeneous() ||
+        castedTupleTy->getNumElements() != arrayExpr->getNumElements())
+    return nullptr;
+
+  auto arrayLoc = cs.getConstraintLocator(arrayExpr);
+  return new (cs.getAllocator())
+      TreatArrayLiteralAsTuple(cs, tupleTy, arrayTy, arrayLoc);
+}
+
+bool TreatTupleAsArrayLiteral::diagnose(const Solution &solution,
+                                             bool asNote) const {
+  TupleToArrayConversionFailure failure(solution, getToType(), getFromType(),
+                                        getLocator());
+  return failure.diagnose(asNote);
+}
+
+static std::optional<std::pair<Type, std::optional<uint64_t>>>
+getArrayLiteralInfo(CanType arrayTy) {
+  // Special-case InlineArray
+  if (auto arraySize = arrayTy->getInlineArrayCount())
+    return std::make_pair(arrayTy->getInlineArrayElementType(),
+                          arraySize->getLimitedValue());
+
+  ASTContext &ctx = arrayTy->getASTContext();
+
+  auto *proto = ctx.getProtocol(KnownProtocolKind::ExpressibleByArrayLiteral);
+  if (!proto)
+    return std::nullopt;
+
+  auto conformance = swift::lookupConformance(arrayTy, proto);
+  if (!conformance)
+    return std::nullopt;
+
+  auto elemTy = conformance.getTypeWitnessByName(ctx.Id_ArrayLiteralElement);
+  return std::make_pair(elemTy, std::nullopt);
+}
+
+TreatTupleAsArrayLiteral *
+TreatTupleAsArrayLiteral::attempt(ConstraintSystem &cs, Type arrayTy,
+                                  Type tupleTy,
+                                  ConstraintLocator *locator) {
+  // The tuple produced must be homogeneous.
+  auto castedTupleTy = tupleTy->getAs<TupleType>();
+  if (!castedTupleTy || !castedTupleTy->isHomogeneous())
+    return nullptr;
+
+  // Determine the ArrayExpr from the locator.
+  auto *expr = getAsExpr(simplifyLocatorToAnchor(locator));
+  if (!expr)
+    return nullptr;
+
+  if (auto *AE = dyn_cast<AssignExpr>(expr))
+    expr = AE->getSrc();
+
+  auto *tupleExpr = dyn_cast<TupleExpr>(expr);
+  if (!tupleExpr)
+    return nullptr;
+
+  // The fix only applies if the tuple is used as an array.
+  auto unwrappedArray = arrayTy->lookThroughAllOptionalTypes();
+  if (unwrappedArray->isTypeVariableOrMember() || arrayTy->is<HoleType>())
+    return nullptr;
+
+  auto arrayInfo = getArrayLiteralInfo(unwrappedArray->getCanonicalType());
+  if (!arrayInfo)
+    return nullptr;
+
+  // If we expected `[(T, T)]` and got `(T, T)` instead, the fix might be to
+  // wrap the tuple in a collection, not to turn the tuple into an array
+  // literal. Bail out so we can choose a more general fix.
+  if (auto elemTupleTy = arrayInfo->first->getAs<TupleType>())
+    if (elemTupleTy->getNumElements() == castedTupleTy->getNumElements())
+      return nullptr;
+
+  // If the array is fixed-size, its count must match the tuple's arity.
+  if (arrayInfo->second && arrayInfo->second != castedTupleTy->getNumElements())
+    return nullptr;
+
+  auto tupleLoc = cs.getConstraintLocator(tupleExpr);
+  return new (cs.getAllocator())
+      TreatTupleAsArrayLiteral(cs, arrayTy, tupleTy, tupleLoc);
 }
 
 bool MarkExplicitlyEscaping::diagnose(const Solution &solution,
@@ -1272,15 +1402,18 @@ AllowAnyObjectKeyPathRoot::create(ConstraintSystem &cs,
 
 bool AllowMultiArgFuncKeyPathMismatch::diagnose(const Solution &solution,
                                                 bool asNote) const {
-  MultiArgFuncKeyPathFailure failure(solution, functionType, getLocator());
+  MultiArgFuncKeyPathFailure failure(solution, functionType, expectedType,
+                                     getLocator());
   return failure.diagnose(asNote);
 }
 
 AllowMultiArgFuncKeyPathMismatch *
-AllowMultiArgFuncKeyPathMismatch::create(ConstraintSystem &cs, Type fnType,
+AllowMultiArgFuncKeyPathMismatch::create(ConstraintSystem &cs,
+                                         Type fnType,
+                                         Type expectedType,
                                          ConstraintLocator *locator) {
   return new (cs.getAllocator())
-  AllowMultiArgFuncKeyPathMismatch(cs, fnType, locator);
+      AllowMultiArgFuncKeyPathMismatch(cs, fnType, expectedType, locator);
 }
 
 bool TreatKeyPathSubscriptIndexAsHashable::diagnose(const Solution &solution,
@@ -1291,7 +1424,8 @@ bool TreatKeyPathSubscriptIndexAsHashable::diagnose(const Solution &solution,
 }
 
 TreatKeyPathSubscriptIndexAsHashable *
-TreatKeyPathSubscriptIndexAsHashable::create(ConstraintSystem &cs, Type type,
+TreatKeyPathSubscriptIndexAsHashable::create(ConstraintSystem &cs,
+                                             Type type,
                                              ConstraintLocator *locator) {
   return new (cs.getAllocator())
       TreatKeyPathSubscriptIndexAsHashable(cs, type, locator);
@@ -1742,7 +1876,8 @@ bool AllowTupleSplatForSingleParameter::attempt(
   auto newArgType = TupleType::get(argElts, cs.getASTContext());
 
   args.clear();
-  args.push_back(AnyFunctionType::Param(newArgType, param.getLabel()));
+  args.push_back(
+      AnyFunctionType::Param::bodyAccess(newArgType, param.getLabel()));
 
   auto *fix = new (cs.getAllocator()) AllowTupleSplatForSingleParameter(
       cs, paramTy, cs.getConstraintLocator(locator));
@@ -2422,7 +2557,7 @@ SpecifyBaseTypeForOptionalUnresolvedMember::attempt(
     return nullptr;
 
   Type underlyingBaseType = baseTy->getMetatypeInstanceType();
-  if (!underlyingBaseType->getNominalOrBoundGenericNominal())
+  if (!underlyingBaseType->getNominalDecl())
     return nullptr;
 
   if (!underlyingBaseType->getOptionalObjectType())
@@ -2852,6 +2987,19 @@ IgnoreOutOfPlaceThenStmt::create(ConstraintSystem &cs,
   return new (cs.getAllocator()) IgnoreOutOfPlaceThenStmt(cs, locator);
 }
 
+bool AllowNonExactlyOnceDeinitArgument::diagnose(const Solution &solution,
+                                                 bool asNote) const {
+  NonExactlyOnceDeinitArgumentFailure failure(solution, ArgType, getLocator());
+  return failure.diagnose(asNote);
+}
+
+AllowNonExactlyOnceDeinitArgument *
+AllowNonExactlyOnceDeinitArgument::create(ConstraintSystem &cs, Type argType,
+                                          ConstraintLocator *locator) {
+  return new (cs.getAllocator())
+      AllowNonExactlyOnceDeinitArgument(cs, argType, locator);
+}
+
 bool IgnoreGenericSpecializationArityMismatch::diagnose(
     const Solution &solution, bool asNote) const {
   InvalidTypeSpecializationArity failure(solution, D, NumParams, NumArgs,
@@ -2885,7 +3033,7 @@ IgnoreKeyPathSubscriptIndexMismatch::create(ConstraintSystem &cs, Type argType,
 
 AllowInlineArrayLiteralCountMismatch *
 AllowInlineArrayLiteralCountMismatch::create(ConstraintSystem &cs,
-                                             unsigned lhsCount,
+                                             IntegerType *lhsCount,
                                              unsigned rhsCount,
                                              ConstraintLocator *locator) {
   return new (cs.getAllocator())

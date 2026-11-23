@@ -15,10 +15,7 @@
 
 #include "swift/SIL/GenericSpecializationMangler.h"
 
-#include "swift/Demangling/Demangler.h"
 #include "swift/Demangling/NamespaceMacros.h"
-#include "swift/Basic/NullablePtr.h"
-#include "swift/AST/ASTMangler.h"
 #include "swift/SIL/SILLinkage.h"
 #include "swift/SIL/SILFunction.h"
 
@@ -69,6 +66,7 @@ class FunctionSignatureSpecializationMangler : public SpecializationMangler {
     BoxToStack = 4,
     InOutToOut = 5,
     ClosurePropPreviousArg = 6, // the same closure as a previous `ClosureProp` argument
+    DifferentiableFunctionProp = 7,
 
     First_Option = 0,
     Last_Option = 31,
@@ -83,11 +81,21 @@ class FunctionSignatureSpecializationMangler : public SpecializationMangler {
     LastOptionSetEntry = 32768,
   };
 
+  struct DifferentiableFunctionInfo {
+    SILInstruction *inst;
+    SILInstruction *originalRoot;
+    SILInstruction *jvpRoot;
+    SILInstruction *vjpRoot;
+  };
+
+  llvm::SmallVector<DifferentiableFunctionInfo, 0> DifferentiableFunctions;
+
   struct ArgInfo {
     ArgumentModifier kind;
     union {
       SILInstruction *inst;
       unsigned otherArgIdx; // only for `ClosurePropPreviousArg`
+      unsigned differentiableFunctionIdx; // only for `DifferentiableFunctionProp`
     };
 
     ArgInfo(ArgumentModifier kind) : kind(kind), inst(nullptr) {}
@@ -116,6 +124,10 @@ public:
 
   void setArgumentClosureProp(unsigned OrigArgIdx, SILInstruction *closure);
   void setArgumentClosurePropPreviousArg(unsigned OrigArgIdx, unsigned otherArgIdx);
+  void setArgumentDifferentiableFunctionProp(
+      unsigned OrigArgIdx, SILInstruction *DifferentiableFunction,
+      SILInstruction *OriginalRoot, SILInstruction *JVPRoot,
+      SILInstruction *VJPRoot);
   void setArgumentDead(unsigned OrigArgIdx);
   void setArgumentOwnedToGuaranteed(unsigned OrigArgIdx);
   void setArgumentGuaranteedToOwned(unsigned OrigArgIdx);
@@ -135,6 +147,7 @@ public:
 private:
   void mangleConstantProp(SILInstruction *constInst);
   void mangleClosureProp(SILInstruction *Inst);
+  void mangleDifferentiableFunctionProp(const DifferentiableFunctionInfo &Info);
   void mangleArgument(ArgInfo argInfo);
   void mangleReturnValue(ReturnValueModifierIntBase RetMod);
 };

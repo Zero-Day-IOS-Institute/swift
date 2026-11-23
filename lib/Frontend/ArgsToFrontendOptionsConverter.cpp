@@ -17,15 +17,12 @@
 #include "swift/AST/AttrKind.h"
 #include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/Basic/Assertions.h"
-#include "swift/Basic/Platform.h"
 #include "swift/Frontend/Frontend.h"
-#include "swift/Option/Options.h"
 #include "swift/Option/SanitizerOptions.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Parse/ParseVersion.h"
 #include "swift/Strings.h"
 #include "clang/Driver/Driver.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/CAS/ObjectStore.h"
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/ArgList.h"
@@ -34,8 +31,8 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/LineIterator.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/PrefixMapper.h"
 #include "llvm/Support/Process.h"
+#include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/TargetParser/Triple.h"
 
 using namespace swift;
@@ -109,8 +106,11 @@ bool ArgsToFrontendOptionsConverter::convert(
 
   Opts.EnableTesting |= Args.hasArg(OPT_enable_testing);
   Opts.EnablePrivateImports |= Args.hasArg(OPT_enable_private_imports);
-  Opts.FrontendParseableOutput |= Args.hasArg(OPT_frontend_parseable_output);
   Opts.ExplicitInterfaceBuild |= Args.hasArg(OPT_explicit_interface_module_build);
+
+  if (Args.hasArg(OPT_frontend_parseable_output))
+    Diags.diagnose(SourceLoc(), diag::warn_flag_deprecated,
+                   "-frontend-parseable-output");
 
   Opts.EmitClangHeaderWithNonModularIncludes |=
       Args.hasArg(OPT_emit_clang_header_nonmodular_includes);
@@ -139,17 +139,6 @@ bool ArgsToFrontendOptionsConverter::convert(
       return true;
     }
     Opts.BadFileDescriptorRetryCount = limit;
-  }
-
-  if (auto A = Args.getLastArg(OPT_user_module_version)) {
-    StringRef raw(A->getValue());
-    while(raw.count('.') > 3) {
-      raw = raw.rsplit('.').first;
-    }
-    if (Opts.UserModuleVersion.tryParse(raw)) {
-      Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
-                     A->getAsString(Args), A->getValue());
-    }
   }
 
   for (auto A : Args.getAllArgValues(options::OPT_allowable_client)) {
@@ -215,12 +204,6 @@ bool ArgsToFrontendOptionsConverter::convert(
   Opts.CompilerDebuggingOpts.DumpClangLookupTables |=
       Args.hasArg(OPT_dump_clang_lookup_tables);
 
-  Opts.CompilerDebuggingOpts.DumpAbstractLayout |=
-      Args.hasArg(OPT_dump_abstract_layout);
-
-  Opts.CompilerDebuggingOpts.DumpHiddenTypeLayouts |=
-      Args.hasArg(OPT_dump_hidden_type_layouts);
-
   Opts.CheckOnoneSupportCompleteness = Args.hasArg(OPT_check_onone_completeness);
 
   Opts.ParseStdlib |= Args.hasArg(OPT_parse_stdlib);
@@ -277,7 +260,7 @@ bool ArgsToFrontendOptionsConverter::convert(
   }
 
   std::optional<FrontendInputsAndOutputs> inputsAndOutputs =
-      ArgsToFrontendInputsConverter(Diags, Args).convert(buffers);
+      ArgsToFrontendInputsConverter(Diags, Args, FS).convert(buffers);
 
   // None here means error, not just "no inputs". Propagate unconditionally.
   if (!inputsAndOutputs)
@@ -337,6 +320,26 @@ bool ArgsToFrontendOptionsConverter::convert(
   if (HaveNewInputsAndOutputs &&
       computeMainAndSupplementaryOutputFilenames())
     return true;
+
+  if (auto A = Args.getLastArg(OPT_user_module_version)) {
+    StringRef raw(A->getValue());
+    if (auto version = VersionParser::parseUserModuleVersion(raw)) {
+      Opts.UserModuleVersion = *version;
+
+      // The driver passes -user-module-version to every frontend job, so only
+      // warn in the job that emits the module to avoid repeating diagnostics.
+      bool emitsModule = Opts.InputsAndOutputs.hasModuleOutputPath() &&
+                         !Opts.InputsAndOutputs.hasPrimaryInputs();
+      if (emitsModule && raw.count('.') >= 4 && !version->getSubbuild())
+        Diags.diagnose(
+            SourceLoc(),
+            diag::warning_user_module_version_fifth_component_ignored, raw,
+            /*limit*/ 1023);
+    } else {
+      Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
+                     A->getAsString(Args), A->getValue());
+    }
+  }
 
   Opts.EmitSymbolGraph |= Args.hasArg(OPT_emit_symbol_graph);
   if (const Arg *A = Args.getLastArg(OPT_emit_symbol_graph_dir)) {
@@ -817,12 +820,16 @@ bool ArgsToFrontendOptionsConverter::computeFallbackModuleName() {
   }
   std::optional<std::vector<std::string>> outputFilenames =
       OutputFilesComputer::getOutputFilenamesFromCommandLineOrFilelist(
-          Args, Diags, options::OPT_o, options::OPT_output_filelist);
+          Args, Diags, options::OPT_o, options::OPT_output_filelist, FS);
 
+  auto isDirectory = [&](StringRef path) {
+    auto status = FS.status(path);
+    return status && status->isDirectory();
+  };
   std::string nameToStem =
       outputFilenames && outputFilenames->size() == 1 &&
               outputFilenames->front() != "-" &&
-              !llvm::sys::fs::is_directory(outputFilenames->front())
+              !isDirectory(outputFilenames->front())
           ? outputFilenames->front()
           : Opts.InputsAndOutputs.getFilenameOfFirstInput();
 
@@ -835,10 +842,10 @@ bool ArgsToFrontendOptionsConverter::
   std::vector<std::string> mainOutputs;
   std::vector<std::string> mainOutputForIndexUnits;
   std::vector<SupplementaryOutputPaths> supplementaryOutputs;
-  const bool hadError = ArgsToFrontendOutputsConverter(
-                            Args, Opts.ModuleName, Opts.InputsAndOutputs, Diags)
-                            .convert(mainOutputs, mainOutputForIndexUnits,
-                                     supplementaryOutputs);
+  const bool hadError =
+      ArgsToFrontendOutputsConverter(Args, Opts.ModuleName,
+                                     Opts.InputsAndOutputs, Diags, FS)
+          .convert(mainOutputs, mainOutputForIndexUnits, supplementaryOutputs);
   if (hadError)
     return true;
   Opts.InputsAndOutputs.setMainAndSupplementaryOutputs(mainOutputs,

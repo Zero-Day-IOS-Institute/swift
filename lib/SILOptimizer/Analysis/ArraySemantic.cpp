@@ -11,9 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/SILOptimizer/Analysis/ArraySemantic.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/SIL/DebugUtils.h"
-#include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/NodeDatastructures.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
@@ -301,7 +299,7 @@ static bool canHoistArrayArgument(ApplyInst *SemanticsCall, SILValue Arr,
   if (auto* lbi = dyn_cast<LoadBorrowInst>(SelfVal)) {
     // Are we loading a value from an address in a struct defined at a point
     // dominating the hoist point.
-    auto Val = lbi->getOperand();
+    auto Val = lbi->getAddress();
     bool DoesNotDominate;
     StructElementAddrInst *SEI;
     while ((DoesNotDominate = !DT->dominates(Val->getParentBlock(),
@@ -391,14 +389,11 @@ static SILValue copySelfValue(SILValue ArrayStructValue,
   auto *func = InsertBefore->getFunction();
   if (DT->dominates(ArrayStructValue->getParentBlock(),
                     InsertBefore->getParent())) {
-    assert(!func->hasOwnership() ||
-           ArrayStructValue->getOwnershipKind() == OwnershipKind::Owned ||
-           ArrayStructValue->getOwnershipKind() == OwnershipKind::Guaranteed);
     return ArrayStructValue;
   }
 
   if (auto *lbi = dyn_cast<LoadBorrowInst>(ArrayStructValue)) {
-    SILValue Val = lbi->getOperand();
+    SILValue Val = lbi->getAddress();
     auto *InsertPt = InsertBefore;
     while (!DT->dominates(Val->getParentBlock(), InsertBefore->getParent())) {
       auto *Inst = cast<StructElementAddrInst>(Val);
@@ -406,7 +401,7 @@ static SILValue copySelfValue(SILValue ArrayStructValue,
       Val = Inst->getOperand();
       InsertPt = Inst;
     }
-    return SILBuilderWithScope(InsertPt).createLoadBorrow(InsertPt->getLoc(), lbi->getOperand());
+    return SILBuilderWithScope(InsertPt).createLoadBorrow(InsertPt->getLoc(), lbi->getAddress());
   }
 
   assert(!func->hasOwnership() ||
@@ -661,7 +656,7 @@ bool swift::ArraySemanticsCall::mayHaveBridgedObjectElementType() const {
   assert(hasSelf() && "Need self parameter");
 
   auto Ty = getSelf()->getType();
-  if (auto BGT = Ty.getAs<BoundGenericStructType>()) {
+  if (auto BGT = Ty.getAs<StructType>()) {
     // Check the array element type parameter.
     bool isClass = true;
     for (auto EltTy : BGT->getGenericArgs()) {

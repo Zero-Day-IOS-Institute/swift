@@ -265,6 +265,32 @@ bb0(%0 : $Int64):
   return %2 : $Int64
 }
 
+// Don't fold `tuple_extract(tuple(x, y), 0)` to the owned element `x` here. The
+// tuple has another use, so the RAUW would have to compensate by inserting a
+// `copy_value` at the definition of `x` and a `destroy_value` at the use. If the
+// use is in a block which SILCombine orphaned earlier in the same run, the
+// destroy is deleted along with the dead block and the copy leaks.
+// Instead, the borrow scope of the tuple is split and the tuple is sunk to its
+// consuming use.
+//
+// CHECK-LABEL: sil [ossa] @dont_fold_owned_tuple_extract
+// CHECK-NOT:     copy_value
+// CHECK:         apply {{%.*}}(%0)
+// CHECK-NEXT:    [[T:%.*]] = tuple (%0 : $Klass, %1 : $Klass)
+// CHECK-NEXT:    return [[T]]
+// CHECK-NOT:     copy_value
+// CHECK-LABEL: } // end sil function 'dont_fold_owned_tuple_extract'
+sil [ossa] @dont_fold_owned_tuple_extract : $@convention(thin) (@owned Klass, @owned Klass) -> @owned (Klass, Klass) {
+bb0(%0 : @owned $Klass, %1 : @owned $Klass):
+  %2 = tuple (%0 : $Klass, %1 : $Klass)
+  %3 = begin_borrow %2 : $(Klass, Klass)
+  %4 = tuple_extract %3 : $(Klass, Klass), 0
+  %5 = function_ref @use_klass_guaranteed : $@convention(thin) (@guaranteed Klass) -> ()
+  %6 = apply %5(%4) : $@convention(thin) (@guaranteed Klass) -> ()
+  end_borrow %3 : $(Klass, Klass)
+  return %2 : $(Klass, Klass)
+}
+
 // CHECK-LABEL: sil [ossa] @do_not_fold_integer_literal
 // CHECK: bb
 // CHECK: cond_br
@@ -642,7 +668,7 @@ bb0(%0 : @owned $HeapBufferStorage<T_0_0, T_0_1>):
 // CHECK-NEXT: return
 sil [ossa] @raw_pointer_to_ref_ref_to_raw_pointer_round_trip : $@convention(thin) (Builtin.RawPointer) -> Builtin.RawPointer {
 bb0(%0 : $Builtin.RawPointer):
-  %1 = raw_pointer_to_ref %0 : $Builtin.RawPointer to $C
+  %1 = raw_pointer_to_ref [immortal] %0 : $Builtin.RawPointer to $C
   %2 = ref_to_raw_pointer %1 : $C to $Builtin.RawPointer
   return %2 : $Builtin.RawPointer
 }
@@ -1573,10 +1599,10 @@ bb0(%0 : @owned $B):
 sil [ossa] @unchecked_ref_cast_formation_owned : $@convention(thin) (@owned B) -> @owned F {
 bb0(%0 : @owned $B):
   %1 = ref_to_raw_pointer %0 : $B to $Builtin.RawPointer
+  // The result of a non-immortal `raw_pointer_to_ref` is owned.
   %2 = raw_pointer_to_ref %1 : $Builtin.RawPointer to $F
-  %3 = copy_value %2 : $F
   destroy_value %0 : $B
-  return %3 : $F
+  return %2 : $F
 }
 
 // CHECK-LABEL: sil [ossa] @unchecked_ref_cast_formation_guaranteed : $@convention(thin) (@guaranteed B) -> @owned F {
@@ -1587,9 +1613,9 @@ bb0(%0 : @owned $B):
 sil [ossa] @unchecked_ref_cast_formation_guaranteed : $@convention(thin) (@guaranteed B) -> @owned F {
 bb0(%0 : @guaranteed $B):
   %1 = ref_to_raw_pointer %0 : $B to $Builtin.RawPointer
+  // The result of a non-immortal `raw_pointer_to_ref` is owned.
   %2 = raw_pointer_to_ref %1 : $Builtin.RawPointer to $F
-  %3 = copy_value %2 : $F
-  return %3 : $F
+  return %2 : $F
 }
 
 // CHECK-LABEL: sil [ossa] @upcast_unchecked_ref_cast_roundtrip : $@convention(thin) (@owned B) -> @owned B {
@@ -1601,6 +1627,44 @@ bb0(%0 : @owned $B):
   %1 = unchecked_ref_cast %0 : $B to $E
   %2 = upcast %1 : $E to $B
   return %2 : $B
+}
+
+// A forwarding instruction can forward `owned` even if its operand has `none`
+// ownership - e.g. the result of an `immortal` raw_pointer_to_ref. Such a cast
+// must not be bypassed, because it would lose its consuming use and leak.
+
+// CHECK-LABEL: sil [ossa] @dont_bypass_owned_cast_of_immortal_value : $@convention(thin) (Builtin.RawPointer) -> Builtin.Word {
+// CHECK:         [[CAST:%.*]] = unchecked_ref_cast %{{[0-9]+}} : $F to $Builtin.BridgeObject, forwarding: @owned
+// CHECK:         unchecked_ref_cast [[CAST]] : $Builtin.BridgeObject to $Klass
+// CHECK:       } // end sil function 'dont_bypass_owned_cast_of_immortal_value'
+sil [ossa] @dont_bypass_owned_cast_of_immortal_value : $@convention(thin) (Builtin.RawPointer) -> Builtin.Word {
+bb0(%0 : $Builtin.RawPointer):
+  %1 = raw_pointer_to_ref [immortal] %0 : $Builtin.RawPointer to $F
+  %2 = unchecked_ref_cast %1 : $F to $Builtin.BridgeObject, forwarding: @owned
+  %3 = bridge_object_to_word %2 : $Builtin.BridgeObject to $Builtin.Word
+  %4 = unchecked_ref_cast %2 : $Builtin.BridgeObject to $Klass
+  %5 = function_ref @use_klass_guaranteed : $@convention(thin) (@guaranteed Klass) -> ()
+  %6 = apply %5(%4) : $@convention(thin) (@guaranteed Klass) -> ()
+  destroy_value %4 : $Klass
+  return %3 : $Builtin.Word
+}
+
+// CHECK-LABEL: sil [ossa] @dont_bypass_owned_upcast_of_immortal_value : $@convention(thin) (Builtin.RawPointer) -> () {
+// CHECK:         [[CAST:%.*]] = upcast %{{[0-9]+}} : $F to $E, forwarding: @owned
+// CHECK:         unchecked_ref_cast [[CAST]] : $E to $Klass
+// CHECK:       } // end sil function 'dont_bypass_owned_upcast_of_immortal_value'
+sil [ossa] @dont_bypass_owned_upcast_of_immortal_value : $@convention(thin) (Builtin.RawPointer) -> () {
+bb0(%0 : $Builtin.RawPointer):
+  %1 = raw_pointer_to_ref [immortal] %0 : $Builtin.RawPointer to $F
+  %2 = upcast %1 : $F to $E, forwarding: @owned
+  %3 = function_ref @use_generic_obj_guaranteed : $@convention(thin) <τ_0_0> (@guaranteed τ_0_0) -> ()
+  %4 = apply %3<E>(%2) : $@convention(thin) <τ_0_0> (@guaranteed τ_0_0) -> ()
+  %5 = unchecked_ref_cast %2 : $E to $Klass
+  %6 = function_ref @use_klass_guaranteed : $@convention(thin) (@guaranteed Klass) -> ()
+  %7 = apply %6(%5) : $@convention(thin) (@guaranteed Klass) -> ()
+  destroy_value %5 : $Klass
+  %9 = tuple ()
+  return %9 : $()
 }
 
 // CHECK-LABEL: sil [ossa] @unchecked_ref_cast_upcast_roundtrip : $@convention(thin) (@owned E) -> @owned E {
@@ -1642,6 +1706,7 @@ bb0(%0 : @owned $E):
 // CHECK-NEXT: switch_enum [[BORROW]]
 // CHECK: bb1([[GUARANTEED:%.*]] : @guaranteed
 // CHECK-NEXT: end_borrow [[BORROW]]
+// CHECK-NEXT: debug_value
 // CHECK-NEXT: load [copy]
 // CHECK-NEXT: unchecked_enum_data
 // CHECK-NEXT: return
@@ -5833,5 +5898,92 @@ bb0:
   %2 = integer_literal $Builtin.Int64, 2
   %3 = struct $UInt64 (%2)
   destroy_value %1
+  unreachable
+}
+
+struct BridgeObjectWrapper {
+  var o: Builtin.BridgeObject
+}
+
+sil @barrier : $@convention(thin) () -> ()
+sil @fail : $@convention(thin) () -> Never
+
+// Make sure that the lifetime extending copy, which is created when replacing the
+// upcast-operand of the unchecked_ref_cast, gets a `dead_end` destroy in bb2.
+// Otherwise the object would be released on the path to the infinite loop.
+//
+// CHECK-LABEL: sil [ossa] @no_destroy_for_lifetime_extending_copy_in_dead_end :
+// CHECK-NOT:     destroy_value {{%[0-9]+}} : $E
+// CHECK:       } // end sil function 'no_destroy_for_lifetime_extending_copy_in_dead_end'
+// CHECK_COPYPROP-LABEL: sil [ossa] @no_destroy_for_lifetime_extending_copy_in_dead_end :
+// CHECK_COPYPROP-NOT:     destroy_value {{%[0-9]+}} : $E
+// CHECK_COPYPROP:       } // end sil function 'no_destroy_for_lifetime_extending_copy_in_dead_end'
+sil [ossa] @no_destroy_for_lifetime_extending_copy_in_dead_end : $@convention(thin) (Builtin.Int1) -> () {
+bb0(%0 : $Builtin.Int1):
+  %1 = alloc_ref $E
+  %2 = upcast %1 to $B
+  cond_br %0, bb1, bb2
+
+bb1:
+  %4 = unchecked_ref_cast %2 to $Builtin.BridgeObject
+  %5 = struct $BridgeObjectWrapper (%4)
+  destroy_value [dead_end] %5
+  %7 = function_ref @barrier : $@convention(thin) () -> ()
+  br bb3
+
+bb2:
+  destroy_value [dead_end] %2
+  %10 = function_ref @fail : $@convention(thin) () -> Never
+  %11 = apply %10() : $@convention(thin) () -> Never
+  unreachable
+
+bb3:
+  %13 = apply %7() : $@convention(thin) () -> ()
+  %14 = builtin "infinite_loop_true_condition"() : $Builtin.Int1
+  cond_br %14, bb4, bb5
+
+bb4:
+  br bb3
+
+bb5:
+  unreachable
+}
+
+// Same as above, but in a loop: the leaky block bb3 is in a dead-end region, but the
+// lifetime extending copy can be re-executed. Therefore the destroy must not be `dead_end`.
+//
+// CHECK-LABEL: sil [ossa] @destroy_for_lifetime_extending_copy_in_dead_end_loop :
+// CHECK:       bb1:
+// CHECK:         [[A:%.*]] = alloc_ref $E
+// CHECK-NEXT:    destroy_value [[A]] : $E
+// CHECK-NOT:     dead_end
+// CHECK:       } // end sil function 'destroy_for_lifetime_extending_copy_in_dead_end_loop'
+sil [ossa] @destroy_for_lifetime_extending_copy_in_dead_end_loop : $@convention(thin) (Builtin.Int1) -> () {
+bb0(%0 : $Builtin.Int1):
+  br bb1
+
+bb1:
+  %1 = alloc_ref $E
+  %2 = upcast %1 to $B
+  cond_br %0, bb2, bb3
+
+bb2:
+  %4 = unchecked_ref_cast %2 to $Builtin.BridgeObject
+  %5 = struct $BridgeObjectWrapper (%4)
+  destroy_value %5
+  br bb4
+
+bb3:
+  destroy_value %2
+  br bb4
+
+bb4:
+  %10 = builtin "infinite_loop_true_condition"() : $Builtin.Int1
+  cond_br %10, bb5, bb6
+
+bb5:
+  br bb1
+
+bb6:
   unreachable
 }

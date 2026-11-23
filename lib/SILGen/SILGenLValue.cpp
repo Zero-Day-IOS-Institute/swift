@@ -43,7 +43,6 @@
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILUndef.h"
 #include "swift/SIL/TypeLowering.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 using namespace swift;
 using namespace Lowering;
@@ -478,8 +477,7 @@ void LogicalPathComponent::writeback(SILGenFunction &SGF, SILLocation loc,
 
   assert(temporary.getType().isAddress());
   auto &tempTL = SGF.getTypeLowering(temporary.getType());
-  if (!tempTL.isAddressOnly() || !isFinal ||
-      !SGF.silConv.useLoweredAddresses()) {
+  if (tempTL.isLoadableOrOpaque(SGF.F) || !isFinal) {
     if (isFinal) temporary.forward(SGF);
     temporary = SGF.emitLoad(loc, temporary.getValue(), tempTL,
                              SGFContext(), IsTake_t(isFinal));
@@ -971,6 +969,43 @@ namespace {
     }
   };
 
+  /// A physical path component which reinterprets the address (or value) of the
+  /// previous physical component as a layout-compatible type with an
+  /// \c unchecked_addr_cast (or \c unchecked_bitcast ).
+  ///
+  /// Unlike UncheckedConversionComponent, this cannot follow a logical
+  /// component, since it must be projected even when assigning.
+  class UncheckedAddressCastComponent : public PhysicalPathComponent {
+  public:
+    UncheckedAddressCastComponent(LValueTypeData typeData)
+        : PhysicalPathComponent(typeData, UncheckedAddressCastKind,
+                                /*actorIsolation=*/std::nullopt) {}
+
+    virtual bool isLoadingPure() const override { return true; }
+
+    ManagedValue project(SILGenFunction &SGF, SILLocation loc,
+                         ManagedValue base) && override {
+      assert(base && "invalid value for cast base");
+      auto toType = getTypeOfRValue();
+      if (base.getType().isObject()) {
+        if (base.getType() == toType)
+          return base;
+        return SGF.B.createUncheckedBitCast(loc, base, toType);
+      }
+
+      auto toAddrType = toType.getAddressType();
+      if (base.getType() == toAddrType)
+        return base;
+      auto Res = SGF.B.createUncheckedAddrCast(loc, base.getValue(),
+                                               toAddrType);
+      return ManagedValue::forFormalAccessedAddress(Res, getAccessKind());
+    }
+
+    void dump(raw_ostream &OS, unsigned indent) const override {
+      OS.indent(indent) << "UncheckedAddressCastComponent\n";
+    }
+  };
+
   /// A physical path component which force-projects the address of
   /// the value of an optional l-value.
   class ForceOptionalObjectComponent : public PhysicalPathComponent {
@@ -1024,11 +1059,11 @@ namespace {
 
   /// A physical path component which projects out an opened archetype
   /// from an existential.
-  class OpenOpaqueExistentialComponent : public PhysicalPathComponent {
+  class OpenAddressExistentialComponent : public PhysicalPathComponent {
   public:
-    OpenOpaqueExistentialComponent(CanArchetypeType openedArchetype,
-                                   LValueTypeData typeData)
-        : PhysicalPathComponent(typeData, OpenOpaqueExistentialKind,
+    OpenAddressExistentialComponent(CanArchetypeType openedArchetype,
+                                    LValueTypeData typeData)
+        : PhysicalPathComponent(typeData, OpenAddressExistentialKind,
                                 /*actorIsolation=*/std::nullopt) {
       assert(getSubstFormalType() == openedArchetype);
     }
@@ -1050,9 +1085,10 @@ namespace {
       auto rep = base.getType().getPreferredExistentialRepresentation();
       switch (rep) {
       case ExistentialRepresentation::COM:
-        llvm_unreachable("opening a COM existential is not implemented");
       case ExistentialRepresentation::Opaque:
         if (!base.getValue()->getType().isAddress()) {
+          assert(rep == ExistentialRepresentation::Opaque &&
+                 "COM existential lvalue must be an address");
           assert(!SGF.useLoweredAddresses());
           auto borrow = SGF.B.createBeginBorrow(
               loc, base.getValue(), IsNotLexical, DoesNotHavePointerEscape);
@@ -1094,7 +1130,7 @@ namespace {
     }
 
     void dump(raw_ostream &OS, unsigned indent) const override {
-      OS.indent(indent) << "OpenOpaqueExistentialComponent("
+      OS.indent(indent) << "OpenAddressExistentialComponent("
                         << getSubstFormalType() << ")\n";
     }
   };
@@ -1211,6 +1247,18 @@ namespace {
 
     virtual bool isLoadingPure() const override { return true; }
 
+    /// Re-form an l-value referring to the same value, without projecting it.
+    /// See `LValue::copyOfValueReference`.
+    LValue copyAsLValue() const {
+      assert(!hasActorIsolation() &&
+             "projecting an actor-isolated component twice would hop twice");
+      LValue lv;
+      lv.add<ValueComponent>(Value, Enforcement, getTypeData(), IsRValue,
+                             /*actorIso=*/std::nullopt,
+                             IsLazyInitializedGlobal);
+      return lv;
+    }
+
     ManagedValue project(SILGenFunction &SGF, SILLocation loc,
                          ManagedValue base) && override {
       assert(!base && "value component must be root of lvalue path");
@@ -1235,16 +1283,16 @@ namespace {
           // handle delayed initialization of the boxes and convert those to
           // initable_but_not_consumable.
           //
-          // `@called(once)` values are always consumed by whatever uses
-          // them, so a non-read access to one must permit consuming it,
-          // unlike an ordinary noncopyable var/let box, which only permits
-          // being fully reassigned.
+          // Function values whose call consumes them are always consumed by
+          // whatever uses them, so a non-read access to one must permit
+          // consuming it, unlike an ordinary noncopyable var/let box, which
+          // only permits being fully reassigned.
           addr = SGF.B.createMarkUnresolvedNonCopyableValueInst(
               loc, addr,
               isReadAccess(getAccessKind())
                   ? MarkUnresolvedNonCopyableValueInst::CheckKind::
                         NoConsumeOrAssign
-              : Value.getType().isCalledOnce()
+              : Value.getType().isCallConsuming()
                   ? MarkUnresolvedNonCopyableValueInst::CheckKind::
                         ConsumableAndAssignable
                   : MarkUnresolvedNonCopyableValueInst::CheckKind::
@@ -1323,6 +1371,12 @@ namespace {
     }
   };
 } // end anonymous namespace
+
+void LValue::addUncheckedAddressCast(LValueTypeData typeData) {
+  assert(isLastComponentPhysical() &&
+         "address cast must follow a physical component");
+  add<UncheckedAddressCastComponent>(typeData);
+}
 
 void LValue::addForceValueComponent(bool isObject, bool isImplicitOptional) {
   auto substFormalType = getSubstFormalType();
@@ -1926,13 +1980,13 @@ namespace {
         if (BaseFormalType) {
           auto selfTy = base.getType().getASTType();
           auto metatypeTy = MetatypeType::get(selfTy);
-          if (selfTy->getClassOrBoundGenericClass()) {
+          if (selfTy->getClassDecl()) {
             selfMetatype = SGF.B
                                .createValueMetatype(
                                    loc, SGF.getLoweredType(metatypeTy), base)
                                .getValue();
           } else {
-            assert(BaseFormalType->getStructOrBoundGenericStruct());
+            assert(BaseFormalType->getStructDecl());
             selfMetatype =
                 SGF.B.createMetatype(loc, SGF.getLoweredType(metatypeTy));
           }
@@ -2458,10 +2512,11 @@ emitUpcastToKeyPath(SILGenFunction &SGF, SILLocation loc,
   assert(typeKind == KPTK_WritableKeyPath ||
          typeKind == KPTK_ReferenceWritableKeyPath);
 
-  auto derivedKeyPathTy = keyPath.getType().castTo<BoundGenericType>();
+  auto &ctx = SGF.getASTContext();
+  auto derivedKeyPathTy = keyPath.getType().castTo<NominalType>();
   auto baseKeyPathTy =
-    BoundGenericType::get(SGF.getASTContext().getKeyPathDecl(),
-                          Type(), derivedKeyPathTy->getGenericArgs())
+    NominalType::get(ctx.getKeyPathDecl(), Type(),
+                     derivedKeyPathTy->getGenericArgs(), ctx)
       ->getCanonicalType();
   return SGF.B.createUpcast(loc, keyPath,
                             SILType::getPrimitiveObjectType(baseKeyPathTy));
@@ -2509,7 +2564,7 @@ namespace {
         projectFn = SGF.getASTContext().getGetAtKeyPath();
         sig = projectFn->getGenericSignature();
 
-        auto keyPathTy = keyPathValue.getType().castTo<BoundGenericType>();
+        auto keyPathTy = keyPathValue.getType().castTo<NominalType>();
         assert(keyPathTy->getGenericArgs().size() == 2);
         assert(keyPathTy->getGenericArgs()[0]->getCanonicalType() ==
                BaseFormalType->getCanonicalType());
@@ -2546,7 +2601,7 @@ namespace {
         llvm_unreachable("bad writable type kind");
       }
 
-      auto keyPathTy = keyPathValue.getType().castTo<BoundGenericType>();
+      auto keyPathTy = keyPathValue.getType().castTo<NominalType>();
       auto subs = keyPathTy->getContextSubstitutionMap();
 
       auto origType = AbstractionPattern::getOpaque();
@@ -2620,7 +2675,7 @@ namespace {
       auto projectFnRef = SGF.B.createManagedFunctionRef(loc, projectFn);
       auto projectFnType = projectFn->getLoweredFunctionType();
 
-      auto keyPathTy = keyPathValue.getType().castTo<BoundGenericType>();
+      auto keyPathTy = keyPathValue.getType().castTo<NominalType>();
       auto subs = keyPathTy->getContextSubstitutionMap();
 
       auto substFnType = projectFnType->substGenericArgs(
@@ -2921,6 +2976,24 @@ LValue LValue::forAddress(SGFAccessKind accessKind, ManagedValue address,
   LValue lv;
   lv.add<ValueComponent>(address, enforcement, typeData);
   return lv;
+}
+
+LValue LValue::copyOfValueReference() const {
+  assert(isValid());
+  if (Path.size() != 1)
+    return LValue();
+
+  auto &component = *Path.front();
+  if (component.getKind() != PathComponent::ValueKind)
+    return LValue();
+
+  // An actor-isolated component would hop to that actor's isolation domain
+  // every time it is projected, so it must not be projected more than once.
+  auto &valueComponent = static_cast<ValueComponent &>(component);
+  if (valueComponent.hasActorIsolation())
+    return LValue();
+
+  return valueComponent.copyAsLValue();
 }
 
 void LValue::addMemberComponent(SILGenFunction &SGF, SILLocation loc,
@@ -3567,6 +3640,25 @@ namespace {
         FormalRValueType(formalRValueType), AccessKind(accessKind) {}
 
     void emitUsingStrategy(AccessStrategy strategy) {
+      // Foreign COM interfaces provide getters and setters, not Swift
+      // coroutine accessors. Materialize read-write accesses through them.
+      if (AccessKind == SGFAccessKind::ReadWrite &&
+          strategy.getKind() == AccessStrategy::DispatchToAccessor) {
+        auto *protocol = dyn_cast<ProtocolDecl>(Storage->getDeclContext());
+        if (protocol && protocol->isCOMInterface()) {
+          strategy = AccessStrategy::getMaterializeToTemporary(
+              AccessStrategy::getAccessor(AccessorKind::Get,
+                                          /*dispatched=*/true),
+              AccessStrategy::getAccessor(AccessorKind::Set,
+                                          /*dispatched=*/true));
+        }
+      }
+
+      // Peephole the (technically computed) modern projection of a stored C
+      // array property so that it behaves like a stored property.
+      if (auto *stored = SILGenModule::findStoredCArrayCounterpart(Storage))
+        return asImpl().emitUsingUncheckedAddressCastOfStorage(stored);
+
       switch (strategy.getKind()) {
       case AccessStrategy::Storage: {
         auto typeData =
@@ -3597,6 +3689,28 @@ namespace {
         return asImpl().emitUsingDistributedThunk();
       }
       llvm_unreachable("unknown kind");
+    }
+
+    /// Project \p stored, the stored property that holds the same value as
+    /// `Storage`, and reinterpret its address as `Storage`'s type.
+    void emitUsingUncheckedAddressCastOfStorage(VarDecl *stored) {
+      if constexpr (std::is_same_v<StorageType, VarDecl>) {
+        // Access the stored property.
+        {
+          llvm::SaveAndRestore<StorageType *> tempStorage(Storage, stored);
+          llvm::SaveAndRestore<CanType> tempFormalRValueType(
+              FormalRValueType, stored->getInterfaceType()->getCanonicalType());
+
+          emitUsingStrategy(AccessStrategy::getStorage());
+        }
+
+        // Bitcast it to the type of the computed property.
+        asImpl().LV.addUncheckedAddressCast(getLogicalStorageTypeData(
+            SGF.getTypeExpansionContext(), SGF.SGM, AccessKind,
+            FormalRValueType));
+      } else {
+        llvm_unreachable("only variables have C array projections");
+      }
     }
 
     void emitUsingAccessor(AccessorKind accessorKind,
@@ -3793,13 +3907,28 @@ void LValue::addNonMemberVarComponent(
       }
 
       if (!address.isLValue()) {
-        assert((AccessKind == SGFAccessKind::BorrowedObjectRead
-                || AccessKind == SGFAccessKind::BorrowedAddressRead)
-               && "non-borrow component requires an address base");
-        LV.add<ValueComponent>(address, std::nullopt, typeData,
-                               /*rvalue*/ true);
-        LV.add<BorrowValueComponent>(typeData);
-        return;
+        switch (AccessKind) {
+        case SGFAccessKind::BorrowedObjectRead:
+        case SGFAccessKind::BorrowedAddressRead:
+        case SGFAccessKind::OwnedAddressRead:
+        case SGFAccessKind::OwnedObjectRead:
+          LV.add<ValueComponent>(address, std::nullopt, typeData,
+                                /*rvalue*/ true);
+          LV.add<BorrowValueComponent>(typeData);
+          return;
+        case SGFAccessKind::OwnedObjectConsume:
+        case SGFAccessKind::OwnedAddressConsume:
+          LV.add<ValueComponent>(address, std::nullopt, typeData,
+                                /*rvalue*/ true);
+          return;
+        
+        case SGFAccessKind::IgnoredRead:
+          llvm_unreachable("should not appear as an lvalue component");
+        case SGFAccessKind::Write:
+        case SGFAccessKind::ReadWrite:
+          // Should be ruled out by the `!isLValue` check above.
+          llvm_unreachable("would have been an lvalue");
+        }
       }
 
       std::optional<SILAccessEnforcement> enforcement;
@@ -4514,7 +4643,7 @@ void LValue::addMemberVarComponent(
         LV.add<RefElementComponent>(Storage, Options, varStorageType,
                                     typeData, ActorIso);
       } else {
-        assert(BaseFormalType->getStructOrBoundGenericStruct());
+        assert(BaseFormalType->getStructDecl());
         LV.add<StructElementComponent>(Storage, varStorageType, typeData,
                                        ActorIso);
       }
@@ -4818,12 +4947,14 @@ LValue SILGenLValue::visitForceValueExpr(ForceValueExpr *e,
     assert((isBorrowAccess(accessKind) || isConsumeAccess(accessKind))
            && "should only see a (force_value (load)) lvalue as part of a "
               "borrow or consume");
-    subExpr = load->getSubExpr();
+    // Borrow the storage in place.
+    if (isBorrowAccess(accessKind))
+      subExpr = load->getSubExpr();
   }
                                          
   // Like BindOptional, this is a read even if we only write to the result.
   // (But it's unnecessary to use a force this way!)
-  LValue lv = visitRec(e->getSubExpr(),
+  LValue lv = visitRec(subExpr,
                        getBaseAccessKindForStorage(accessKind),
                        options.forComputedBaseLValue());
   LValueTypeData typeData =
@@ -4960,6 +5091,17 @@ LValue SILGenLValue::visitLoadExpr(LoadExpr *e, SGFAccessKind accessKind,
 
 LValue SILGenLValue::visitConsumeExpr(ConsumeExpr *e, SGFAccessKind accessKind,
                                       LValueOptions options) {
+
+  // When using lifetime resolution, the consume expr just overrides the access
+  // kind under which we visit the sub expression.
+  if (SGF.getASTContext().SILOpts.EnableLifetimeResolution) {
+    auto loweredTy = SGF.getLoweredType(e->getSubExpr()->getType());
+    auto consumingAccess = loweredTy.isAddress()
+                               ? SGFAccessKind::OwnedAddressConsume
+                               : SGFAccessKind::OwnedObjectConsume;
+    return visitRec(e->getSubExpr(), consumingAccess, options);
+  }
+
   // Do formal evaluation of the base l-value.
   LValue baseLV = visitRec(e->getSubExpr(), SGFAccessKind::ReadWrite,
                            options.forComputedBaseLValue());
@@ -5129,7 +5271,7 @@ ManagedValue SILGenFunction::emitLoad(SILLocation loc, SILValue addr,
                        (isAddrGuaranteed ? C.isGuaranteedPlusZeroOk()
                                           : C.isImmediatePlusZeroOk()));
 
-  if (rvalueTL.isAddressOnly() && silConv.useLoweredAddresses()) {
+  if (!rvalueTL.isLoadableOrOpaque(F)) {
     // If the client is cool with a +0 rvalue, the decl has an address-only
     // type, and there are no conversions, then we can return this as a +0
     // address RValue.
@@ -5196,7 +5338,7 @@ ManagedValue SILGenFunction::emitFormalAccessLoad(SILLocation loc,
       (isTake == IsNotTake && (isAddressGuaranteed ? C.isGuaranteedPlusZeroOk()
                                                  : C.isImmediatePlusZeroOk()));
 
-  if (rvalueTL.isAddressOnly() && silConv.useLoweredAddresses()) {
+  if (!rvalueTL.isLoadableOrOpaque(F)) {
     // If the client is cool with a +0 rvalue, the decl has an address-only
     // type, and there are no conversions, then we can return this as a +0
     // address RValue.
@@ -5440,7 +5582,7 @@ SILValue SILGenFunction::emitSemanticLoad(SILLocation loc,
                                           const TypeLowering &rvalueTL,
                                           IsTake_t isTake) {
   assert(srcTL.getLoweredType().getAddressType() == src->getType());
-  assert(rvalueTL.isLoadable() || !silConv.useLoweredAddresses());
+  assert(rvalueTL.isLoadableOrOpaque(F));
 
   SILType srcType = srcTL.getLoweredType();
   SILType rvalueType = rvalueTL.getLoweredType();
@@ -5851,7 +5993,7 @@ RValue SILGenFunction::emitRValueForStorageLoad(
   if (field->isStatic()) {
     auto baseMeta = base.getType().castTo<MetatypeType>().getInstanceType();
     (void)baseMeta;
-    assert(!baseMeta->is<BoundGenericType>() &&
+    assert(!baseMeta->hasArchetype() &&
            "generic static stored properties not implemented");
     if (field->getDeclContext()->getSelfClassDecl() &&
         field->hasStorage())
@@ -6046,10 +6188,9 @@ SILGenFunction::emitOpenExistentialLValue(SILLocation loc,
     .getPreferredExistentialRepresentation();
   switch (rep) {
   case ExistentialRepresentation::COM:
-    llvm_unreachable("opening a COM existential is not implemented");
   case ExistentialRepresentation::Opaque:
   case ExistentialRepresentation::Boxed: {
-    lv.add<OpenOpaqueExistentialComponent>(openedArchetype, typeData);
+    lv.add<OpenAddressExistentialComponent>(openedArchetype, typeData);
     break;
   }
   case ExistentialRepresentation::Metatype:

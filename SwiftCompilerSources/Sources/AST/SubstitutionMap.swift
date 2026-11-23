@@ -42,7 +42,17 @@ public struct SubstitutionMap: CustomStringConvertible, NoReflectionChildren {
 
   public var isEmpty: Bool { bridged.isEmpty() }
 
-  public var hasAnySubstitutableParams: Bool { bridged.hasAnySubstitutableParams() }
+  public var isEffectivelyGeneric: Bool { bridged.isEffectivelyGeneric() }
+
+  /// Applies `substitutionMap` to the replacement types of this substitution map.
+  ///
+  /// This is used to map a substitution map of an instruction in a callee into the context
+  /// of a caller which calls the callee with `substitutionMap`.
+  /// Archetypes in the replacement types are mapped out of their generic environment before
+  /// `substitutionMap` is applied to them.
+  public func substitute(with substitutionMap: SubstitutionMap) -> SubstitutionMap {
+    SubstitutionMap(bridged: bridged.subst(substitutionMap.bridged))
+  }
 
   public var conformances: ConformanceArray { ConformanceArray(substitutionMap: self) }
 

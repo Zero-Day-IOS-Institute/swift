@@ -149,7 +149,7 @@ option(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB_CROSS_COMPILING
 
 option(SWIFT_USE_SWIFT_EMBEDDED_PLATFORM
        "Whether to build the Embedded Swift standard library using the hooks in swift/EmbeddedPlatform.h"
-       FALSE)
+       TRUE)
 
 set(SWIFT_EMBEDDED_PLATFORM_ABSTRACTION_LAYER_TRIPLE_REGEX "" CACHE STRING
     "If non-empty, embedded Swift target triples matching this regex are
@@ -165,7 +165,9 @@ set(SWIFT_EMBEDDED_STDLIB_INTERFACE_CGM_TRIPLE_REGEX "" CACHE STRING
     built using the Interface code-generation model. Their libraries' object
     files contain real code (rather than the empty/stub objects produced for
     the default Inlinable model), and clients reference the library's strong
-    external symbols instead of re-emitting `linkonce_odr` copies.")
+    external symbols instead of re-emitting `linkonce_odr` copies. Because
+    those archives are what clients link against, they are installed into
+    lib/swift/embedded/<triple>/ alongside the swiftmodules.")
 
 set(SWIFT_EMBEDDED_STDLIB_LTO_TRIPLE_REGEX "" CACHE STRING
     "If non-empty, embedded Swift target triples matching this regex are
@@ -220,10 +222,17 @@ endif()
 
 set(EMBEDDED_STDLIB_TARGET_TRIPLES)
 
+if(SWIFT_WASI_SYSROOT_PATH)
+  set(SWIFT_EMBEDDED_WASI_TRIPLE "${SWIFT_SDK_WASI_ARCH_wasm32_TRIPLE}")
+  if(NOT SWIFT_EMBEDDED_WASI_TRIPLE)
+    swift_wasi_target_triple(SWIFT_EMBEDDED_WASI_TRIPLE)
+  endif()
+endif()
+
 if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB_CROSS_COMPILING)
   if(SWIFT_WASI_SYSROOT_PATH)
     list(APPEND EMBEDDED_STDLIB_TARGET_TRIPLES
-      "wasm32    wasm32-unknown-wasip1    wasm32-unknown-wasip1"
+      "wasm32    ${SWIFT_EMBEDDED_WASI_TRIPLE}    ${SWIFT_EMBEDDED_WASI_TRIPLE}"
     )
   endif()
 
@@ -380,6 +389,9 @@ if(SWIFT_EMBEDDED_STDLIB_SDKS_FOR_TARGET_TRIPLES)
 endif()
 
 if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB)
+  set(EMBEDDED_STDLIB_TARGET_TRIPLES
+    "${EMBEDDED_STDLIB_TARGET_TRIPLES}" PARENT_SCOPE)
+
   get_threading_package(EMBEDDED "embedded" SWIFT_SDK_embedded_THREADING_PACKAGE)
 
   set(triples)

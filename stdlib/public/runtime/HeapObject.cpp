@@ -27,6 +27,7 @@
 #include "swift/Runtime/Debug.h"
 #include "swift/Runtime/CustomRRABI.h"
 #include "swift/Runtime/InstrumentsSupport.h"
+#include "swift/Threading/ThreadSanitizer.h"
 #include "swift/shims/GlobalObjects.h"
 #include "swift/shims/RuntimeShims.h"
 #include <algorithm>
@@ -251,6 +252,60 @@ inline size_t getInstanceAddressPoint(const HeapMetadata *metadata) {
        : 0;
 }
 
+struct InstancePrefix {
+  const void *Template;
+  size_t TemplateSize;
+  size_t AddressPoint;
+};
+
+/// Validate and retrieve the metadata-driven prefix for a heap allocation.
+///
+/// The zero-address-point path intentionally avoids touching the class
+/// descriptor. Ordinary zero-address-point allocations therefore retain their
+/// existing metadata traffic.
+inline InstancePrefix getInstancePrefix(const HeapMetadata *metadata,
+                                        size_t requiredSize,
+                                        size_t requiredAlignmentMask) {
+  size_t offset = getInstanceAddressPoint(metadata);
+  if (offset == 0)
+    return {nullptr, 0, 0};
+
+  if (requiredSize < offset || requiredSize - offset < sizeof(HeapObject))
+    swift::fatalError(0,
+                      "invalid class instance prefix: address point %zu "
+                      "does not fit in allocation size %zu",
+                      offset, requiredSize);
+
+  // The allocation base has the requested alignment. The address point must
+  // preserve it so placement-new constructs a correctly aligned HeapObject.
+  if (offset & requiredAlignmentMask)
+    swift::fatalError(0,
+                      "invalid class instance prefix: address point %zu "
+                      "does not preserve alignment mask %zu",
+                      offset, requiredAlignmentMask);
+
+  auto *classMetadata = static_cast<const ClassMetadata *>(metadata);
+  auto *description = classMetadata->getDescription();
+  if (description == nullptr || !description->hasInstancePrefix())
+    return {nullptr, 0, offset};
+
+  auto *prefix = description->getInstancePrefixDescriptor();
+  if (prefix->Version != ClassInstancePrefixDescriptor::CurrentVersion)
+    swift::fatalError(0,
+                      "unsupported class instance prefix descriptor "
+                      "version %u",
+                      unsigned(prefix->Version));
+
+  size_t size = prefix->PrefixSizeInWords * sizeof(void *);
+  if (size == 0 || size > offset)
+    swift::fatalError(0,
+                      "class instance prefix size %zu does not fit "
+                      "metadata address point %zu",
+                      size, offset);
+
+  return {prefix->PrefixTemplate.get(), size, offset};
+}
+
 // Return a heap object's backing allocation to the allocator.
 //
 // A class instance's pointer may be interior, where the class metadata records
@@ -268,6 +323,8 @@ static HeapObject *_swift_allocObject_(HeapMetadata const *metadata,
                                        size_t requiredSize,
                                        size_t requiredAlignmentMask) {
   assert(isAlignmentMask(requiredAlignmentMask));
+  auto prefix =
+      getInstancePrefix(metadata, requiredSize, requiredAlignmentMask);
 #if SWIFT_STDLIB_HAS_MALLOC_TYPE
   auto allocation = swift_slowAllocTyped(requiredSize, requiredAlignmentMask,
                                           getMallocTypeId(metadata));
@@ -275,7 +332,13 @@ static HeapObject *_swift_allocObject_(HeapMetadata const *metadata,
   auto allocation = swift_slowAlloc(requiredSize, requiredAlignmentMask);
 #endif
 
-  size_t offset = getInstanceAddressPoint(metadata);
+  if (prefix.TemplateSize) {
+    auto *prefixAddress = reinterpret_cast<char *>(allocation) +
+                          prefix.AddressPoint - prefix.TemplateSize;
+    memcpy(prefixAddress, prefix.Template, prefix.TemplateSize);
+  }
+
+  size_t offset = prefix.AddressPoint;
   HeapObject *object =
       reinterpret_cast<HeapObject *>(reinterpret_cast<char *>(allocation) + offset);
 
@@ -301,6 +364,11 @@ HeapObject *swift::swift_allocObject(HeapMetadata const *metadata,
 HeapObject *
 swift::swift_initStackObject(HeapMetadata const *metadata,
                              HeapObject *object) {
+  // Stack promotion currently has no storage representation for native
+  // instance prefixes. IRGen must keep such objects on the common heap path.
+  assert(getInstanceAddressPoint(metadata) == 0 &&
+         "cannot initialize a prefixed class object on the stack");
+
   object->metadata = metadata;
   object->refCounts.initForNotFreeing();
 
@@ -318,6 +386,11 @@ struct InitStaticObjectContext {
 HeapObject *
 swift::swift_initStaticObject(HeapMetadata const *metadata,
                               HeapObject *object) {
+  // Object outlining currently has no way to place the prefix template and
+  // its once token ahead of the native address point.
+  assert(getInstanceAddressPoint(metadata) == 0 &&
+         "cannot initialize a prefixed static class object");
+
   SWIFT_RT_TRACK_INVOCATION(object, swift_initStaticObject);
   // The token is located at a negative offset from the object header.
   swift_once_t *token = ((swift_once_t *)object) - 1;
@@ -530,7 +603,17 @@ SWIFT_ALWAYS_INLINE static HeapObject *_swift_retain_(HeapObject *object) {
 }
 
 #ifdef SWIFT_STDLIB_OVERRIDABLE_RETAIN_RELEASE
+// We play a game with the function's asm name to hide the function body from
+// the compiler. A direct tail call to this function from swift_retain somehow
+// causes swift_retain to have a stack frame. By defining the function under a
+// different name at the C++ level, the compiler doesn't see where the call to
+// _swift_retain_adapter goes, and this prevents it from adding a stack frame.
+// The `used` attribute keeps the definition alive, otherwise the compiler would
+// see this as an unused static and eliminate it entirely.
 SWIFT_REFCOUNT_CC
+static HeapObject *_swift_retain_adapterImpl(HeapObject *object)
+    SWIFT_ASM_LABEL_WITH_PREFIX("_swift_retain_adapter");
+SWIFT_REFCOUNT_CC __attribute__((used))
 static HeapObject *_swift_retain_adapterImpl(HeapObject *object) {
   HeapObject *masked =
       (HeapObject *)((uintptr_t)object & ~heap_object_abi::UntaggedNonNativeBridgeObjectBits);
@@ -538,11 +621,8 @@ static HeapObject *_swift_retain_adapterImpl(HeapObject *object) {
   return object;
 }
 
-// This strange construct prevents the compiler from creating an unnecessary
-// stack frame in swift_retain. A direct tail call to _swift_retain_adapterImpl
-// somehow causes clang to emit a stack frame.
-static HeapObject *(*SWIFT_REFCOUNT_CC volatile _swift_retain_adapter)(
-    HeapObject *object) = _swift_retain_adapterImpl;
+extern "C" SWIFT_REFCOUNT_CC HeapObject *_swift_retain_adapter(
+    HeapObject *object);
 #endif
 
 HeapObject *swift::swift_retain(HeapObject *object) {
@@ -592,6 +672,14 @@ HeapObject *swift::swift_nonatomic_retain_n(HeapObject *object, uint32_t n) {
   return object;
 }
 
+/// Publish a release edge to TSan; this allows it to understand
+/// synchronization when CoW occurs, or deinit runs on another thread
+SWIFT_ALWAYS_INLINE
+static void tsanPublishRelease(HeapObject *object) {
+  if (isValidPointerForNativeRetain(object))
+    tsan::release(object);
+}
+
 SWIFT_ALWAYS_INLINE
 static void _swift_release_impl(HeapObject *object, uint32_t *count) {
   if (isValidPointerForNativeRetain(object))
@@ -607,6 +695,7 @@ static void _swift_release_(HeapObject *object) {
 #ifdef SWIFT_STDLIB_OVERRIDABLE_RETAIN_RELEASE
 SWIFT_REFCOUNT_CC SWIFT_NOINLINE
 static void _swift_release_adapter(HeapObject *object) {
+  tsanPublishRelease(object);
   _swift_release(object);
 }
 #endif
@@ -642,11 +731,25 @@ static void _swift_release_n_(HeapObject *object, uint32_t n) {
     object->refCounts.decrementAndMaybeDeinit(n, nullptr);
 }
 
+#ifdef SWIFT_STDLIB_OVERRIDABLE_RETAIN_RELEASE
+SWIFT_NOINLINE
+static void _swift_release_n_adapter(HeapObject *object, uint32_t n) {
+  tsanPublishRelease(object);
+  _swift_release_n(object, n);
+}
+#endif
+
 void swift::swift_release_n(HeapObject *object, uint32_t n) {
 #ifdef SWIFT_THREADING_NONE
   swift_nonatomic_release_n(object, n);
 #else
-  CALL_IMPL(swift_release_n, (object, n));
+#ifdef SWIFT_STDLIB_OVERRIDABLE_RETAIN_RELEASE
+  if (SWIFT_UNLIKELY(
+          _swift_enableSwizzlingOfAllocationAndRefCountingFunctions_forInstrumentsOnly
+              .load(std::memory_order_relaxed)))
+    return _swift_release_n_adapter(object, n);
+#endif
+  return _swift_release_n_(object, n);
 #endif
 }
 
@@ -916,10 +1019,9 @@ void swift::swift_deallocClassInstance(HeapObject *object,
 
     swift::fatalError(0,
                       "Object %p of class %s deallocated with non-zero retain "
-                      "count %zd. This object's deinit, or something called "
-                      "from it, may have created a strong reference to self "
-                      "which outlived deinit, resulting in a dangling "
-                      "reference.\n",
+                      "count %zd. Possible unsafe concurrent access to stored "
+                      "property containing this object, or escape of self from "
+                      "its deinit.\n",
                       object,
                       descriptor ? descriptor->Name.get() : "<unknown>",
                       retainCount);

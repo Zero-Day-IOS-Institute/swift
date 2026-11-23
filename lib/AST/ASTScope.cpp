@@ -24,16 +24,11 @@
 #include "swift/AST/LazyResolver.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
-#include "swift/AST/ParameterList.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/TypeRepr.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/NullablePtr.h"
-#include "swift/Basic/STLExtras.h"
-#include "llvm/Support/Compiler.h"
-#include <algorithm>
 
 using namespace swift;
 using namespace ast_scope;
@@ -234,6 +229,7 @@ std::string ASTScopeImpl::getClassName() const {
 #define SCOPE_NODE(Name) case ScopeKind::Name: return #Name "Scope";
 #include "swift/AST/ASTScopeNodes.def"
   }
+  llvm_unreachable("covered switch");
 }
 
 std::string GenericTypeOrExtensionScope::getClassName() const {
@@ -254,6 +250,7 @@ NullablePtr<Decl> ASTScopeImpl::getDeclIfAny() const {
 #include "swift/AST/ASTScopeNodes.def"
       return nullptr;
   }
+  llvm_unreachable("covered switch");
 }
 
 NullablePtr<Stmt> ASTScopeImpl::getStmtIfAny() const {
@@ -270,6 +267,7 @@ NullablePtr<Stmt> ASTScopeImpl::getStmtIfAny() const {
 #include "swift/AST/ASTScopeNodes.def"
       return nullptr;
   }
+  llvm_unreachable("covered switch");
 }
 
 NullablePtr<Expr> ASTScopeImpl::getExprIfAny() const {
@@ -286,6 +284,7 @@ NullablePtr<Expr> ASTScopeImpl::getExprIfAny() const {
 #include "swift/AST/ASTScopeNodes.def"
       return nullptr;
   }
+  llvm_unreachable("covered switch");
 }
 
 bool ASTScopeImpl::isDeclAttribute() const {
@@ -300,6 +299,7 @@ bool ASTScopeImpl::isDeclAttribute() const {
 #include "swift/AST/ASTScopeNodes.def"
       return false;
   }
+  llvm_unreachable("covered switch");
 }
 
 SourceManager &ASTScopeImpl::getSourceManager() const {

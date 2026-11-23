@@ -18,10 +18,10 @@
 #ifndef SWIFT_IRGEN_CLASSLAYOUT_H
 #define SWIFT_IRGEN_CLASSLAYOUT_H
 
-#include "llvm/ADT/ArrayRef.h"
 #include "Field.h"
 #include "IRGen.h"
 #include "StructLayout.h"
+#include "llvm/ADT/ArrayRef.h"
 
 namespace swift {
 namespace irgen {
@@ -205,6 +205,8 @@ public:
             Options.contains(ClassMetadataFlags::ClassIsGeneric));
   }
 
+  ArrayRef<ElementLayout> getElements() const { return AllElements; }
+
   std::pair<FieldAccess, ElementLayout>
   getFieldAccessAndElement(Field field) const {
     // FIXME: This is algorithmically terrible.
@@ -222,8 +224,14 @@ public:
     return Options.contains(ClassMetadataFlags::ClassHasObjCImplementation);
   }
 
-  std::optional<uint64_t>
-  computeTypedMallocTypeDescriptor(IRGenModule &IGM, SILType selfType) const;
+  std::optional<uint64_t> computeTypedMallocTypeDescriptor(
+      IRGenModule &IGM, SILType selfType,
+      ArrayRef<SILType> tailElementTypes = {}) const;
+
+private:
+  static void collectAllStoredPropertyTypes(
+      IRGenModule &IGM, SILType classType,
+      SmallVectorImpl<SILType> &fieldTypes);
 };
 
 } // end namespace irgen

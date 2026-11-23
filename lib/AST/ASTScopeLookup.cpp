@@ -29,10 +29,7 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/TypeRepr.h"
-#include "swift/Basic/STLExtras.h"
 #include "swift/ClangImporter/ClangModule.h"
-#include "swift/Parse/Lexer.h"
-#include "llvm/Support/Compiler.h"
 
 using namespace swift;
 using namespace namelookup;
@@ -409,7 +406,12 @@ bool FunctionBodyScope::lookupLocalsOrMembers(
 
 bool SpecializeAttributeScope::lookupLocalsOrMembers(
     DeclConsumer consumer) const {
-  if (auto *params = whatWasSpecialized->getGenericParams())
+  // For an extension, the generic parameters of every enclosing type, not just
+  // the innermost one, e.g. 'T' and 'U' for 'extension Outer.Inner': its scope
+  // is outside the extended type, so no parent scope provides them.
+  bool isExtension = isa<ExtensionDecl>(whatWasSpecialized);
+  for (auto *params = whatWasSpecialized->getGenericParams(); params;
+       params = isExtension ? params->getOuterParameters() : nullptr)
     for (auto *param : params->getParams())
       if (consumer.consume({param}))
         return true;
@@ -533,7 +535,11 @@ NominalTypeScope::getLookupLimitForDecl() const {
 
   // Otherwise, nominals can be nested inside anything but a ProtocolDecl.
   return ancestorWithDeclSatisfying(
-      [&](const Decl *const d) { return isa<ProtocolDecl>(d); });
+      [&](const Decl *const d) -> bool {
+        if (auto *dc = dyn_cast<DeclContext>(d))
+          return dc->getSelfProtocolDecl();
+        return false;
+      });
 }
 
 NullablePtr<const ASTScopeImpl> ExtensionScope::getLookupLimitForDecl() const {

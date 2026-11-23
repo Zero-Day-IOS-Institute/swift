@@ -47,16 +47,24 @@ import SIL
 ///
 let tempLValueElimination = FunctionPass(name: "temp-lvalue-elimination") {
   (function: Function, context: FunctionPassContext) in
+  removeTempLValues(in: function, keepDebugInfo: false, context)
+}
 
+let mandatoryTempLValueElimination = FunctionPass(name: "mandatory-temp-lvalue-elimination") {
+  (function: Function, context: FunctionPassContext) in
+  removeTempLValues(in: function, keepDebugInfo: true, context)
+}
+
+private func removeTempLValues(in function: Function, keepDebugInfo: Bool, _ context: FunctionPassContext) {
   for inst in function.instructions {
     switch inst {
     case let copy as CopyAddrInst:
-      combineWithDestroy(copy: copy, context)
-      tryEliminate(copy: copy, context)
+      combineWithDestroy(copy: copy, keepDebugInfo: keepDebugInfo, context)
+      tryEliminate(copy: copy, keepDebugInfo: keepDebugInfo, context)
     case let store as StoreInst:
       // Also handle `load`-`store` pairs which are basically the same thing as a `copy_addr`.
       if let load = store.source as? LoadInst, load.uses.isSingleUse, load.parentBlock == store.parentBlock {
-        tryEliminate(copy: store, context)
+        tryEliminate(copy: store, keepDebugInfo: keepDebugInfo, context)
       }
     default:
       break
@@ -64,11 +72,14 @@ let tempLValueElimination = FunctionPass(name: "temp-lvalue-elimination") {
   }
 }
 
-private func tryEliminate(copy: CopyLikeInstruction, _ context: FunctionPassContext) {
+private func tryEliminate(copy: CopyLikeInstruction, keepDebugInfo: Bool, _ context: FunctionPassContext) {
   guard let allocStack = copy.sourceAddress as? AllocStackInst,
-        allocStack.isDeallocatedInSameBlock(as: copy),
         !allocStack.parentFunction.hasOwnership || !allocStack.hasDynamicLifetime
   else {
+    return
+  }
+
+  if keepDebugInfo, allocStack.isFromVarDecl || allocStack.isLexical {
     return
   }
   let isTrivial = allocStack.type.isTrivial(in: copy.parentFunction)
@@ -107,13 +118,19 @@ private func tryEliminate(copy: CopyLikeInstruction, _ context: FunctionPassCont
     return
   }
 
-  let firstUseOfAllocStack = InstructionList(first: allocStack).first(where: { $0.isUsing(allocStack) }) ??
-                               // The conservative default, if the fist use is not in the alloc_stack's block.
-                               allocStack.parentBlock.terminator
+  guard let liverangeBegin = allocStack.liverangeBegin(context) else {
+    return
+  }
 
-  if firstUseOfAllocStack == copy.loadingInstruction {
+  if liverangeBegin == copy.loadingInstruction {
     // The alloc_stack is not written yet at the point of the copy. This is a very unusual corner case
     // which can only happen if the alloc_stack has an empty type (e.g. `$()`).
+    return
+  }
+
+  // Writing an enum payload in other blocks than the copy's can prevent promoting the enum to registers,
+  // e.g. a specialized `@out Optional` result which became a stack location.
+  if liverangeBegin.parentBlock != copy.parentBlock && copy.destinationAddress.isInEnumPayload {
     return
   }
 
@@ -134,12 +151,12 @@ private func tryEliminate(copy: CopyLikeInstruction, _ context: FunctionPassCont
 
   var worklist = InstructionWorklist(context)
   defer { worklist.deinitialize() }
-  worklist.pushIfNotVisited(firstUseOfAllocStack)
+  worklist.pushIfNotVisited(liverangeBegin)
 
   // Check instructions within the liverange of the alloc_stack.
   while let inst = worklist.pop() {
     // If the destination root address is within the liverange it would prevent moving the projections
-    // before the first use. Note that if the defining instruction of `destinationRootAddress` is nil
+    // before `liverangeBegin`. Note that if the defining instruction of `destinationRootAddress` is nil
     // it can only be a function argument.
     if inst == destinationRootAddress.definingInstruction {
       return
@@ -167,19 +184,32 @@ private func tryEliminate(copy: CopyLikeInstruction, _ context: FunctionPassCont
       return
     }
 
+    // On this path the destination would receive the alloc_stack's value without passing the copy.
+    // A deallocation in the copy's block can only follow the `load` of a `load`-`store` pair.
+    if let deallocStack = inst as? DeallocStackInst, deallocStack.allocatedValue == allocStack,
+       deallocStack.parentBlock != copy.parentBlock
+    {
+      return
+    }
+
+    // A path back to `liverangeBegin` would execute the early destroy on the alloc_stack's value.
+    if needDestroyEarly && inst.isImmediatePredecessor(of: liverangeBegin) {
+      return
+    }
+
     worklist.pushSuccessors(of: inst, ignoring: copy)
   }
 
-  if allocStack.isReadOrWritten(after: copy.loadingInstruction, aliasAnalysis) {
-    // Bail in the unlikely case of the alloc_stack is re-initialized after its value has been taken by `copy`.
+  if allocStack.isReadOrWritten(after: copy, liverange: worklist, liverangeBegin: liverangeBegin,
+                                aliasAnalysis, context) {
     return
   }
 
-  moveProjections(of: copy.destinationAddress, within: worklist, before: firstUseOfAllocStack, context)
+  moveProjections(of: copy.destinationAddress, within: worklist, before: liverangeBegin, context)
 
   if needDestroyEarly {
     // Make sure the destination is uninitialized before the liverange of the temporary.
-    let builder = Builder(before: firstUseOfAllocStack, context)
+    let builder = Builder(before: liverangeBegin, context)
     builder.createDestroyAddr(address: copy.destinationAddress)
   }
 
@@ -193,9 +223,13 @@ private func tryEliminate(copy: CopyLikeInstruction, _ context: FunctionPassCont
     }
   }
 
+  if keepDebugInfo {
+    Builder(before: copy, context).createDebugStep()
+  }
+
   // Salvage the debug variable attribute, if present.
   if let debugVariable = allocStack.debugVariable {
-    let builder = Builder(before: firstUseOfAllocStack, location: allocStack.location, context)
+    let builder = Builder(before: liverangeBegin, location: allocStack.location, context)
     builder.createDebugValue(value: copy.destinationAddress, debugVariable: debugVariable)
   }
   context.erase(instruction: allocStack)
@@ -240,9 +274,23 @@ private extension FullApplySite {
 ///   copy_addr %source to %destination    -->     copy_addr [take] %source to %destination
 ///   destroy_addr %source
 /// ```
-private func combineWithDestroy(copy: CopyAddrInst, _ context: FunctionPassContext) {
+private func combineWithDestroy(copy: CopyAddrInst, keepDebugInfo: Bool, _ context: FunctionPassContext) {
   guard !copy.isTakeOfSource else {
     return
+  }
+
+  if keepDebugInfo {
+    // Combining degrades debug info if the source is an alloc_stack that has an
+    // associated var decl or is lexical.
+    if let allocStack = copy.source.definingInstruction as? AllocStackInst,
+       allocStack.isFromVarDecl || allocStack.isLexical {
+      return
+    }
+    // Debug values before the copy would become stale after the take, and debug
+    // values between the copy and destroy would be lost.
+    if !copy.source.uses.users(ofType: DebugValueInst.self).isEmpty {
+      return
+    }
   }
 
   // Check if the destroy_addr is after the copy_addr and if there are no memory accesses between them.
@@ -297,6 +345,17 @@ private extension Value {
       default: nil
     }
   }
+
+  var isInEnumPayload: Bool {
+    var a: Value = self
+    while let projection = a.isMovableProjection {
+      if projection.instruction is InitEnumDataAddrInst {
+        return true
+      }
+      a = projection.base
+    }
+    return false
+  }
 }
 
 private func collectMovableProjections(of address: Value, in projections: inout InstructionSet) -> Value {
@@ -326,24 +385,89 @@ private func moveProjections(
 }
 
 private extension AllocStackInst {
-  func isReadOrWritten(after afterInst: Instruction, _ aliasAnalysis: AliasAnalysis) -> Bool {
-    for inst in InstructionList(first: afterInst.next) {
-      if let deallocStack = inst as? DeallocStackInst, deallocStack.allocatedValue == self {
-        return false
-      }
-      if inst.mayReadOrWrite(address: self, aliasAnalysis) {
-        return true
-      }
+  /// Returns the latest instruction which dominates all uses except `dealloc_stack`s.
+  /// That is the use which dominates all other uses or, if there is none, the terminator of the nearest
+  /// block which dominates all uses.
+  func liverangeBegin(_ context: FunctionPassContext) -> Instruction? {
+    if let use = InstructionList(first: self).first(where: { $0.isUsing(self) }) {
+      return use
     }
-    fatalError("dealloc_stack expected to be in same block as `afterInst`")
+    let domTree = context.dominatorTree
+    var dominatingBlock: BasicBlock? = nil
+    for use in uses.ignore(usersOfType: DeallocStackInst.self) {
+      let useBlock = use.instruction.parentBlock
+      var block = dominatingBlock ?? useBlock
+      while !block.dominates(useBlock, domTree) {
+        guard let idom = domTree.getImmediateDominator(of: block) else {
+          return nil
+        }
+        block = idom
+      }
+      dominatingBlock = block
+    }
+    guard let dominatingBlock else {
+      return nil
+    }
+    return dominatingBlock.instructions.first(where: { $0.isUsing(self) }) ?? dominatingBlock.terminator
   }
 
-  func isDeallocatedInSameBlock(as inst: Instruction) -> Bool {
-    if let deallocStack = uses.users(ofType: DeallocStackInst.self).singleElement,
-       deallocStack.parentBlock == inst.parentBlock
-    {
-      return true
+  /// Returns true if the alloc_stack is accessed after `copy` before it is deallocated, or if a path
+  /// from `copy` re-enters the `liverange` other than at a `liverangeBegin` which re-initializes the alloc_stack.
+  func isReadOrWritten(after copy: CopyLikeInstruction, liverange: InstructionWorklist, liverangeBegin: Instruction,
+                       _ aliasAnalysis: AliasAnalysis, _ context: FunctionPassContext) -> Bool {
+    // The `load` and the `store` of a `load`-`store` pair are in the same block.
+    if copy.loadingInstruction != copy {
+      for inst in InstructionList(first: copy.loadingInstruction.next) {
+        if inst == copy {
+          break
+        }
+        if let deallocStack = inst as? DeallocStackInst, deallocStack.allocatedValue == self {
+          return false
+        }
+        if inst.mayReadOrWrite(address: self, aliasAnalysis) {
+          return true
+        }
+      }
+    }
+
+    var worklist = InstructionWorklist(context)
+    defer { worklist.deinitialize() }
+    worklist.pushSuccessors(of: copy)
+
+    while let inst = worklist.pop() {
+      if let deallocStack = inst as? DeallocStackInst, deallocStack.allocatedValue == self {
+        continue
+      }
+      if inst == liverangeBegin && liverangeBegin.isFullInitialization(of: self) {
+        continue
+      }
+      if liverange.hasBeenPushed(inst) || inst.mayReadOrWrite(address: self, aliasAnalysis) {
+        return true
+      }
+      worklist.pushSuccessors(of: inst)
     }
     return false
+  }
+}
+
+private extension Instruction {
+  func isImmediatePredecessor(of other: Instruction) -> Bool {
+    if let next {
+      return next == other
+    }
+    return other.previous == nil && parentBlock.successors.contains(other.parentBlock)
+  }
+
+  func isFullInitialization(of address: Value) -> Bool {
+    switch self {
+    case let store as StoreInst:
+      return store.destination == address
+    case let copy as CopyAddrInst:
+      return copy.destination == address
+    case let apply as ApplyInst:
+      return apply.indirectResultOperands.contains { $0.value == address }
+    default:
+      return false
+    }
   }
 }

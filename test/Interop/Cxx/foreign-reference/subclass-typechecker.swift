@@ -1,0 +1,236 @@
+// RUN: %target-typecheck-verify-swift -cxx-interoperability-mode=default -enable-experimental-feature ForeignReferenceTypeSubclassing -I %S%{fs-sep}Inputs %s -target %target-swift-5.8-abi-triple -verify-additional-file %S%{fs-sep}Inputs%{fs-sep}inherit-frt-subclassing.h
+
+// REQUIRES: swift_feature_ForeignReferenceTypeSubclassing
+
+import InheritFRTSubclassing
+
+final class SwiftSub: SubclassableShared {}
+
+final class SwiftSubOfDerived: DerivedSubclassableShared {}
+
+class NotFinal: SubclassableShared {} // expected-error {{class 'NotFinal' must be 'final' because it subclasses a C++ foreign reference type}}
+
+open class Opened: SubclassableShared {} // expected-error {{class 'Opened' must be 'final' because it subclasses a C++ foreign reference type}}
+
+final class TransitiveSub: SwiftSub {} // expected-error {{inheritance from a final class 'SwiftSub'}}
+
+final class SubOfNonVirtual: NonVirtualShared {} // expected-error {{cannot inherit from non-open class 'NonVirtualShared' outside of its defining module}}
+// TODO: emit a note explaining that the C++ type needs a virtual destructor
+
+final class SubOfFinal: FinalShared {} // expected-error {{inheritance from a final class 'FinalShared'}}
+
+final class SubOfPrivateDtor: PrivateDtorShared {} // expected-error {{cannot inherit from non-open class 'PrivateDtorShared' outside of its defining module}}
+final class SubOfDeletedDtor: DeletedDtorShared {} // expected-error {{cannot inherit from non-open class 'DeletedDtorShared' outside of its defining module}}
+final class SubOfProtectedDtor: ProtectedDtorShared {}
+final class SubOfMultiplyInherited: MultiplyInheritedShared {}
+final class SubOfVirtualBase: VirtualBaseShared {} // expected-error {{cannot inherit from non-open class 'VirtualBaseShared' outside of its defining module}}
+final class SubOfDerivedFromVirtualBase: DerivedFromVirtualBaseShared {} // expected-error {{cannot inherit from non-open class 'DerivedFromVirtualBaseShared' outside of its defining module}}
+final class SubOfImmortal: ImmortalWithVirtualDtor {} // expected-error {{cannot inherit from non-open class 'ImmortalWithVirtualDtor' outside of its defining module}}
+
+final class WithMembers: SubclassableShared {
+  var computed: Int { 0 }
+  func method() {}
+
+  final var okComputed: Int { 0 }
+  final func okMethod() {}
+}
+
+final class Okay: SharedConstructed {
+  let f: Int64
+  init(f: Int64, a: Int32) {
+    self.f = f
+    super.init(a)
+  }
+  convenience init(f: Int64) {
+    self.init(f: f, a: 0)
+  }
+}
+
+final class WrongArgumentType: SharedConstructed {
+  init(s: String) {
+    super.init(s) // expected-error {{cannot convert value of type 'String' to expected argument type 'CInt' (aka 'Int32')}}
+  }
+}
+
+final class OverridesBaseInit: SharedConstructed {
+  override init() { // expected-error {{initializer does not override a designated initializer from its superclass}}
+    super.init()
+  }
+}
+
+final class ConvenienceChainsToSuper: SharedConstructed {
+  convenience init(a: Int32) {
+    super.init() // expected-error {{convenience initializer for 'ConvenienceChainsToSuper' must delegate (with 'self.init') rather than chaining to a superclass initializer (with 'super.init')}}
+  }
+}
+
+// A designated initializer must chain to the base's constructor, not delegate.
+final class DesignatedDelegates: SharedConstructed {
+  let x: Int64 // expected-note {{'x' declared here}}
+  init(x: Int64) { // expected-error {{designated initializer for 'DesignatedDelegates' cannot delegate (with 'self.init'); did you mean this to be a convenience initializer?}}
+    // expected-note@-1 {{'init(x:)' declared here}}
+    self.x = x // expected-error {{'let' property 'x' may not be initialized directly; use "self.init(...)" or "self = ..." instead}}
+    self.init() // expected-note {{delegation occurs here}}
+    // expected-error@-1 {{missing argument for parameter 'x' in call}}
+  }
+}
+
+final class DelegatesWithoutStorage: SharedConstructed {
+  init(a: Int32) { // expected-error {{designated initializer for 'DelegatesWithoutStorage' cannot delegate (with 'self.init'); did you mean this to be a convenience initializer?}}
+    // expected-note@-1 {{'init(a:)' declared here}}
+    self.init() // expected-note {{delegation occurs here}}
+    // expected-error@-1 {{missing argument for parameter 'a' in call}}
+  }
+}
+
+final class InitInExtension: SharedConstructed {}
+extension InitInExtension {
+  init(a: Int32) { // expected-error {{designated initializer cannot be declared in an extension of 'InitInExtension'; did you mean this to be a convenience initializer?}}
+    super.init() // expected-error {{convenience initializer for 'InitInExtension' must delegate (with 'self.init') rather than chaining to a superclass initializer (with 'super.init')}}
+  }
+}
+
+final class WithConvenienceInit: SharedConstructed {
+  let value: Int32
+  init(a: Int32) { // expected-note {{'init(a:)' declared here}}
+    self.value = a
+    super.init()
+  }
+  convenience init(b: Int32) {
+    self.init(a: b)
+  }
+}
+
+// An initializer may omit `super.init` if the base has a no-argument
+// constructor: the call to it is inserted implicitly.
+final class OmitsSuperInit: SubclassableShared {
+  let x: Int64
+  init(x: Int64) { // expected-note {{'init(x:)' declared here}}
+    self.x = x
+  }
+}
+
+// A subclass that declares no initializer of its own gets an implicit default
+// one, as long as its stored properties are default initializable.
+final class DefaultInitialized: SharedConstructed {
+  let x: Int64 = 42
+}
+
+final class NoInitializerOfItsOwn: SubclassableShared { // expected-error {{class 'NoInitializerOfItsOwn' has no initializers}}
+  let x: Int64 // expected-note {{stored property 'x' without initial value prevents synthesized initializers}}
+}
+
+// An initializer declared in an extension of the base is a convenience
+// initializer, which a subclass cannot chain to.
+extension ArgOnlyConstructed {
+  convenience init() { self.init(0) }
+}
+final class NoChainableBaseInit: ArgOnlyConstructed { // expected-error {{class 'NoChainableBaseInit' has no initializers}}
+  let x: Int64 = 42
+}
+
+// A static factory method imported as an initializer allocates a new object, so
+// it cannot construct the base subobject of a subclass.
+final class ChainsToFactory: SharedWithFactory {
+  let x: Int64
+  init(x: Int64) {
+    self.x = x
+    super.init(value: 1) // expected-error {{cannot call 'init(value:)' with 'super.init' because it is not a constructor of 'SharedWithFactory'}}
+  }
+}
+
+final class ChainsToNoArgumentFactory: SharedWithFactoryOnly {
+  init() {
+    super.init() // expected-error {{cannot call 'init()' with 'super.init' because it is not a constructor of 'SharedWithFactoryOnly'}}
+  }
+}
+
+final class OmitsSuperInitToFactory: SharedWithFactoryOnly {
+  let x: Int64
+  init(x: Int64) { // expected-error {{cannot implicitly call 'init()' with 'super.init' because it is not a constructor of 'SharedWithFactoryOnly'}}
+    self.x = x
+  }
+}
+
+final class NoDefaultInitFromFactory: SharedWithFactoryOnly { // expected-error {{class 'NoDefaultInitFromFactory' has no initializers}}
+  let x: Int64 = 42
+}
+
+func constructThem() {
+  _ = DefaultInitialized()
+  _ = OmitsSuperInit(x: 0)
+  _ = WithConvenienceInit(b: 0)
+
+  // The base's constructors cannot be used to construct the subclass.
+  _ = OmitsSuperInit() // expected-error {{missing argument for parameter 'x' in call}}
+  _ = DefaultInitialized(1) // expected-error {{argument passed to call that takes no arguments}}
+  _ = WithConvenienceInit() // expected-error {{missing argument for parameter 'a' in call}}
+  _ = ChainsToFactory(value: 1) // expected-error {{incorrect argument label in call (have 'value:', expected 'x:')}}
+}
+
+enum InitError: Error { case bad }
+
+final class ThrowingDesignatedInit: SharedConstructed {
+  let x: Int64
+  init(fail: Bool) throws { // expected-error {{initializer 'init(fail:)' cannot be throwing because it is declared in a class that subclasses a C++ foreign reference type}}
+    self.x = 1
+    if fail { throw InitError.bad }
+    super.init()
+  }
+}
+
+final class FailableDesignatedInit: SharedConstructed {
+  let x: Int64
+  init?(fail: Bool) { // expected-error {{initializer 'init(fail:)' cannot be failable because it is declared in a class that subclasses a C++ foreign reference type}}
+    self.x = 1
+    if fail { return nil }
+    super.init()
+  }
+}
+
+final class FailableConvenienceInit: SharedConstructed {
+  let x: Int64
+  init(x: Int64) {
+    self.x = x
+    super.init()
+  }
+  convenience init?(maybe: Bool) { // expected-error {{initializer 'init(maybe:)' cannot be failable because it is declared in a class that subclasses a C++ foreign reference type}}
+    if !maybe { return nil }
+    self.init(x: 1)
+  }
+  convenience init(orThrow: Bool) throws { // expected-error {{initializer 'init(orThrow:)' cannot be throwing because it is declared in a class that subclasses a C++ foreign reference type}}
+    if !orThrow { throw InitError.bad }
+    self.init(x: 2)
+  }
+}
+
+final class SubWithDeinit: SubclassableShared {
+  var s = ""
+  deinit {} // expected-error {{deinitializer cannot be declared in class 'SubWithDeinit' because it subclasses a C++ foreign reference type}}
+}
+
+final class GenericSub<T>: SubclassableShared {} // expected-error {{generic class 'GenericSub' cannot be generic because it subclasses a C++ foreign reference type}}
+
+struct GenericOuter<T> {
+  final class NestedSub: SubclassableShared {} // expected-error {{class 'NestedSub' cannot be declared in a generic context because it subclasses a C++ foreign reference type}}
+}
+
+// Only an initializer imported from a C++ constructor can construct the C++
+// base subobject.
+final class CallsFunctionInit: SharedWithFunctionInit {
+  init() { super.init(x: 1) } // expected-error {{cannot call 'init(x:)' with 'super.init' because it is not a constructor of 'SharedWithFunctionInit'}}
+}
+
+extension SharedConstructed {
+  convenience init(twice x: Int32) { self.init(x * 2) } // expected-note {{'init(twice:)' declared here}}
+}
+
+final class CallsConvenienceInit: SharedConstructed {
+  init() { super.init(twice: 1) } // expected-error {{cannot call 'init(twice:)' with 'super.init' because it is not a constructor of 'SharedConstructed'}}
+}
+
+// A subclass doesn't get a default initializer chaining to a no-argument
+// initializer that is not a C++ constructor.
+final class NoDefaultInitFromFunction: SharedWithFunctionDefaultInit { // expected-error {{class 'NoDefaultInitFromFunction' has no initializers}}
+  let x: Int64 = 42
+}

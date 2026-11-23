@@ -26,10 +26,16 @@ internal import WinSDK
 internal import Glibc
 #elseif canImport(Musl)
 internal import Musl
+#elseif canImport(Android)
+internal import Android
 #endif
 
 #if os(macOS)
 @_implementationOnly import BacktracingImpl.OS.Darwin
+#endif
+
+#if os(Linux) || os(Android)
+internal import BacktracingImpl.OS.SafeReadMemory
 #endif
 
 @_spi(MemoryReaders)
@@ -261,13 +267,16 @@ public struct UncachedLocalMemoryReader: MemoryReader {
 }
 #endif
 
-#if os(Linux)
+#if os(Linux) || os(Android)
 @_spi(MemoryReaders) public struct POSIXError: Error {
   var errno: CInt
 }
 
 @_spi(MemoryReaders) public struct MemserverError: Error {
   var message: String
+}
+
+@_spi(MemoryReaders) public struct MemoryReadError: Error {
 }
 
 @_spi(MemoryReaders)
@@ -379,8 +388,9 @@ public struct UncachedRemoteMemoryReader: MemoryReader {
     let size = buffer.count
     var fromIOVec = iovec(iov_base: UnsafeMutableRawPointer(
                             bitPattern: UInt(address)),
-                          iov_len: size)
-    var toIOVec = iovec(iov_base: buffer.baseAddress, iov_len: size)
+                          iov_len: numericCast(size))
+    var toIOVec = iovec(iov_base: buffer.baseAddress,
+                        iov_len: numericCast(size))
     let result = process_vm_readv(pid, &toIOVec, 1, &fromIOVec, 1, 0)
     if result != size {
       throw POSIXError(errno: _swift_get_errno())
@@ -390,15 +400,18 @@ public struct UncachedRemoteMemoryReader: MemoryReader {
 
 @_spi(MemoryReaders)
 public struct UncachedLocalMemoryReader: MemoryReader {
-  private var reader: RemoteMemoryReader
-
-  init() {
-    reader = RemoteMemoryReader(pid: getpid())
-  }
-
   public func fetch(from address: Address,
                     into buffer: UnsafeMutableRawBufferPointer) throws {
-    return try reader.fetch(from: address, into: buffer)
+    let ctx = _swift_begin_reading_memory()
+    defer {
+      _swift_end_reading_memory(ctx)
+    }
+    if !_swift_read_memory(
+      ctx, UnsafeRawPointer(bitPattern: UInt(address)),
+      buffer.baseAddress!, buffer.count
+    ) {
+      throw MemoryReadError()
+    }
   }
 }
 #endif

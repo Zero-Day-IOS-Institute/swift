@@ -15,8 +15,6 @@
 #include "CodeCompletionResultBuilder.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ProtocolConformance.h"
-#include "swift/Basic/Assertions.h"
-#include "swift/IDE/CodeCompletionString.h"
 #include "swift/IDE/CodeCompletionStringPrinter.h"
 
 using namespace swift;
@@ -454,6 +452,7 @@ StringRef CompletionOverrideLookup::getResultBuilderDocComment(
     return "Builds a partial result component by combining an accumulated "
            "component and a new component";
   }
+  llvm_unreachable("covered switch");
 }
 
 void CompletionOverrideLookup::addResultBuilderBuildCompletion(

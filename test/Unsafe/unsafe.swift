@@ -2,6 +2,7 @@
 // RUN: %target-swift-frontend -emit-module-path %t/unsafe_swift_decls.swiftmodule %S/Inputs/unsafe_swift_decls.swift
 
 // RUN: %target-typecheck-verify-swift -strict-memory-safety -I %t
+// RUN: %target-typecheck-verify-swift -Wwarning StrictMemorySafety -I %t
 
 // Make sure everything compiles without error when unsafe code is allowed.
 // RUN: %target-swift-frontend -typecheck %s -I %t
@@ -49,8 +50,7 @@ extension ConformsToMultiP: MultiP {
   // expected-note@-1{{unsafe type 'UnsafeSuper' cannot satisfy safe associated type 'Ptr'}}
   @unsafe func f() -> UnsafeSuper {
     .init() // expected-warning{{expression uses unsafe constructs but is not marked with 'unsafe'}}
-    // expected-note@-1{{argument 'self' in call to initializer 'init' has unsafe type 'UnsafeSuper.Type'}}
-    // expected-note@-2{{reference to initializer 'init()' involves unsafe type 'UnsafeSuper'}}
+    // expected-note@-1{{reference to initializer 'init()' involves unsafe type 'UnsafeSuper'}}
   }
 }
 

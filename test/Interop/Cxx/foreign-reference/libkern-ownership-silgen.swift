@@ -1,6 +1,4 @@
-// RUN: %target-swift-emit-silgen -I %S/Inputs -I %swift_src_root/lib/ClangImporter/SwiftBridging -cxx-interoperability-mode=default -enable-experimental-feature LibkernOwnershipConventions -disable-availability-checking %s | %FileCheck %s
-
-// REQUIRES: swift_feature_LibkernOwnershipConventions
+// RUN: %target-swift-emit-silgen -I %S/Inputs -I %swift_src_root/lib/ClangImporter/SwiftBridging -cxx-interoperability-mode=default -target %target-swift-5.8-abi-triple %s | %FileCheck %s
 
 import LibkernOwnership
 
@@ -42,4 +40,4 @@ _ = OSCollectionIterator.getCollectionIterator()
 
 let derived = DerivedService.derivedWithID(19)
 _ = derived.getProvider()
-// CHECK: sil {{.*}}[clang DerivedService.__synthesizedBaseCall___synthesizedVirtualCall_getProvider{{.*}} -> Optional<Service>
+// CHECK: sil {{.*}}[clang DerivedService.derivedWithID] {{.*}} -> @owned DerivedService

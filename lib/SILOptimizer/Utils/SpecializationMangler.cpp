@@ -13,10 +13,8 @@
 #include "swift/SILOptimizer/Utils/SpecializationMangler.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/GenericSignature.h"
-#include "swift/AST/SubstitutionMap.h"
 #include "swift/Basic/Assertions.h"
 #include "swift/Basic/MD5Stream.h"
-#include "swift/Demangling/ManglingMacros.h"
 #include "swift/SIL/SILGlobalVariable.h"
 #include "llvm/ADT/StringExtras.h"
 
@@ -67,6 +65,19 @@ void FunctionSignatureSpecializationMangler::setArgumentClosurePropPreviousArg(
   auto &Info = OrigArgs[OrigArgIdx];
   Info.kind = ArgumentModifier::ClosurePropPreviousArg;
   Info.otherArgIdx = otherArgIdx;
+}
+
+void FunctionSignatureSpecializationMangler::
+    setArgumentDifferentiableFunctionProp(
+        unsigned OrigArgIdx, SILInstruction *DifferentiableFunction,
+        SILInstruction *OriginalRoot, SILInstruction *JVPRoot,
+        SILInstruction *VJPRoot) {
+  ASSERT(isa<DifferentiableFunctionInst>(DifferentiableFunction));
+  auto &Info = OrigArgs[OrigArgIdx];
+  Info.kind = ArgumentModifier::DifferentiableFunctionProp;
+  Info.differentiableFunctionIdx = DifferentiableFunctions.size();
+  DifferentiableFunctions.push_back(
+      {DifferentiableFunction, OriginalRoot, JVPRoot, VJPRoot});
 }
 
 void FunctionSignatureSpecializationMangler::setArgumentConstantProp(
@@ -149,6 +160,7 @@ FunctionSignatureSpecializationMangler::mangleConstantProp(SILInstruction *const
   case SILInstructionKind::ConvertFunctionInst:
   case SILInstructionKind::UpcastInst:
   case SILInstructionKind::OpenExistentialRefInst:
+  case SILInstructionKind::OpenCOMExistentialInst:
   case SILInstructionKind::MoveValueInst:
     mangleConstantProp(cast<SingleValueInstruction>(constInst->getOperand(0)));
     break;
@@ -268,6 +280,24 @@ FunctionSignatureSpecializationMangler::mangleClosureProp(SILInstruction *Inst) 
   }
 }
 
+void FunctionSignatureSpecializationMangler::mangleDifferentiableFunctionProp(
+    const DifferentiableFunctionInfo &Info) {
+  auto *DFI = cast<DifferentiableFunctionInst>(Info.inst);
+  auto MangleComponent =
+      [&](SILInstruction *Root,
+          NormalDifferentiableFunctionTypeComponent Component) {
+        auto *TTTFI = cast<ThinToThickFunctionInst>(Root);
+        auto *FRI = cast<FunctionRefInst>(TTTFI->getCallee());
+        appendIdentifier(FRI->getReferencedFunction()->getName());
+        appendType(DFI->getExtractee(Component)->getType().getASTType(),
+                   nullptr);
+      };
+  MangleComponent(Info.originalRoot,
+                  NormalDifferentiableFunctionTypeComponent::Original);
+  MangleComponent(Info.jvpRoot, NormalDifferentiableFunctionTypeComponent::JVP);
+  MangleComponent(Info.vjpRoot, NormalDifferentiableFunctionTypeComponent::VJP);
+}
+
 void FunctionSignatureSpecializationMangler::mangleArgument(ArgInfo argInfo) {
   switch (argInfo.kind) {
   case ArgumentModifier::ConstantProp:
@@ -298,6 +328,12 @@ void FunctionSignatureSpecializationMangler::mangleArgument(ArgInfo argInfo) {
 
   case ArgumentModifier::ClosurePropPreviousArg:
     ArgOpBuffer << 'C' << argInfo.otherArgIdx;
+    return;
+
+  case ArgumentModifier::DifferentiableFunctionProp:
+    ArgOpBuffer << 'a';
+    mangleDifferentiableFunctionProp(
+        DifferentiableFunctions[argInfo.differentiableFunctionIdx]);
     return;
 
   default:

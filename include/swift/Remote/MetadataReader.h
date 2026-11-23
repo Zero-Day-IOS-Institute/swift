@@ -51,6 +51,10 @@ using TypeDecoder = swift::Demangle::TypeDecoder<BuilderType>;
 /// which can be malformed or cyclic.
 constexpr int defaultTypeRecursionLimit = 50;
 
+/// The limit on the length of a superclass chain walked in the inspected
+/// process, to protect against corrupt/cyclic data.
+constexpr unsigned maxSuperclassChainLength = 1024;
+
 /// The kind of mangled name to read.
 enum class MangledNameKind {
   Type,
@@ -539,8 +543,9 @@ public:
         // without symbolic references.
 
         auto addr = resolved.getResolvedAddress() + sizeof(int32_t);
-        int32_t offset;
-        Reader->readInteger(addr, &offset);
+        int32_t offset = 0;
+        if (!Reader->readInteger(addr, &offset))
+          return nullptr;
         auto addrOfTypeRef = addr + offset;
         resolved = Reader->getSymbol(addrOfTypeRef);
 
@@ -675,7 +680,11 @@ public:
       size_t start = isaAndRetainCountSize;
 
       auto classMeta = cast<TargetClassMetadata>(meta);
+      unsigned i = 0;
       while (stripSignedPointer(classMeta->Superclass)) {
+        if (i++ >= maxSuperclassChainLength)
+          return std::nullopt;
+
         meta = readMetadata(stripSignedPointer(classMeta->Superclass));
         if (!meta || meta->getKind() != MetadataKind::Class)
           return std::nullopt;
@@ -683,7 +692,10 @@ public:
         classMeta = cast<TargetClassMetadata>(meta);
 
         // Subtract the size contribution of the isa and retain counts from
-        // the super class.
+        // the super class. A superclass claiming to be smaller than its own
+        // header is malformed, and subtracting would wrap.
+        if (classMeta->InstanceSize < isaAndRetainCountSize)
+          return std::nullopt;
         start += classMeta->InstanceSize - isaAndRetainCountSize;
       }
       return start;
@@ -1568,7 +1580,7 @@ public:
     if (sizeof(BaseTy) > existingByteCount) {
       ptr = Reader->template readObj<BaseTy>(address);
       if (!ptr)
-        return -1;
+        return 0;
     }
 
     // We don't know how much memory we need to read to get all the trailing
@@ -1591,11 +1603,11 @@ public:
       if (thisSize > sizeSoFar) {
         // Make sure we haven't ended up with a ridiculous size.
         if (thisSize > MaxMetadataSize)
-          return -1;
+          return 0;
 
         ptr = Reader->readBytes(address, thisSize);
         if (!ptr)
-          return -1;
+          return 0;
         sizeSoFar = thisSize;
       }
     }
@@ -1609,9 +1621,20 @@ public:
     if (!demangledSymbol)
       return nullptr;
     if (demangledSymbol->getKind() == Demangle::Node::Kind::Global) {
-      demangledSymbol = demangledSymbol->getChild(0);
+      auto *global = demangledSymbol;
+      demangledSymbol = global->getChild(0);
       if (!demangledSymbol)
         return nullptr;
+
+      // A module's copy of a back-deployed type's descriptor is prefixed with
+      // a marker node. It describes the same type as the descriptor it
+      // copies.
+      if (demangledSymbol->getKind() ==
+          Demangle::Node::Kind::BackDeploymentCopy) {
+        demangledSymbol = global->getChild(1);
+        if (!demangledSymbol)
+          return nullptr;
+      }
     }
 
     switch (demangledSymbol->getKind()) {
@@ -2273,7 +2296,11 @@ protected:
     switch (metadata->getKind()) {
     case MetadataKind::Class: {
       auto classMeta = cast<TargetClassMetadata>(metadata);
+      unsigned i = 0;
       while (true) {
+        if (i++ >= maxSuperclassChainLength)
+          return RemoteAddress();
+
         if (!classMeta->isTypeMetadata())
           return RemoteAddress();
 
@@ -2730,6 +2757,29 @@ private:
     return buildContextDescriptorManglingForSymbol(descriptor.getSymbol(), dem);
   }
 
+  /// Given a demangled type, returns the unbound nominal a bound generic type
+  /// was formed from, or null if the type is not a bound generic type.
+  Demangle::NodePointer stripBoundGenericArgs(Demangle::NodePointer type) {
+    auto bound = type;
+    if (bound->getKind() == Node::Kind::Type && bound->getNumChildren() == 1)
+      bound = bound->getFirstChild();
+
+    switch (bound->getKind()) {
+    case Node::Kind::BoundGenericClass:
+    case Node::Kind::BoundGenericStructure:
+    case Node::Kind::BoundGenericEnum:
+    case Node::Kind::BoundGenericOtherNominalType:
+    case Node::Kind::BoundGenericTypeAlias:
+      break;
+    default:
+      return nullptr;
+    }
+
+    if (bound->getNumChildren() < 1)
+      return nullptr;
+    return bound->getFirstChild();
+  }
+
   Demangle::NodePointer
   buildContextDescriptorMangling(ContextDescriptorRef descriptor,
                                  Demangler &dem, int recursion_limit) {
@@ -2834,6 +2884,13 @@ private:
           readMangledName(extendedContextAddress, MangledNameKind::Type, dem);
       if (!demangledExtendedContext)
         return nullptr;
+
+      // An extension of a constrained generic type records its extended
+      // context as a bound generic type, but an Extension node's extended
+      // context has to be an unbound nominal, with the arguments described by
+      // the generic signature below. Strip the arguments off.
+      if (auto unbound = stripBoundGenericArgs(demangledExtendedContext))
+        demangledExtendedContext = unbound;
 
       auto demangling = dem.createNode(Node::Kind::Extension);
       demangling->addChild(parentDemangling, dem);
@@ -3227,8 +3284,90 @@ private:
 
     unsigned packIndex = 0;
 
+    // Parameters concretized by a same-type constraint carry no key argument,
+    // so their substitution has to come from the constraint instead. Map each
+    // parameter's position in the flattened parameter list to its depth and
+    // index the same way buildNominalTypeDecl counts levels, since that is how
+    // a constraint's subject names it.
+    std::vector<size_t> paramsPerLevel;
+    {
+      size_t runningCount = 0;
+      std::function<void(ContextDescriptorRef)> countLevels =
+          [&](ContextDescriptorRef current) {
+            if (auto parentContextRef = readParentContextDescriptor(current))
+              if (parentContextRef->isResolved())
+                if (auto parentContext = parentContextRef->getResolved())
+                  countLevels(parentContext);
+
+            auto genericContext = current->getGenericContext();
+            if (genericContext &&
+                (current->getKind() == ContextDescriptorKind::Class ||
+                 current->getKind() == ContextDescriptorKind::Enum ||
+                 current->getKind() == ContextDescriptorKind::Struct)) {
+              auto contextHeader = genericContext->getGenericContextHeader();
+              paramsPerLevel.emplace_back(contextHeader.NumParams -
+                                          runningCount);
+              runningCount += paramsPerLevel.back();
+            }
+          };
+      countLevels(descriptor);
+    }
+
+    // Returns the substitution a same-type constraint fixes the parameter at
+    // the given flattened position to, or a null type if no constraint does.
+    auto substFromSameTypeConstraint = [&](unsigned flatIndex) -> BuiltType {
+      // Find the depth and index this flattened position corresponds to.
+      unsigned depth = 0;
+      unsigned index = flatIndex;
+      for (auto count : paramsPerLevel) {
+        if (index < count)
+          break;
+        index -= count;
+        ++depth;
+      }
+
+      for (auto &req : generics->getGenericRequirements()) {
+        if (req.Flags.getKind() != GenericRequirementKind::SameType) {
+          continue;
+        }
+
+        Demangler dem;
+        auto subjectAddress = resolveRelativeField(descriptor, req.Param);
+        auto subject =
+            readMangledName(subjectAddress, MangledNameKind::Type, dem);
+        if (!subject)
+          continue;
+        if (subject->getKind() == Node::Kind::Type &&
+            subject->getNumChildren() == 1)
+          subject = subject->getFirstChild();
+        if (subject->getKind() != Node::Kind::DependentGenericParamType ||
+            subject->getNumChildren() != 2)
+          continue;
+        auto subjectDepth = subject->getChild(0);
+        auto subjectIndex = subject->getChild(1);
+        if (!subjectDepth->hasIndex() || !subjectIndex->hasIndex())
+          continue;
+        if (subjectDepth->getIndex() != depth ||
+            subjectIndex->getIndex() != index)
+          continue;
+
+        auto typeAddress = resolveRelativeField(descriptor, req.Type);
+        auto type = readMangledName(typeAddress, MangledNameKind::Type, dem);
+        if (!type)
+          continue;
+        auto result = decodeMangledType(type);
+        if (result.isError()) {
+          continue;
+        }
+        return result.getType();
+      }
+      return BuiltType();
+    };
+
+    unsigned flatParamIndex = 0;
     std::vector<BuiltType> builtSubsts;
     for (auto param : generics->getGenericParams()) {
+      unsigned thisParamIndex = flatParamIndex++;
       switch (param.getKind()) {
       case GenericParamKind::Type:
         // The type should have a key argument unless it's been same-typed
@@ -3250,10 +3389,13 @@ private:
             return {};
           builtSubsts.push_back(builtArg);
         } else {
-          // TODO: If the key argument has been concretized by a same-type
-          // constraint, that should be reflected in the built nominal type
-          // decl's generic constraints. This isn't handled correctly yet.
-          return {};
+          // The parameter has been concretized by a same-type constraint, so
+          // the constraint holds the substitution.
+          auto builtArg = substFromSameTypeConstraint(thisParamIndex);
+          if (!builtArg) {
+            return {};
+          }
+          builtSubsts.push_back(builtArg);
         }
         break;
 
@@ -3341,8 +3483,9 @@ private:
       auto it =
           TypeCache.find({getAddress(metadata), skipArtificialSubclasses});
       if (it != TypeCache.end()) {
+        BuiltType cached = it->second;
         TypeCache.erase({getAddress(origMetadata), skipArtificialSubclasses});
-        return it->second;
+        return cached;
       }
     }
 

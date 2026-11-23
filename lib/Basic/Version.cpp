@@ -14,15 +14,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Version.h"
 #include "swift/Basic/LLVM.h"
-#include "clang/Basic/CharInfo.h"
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <vector>
 
 #define TOSTR2(X) #X
 #define TOSTR(X) TOSTR2(X)
@@ -188,8 +184,9 @@ std::optional<Version> Version::getEffectiveLanguageVersion() const {
                   "getCurrentLanguageVersion is no longer correct here");
     return Version::getCurrentLanguageVersion();
 
-  // FIXME: When Swift 7 becomes real, remove 'REQUIRES: swift7' from tests
-  //        using '-swift-version 7'.
+  // FIXME: When Swift 7 becomes real, tests using '-swift-version future' to
+  //        test changes planned for Swift 7 should use '-swift-version 7'
+  //        instead and stop requiring 'swift_future'.
 
   case Version::getFutureMajorLanguageVersion():
     // Allow the future language mode version in asserts compilers *only* so

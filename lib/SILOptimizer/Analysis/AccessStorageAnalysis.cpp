@@ -12,7 +12,6 @@
 
 #define DEBUG_TYPE "sil-sea"
 
-#include "swift/Basic/Assertions.h"
 #include "swift/SILOptimizer/Analysis/AccessStorageAnalysis.h"
 #include "swift/SILOptimizer/Analysis/BasicCalleeAnalysis.h"
 #include "swift/SILOptimizer/Analysis/DestructorAnalysis.h"
@@ -258,6 +257,9 @@ transformCalleeStorage(const StorageAccessInfo &storage,
   case AccessStorage::Yield:
     // Continue to hold on to yields from the callee because we don't have
     // any better placeholder in the callee.
+    return storage;
+  case AccessStorage::BorrowMutateAccessor:
+    // Likewise, continue to hold on to accessor results from the callee.
     return storage;
   case AccessStorage::Unidentified:
     // For unidentified storage, continue to reference the value in the callee

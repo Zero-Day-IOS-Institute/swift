@@ -22,7 +22,7 @@
 // RUN:   -load-plugin-library %t/plugins/%target-library-name(NonExisting)
 
 // RUN: %{python} %S/Inputs/SwiftDepsExtractor.py %t/deps.json MyApp casFSRootID > %t/fs.casid
-// RUN: %cache-tool -cas-path %t/cas -cache-tool-action print-include-tree-list @%t/fs.casid | %FileCheck %s --check-prefix=FS
+// RUN: %cache-tool print-include-tree-list -cas-path %t/cas @%t/fs.casid | %FileCheck %s --check-prefix=FS
 
 // FS: MacroDefinition
 
@@ -33,6 +33,33 @@
 // RUN:   -resolved-plugin-verification \
 // RUN:   -disable-implicit-string-processing-module-import -disable-implicit-concurrency-module-import \
 // RUN:   %s @%t/MyApp.cmd
+
+/// The plugin is an input to the compilation, so it has to appear in the
+/// make-style dependencies, both when produced and when replayed from the CAS.
+// RUN: %target-swift-frontend-plain \
+// RUN:   -typecheck -cache-compile-job -cas-path %t/cas \
+// RUN:   -swift-version 5 -module-name MyApp -O \
+// RUN:   -resolved-plugin-verification -Rcache-compile-job \
+// RUN:   -emit-dependencies -emit-dependencies-path %t/deps.d \
+// RUN:   -disable-implicit-string-processing-module-import -disable-implicit-concurrency-module-import \
+// RUN:   %s @%t/MyApp.cmd 2>&1 | %FileCheck %s --check-prefix=MISS
+// MISS: remark: cache miss
+
+// RUN: %FileCheck %s --check-prefix=DEPS --input-file=%t/deps.d -DLIB=%target-library-name(MacroDefinition)
+
+// RUN: rm %t/deps.d
+// RUN: %target-swift-frontend-plain \
+// RUN:   -typecheck -cache-compile-job -cas-path %t/cas \
+// RUN:   -swift-version 5 -module-name MyApp -O \
+// RUN:   -resolved-plugin-verification -Rcache-compile-job \
+// RUN:   -emit-dependencies -emit-dependencies-path %t/deps.d \
+// RUN:   -disable-implicit-string-processing-module-import -disable-implicit-concurrency-module-import \
+// RUN:   %s @%t/MyApp.cmd 2>&1 | %FileCheck %s --check-prefix=REPLAY
+// REPLAY: remark: replay output file '{{.*}}deps.d'
+
+// RUN: %FileCheck %s --check-prefix=DEPS --input-file=%t/deps.d -DLIB=%target-library-name(MacroDefinition)
+
+// DEPS: plugins{{/|\\}}[[LIB]]
 
 @attached(extension, conformances: P, names: named(requirement))
 macro DelegatedConformance() = #externalMacro(module: "MacroDefinition", type: "DelegatedConformanceViaExtensionMacro")

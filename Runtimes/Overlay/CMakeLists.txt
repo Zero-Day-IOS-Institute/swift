@@ -49,6 +49,7 @@ include(EmitSwiftInterface)
 include(InstallSwiftInterface)
 include(PlatformInfo)
 include(ResourceEmbedding)
+include(FramePointers)
 
 include("${${PROJECT_NAME}_VENDOR_MODULE_DIR}/Settings.cmake" OPTIONAL)
 
@@ -120,8 +121,7 @@ elseif(WIN32)
 elseif(WASI)
   add_subdirectory(WASI)
 elseif(LINUX)
-  defaulted_set(SwiftOverlay_LINUX_LIBC STRING "Select Linux libc flavor. Options are: glibc")
-  add_subdirectory("Linux/${SwiftOverlay_LINUX_LIBC}")
+  add_subdirectory(Linux)
 endif()
 
 if(SwiftOverlay_ENABLE_CXX_INTEROP)

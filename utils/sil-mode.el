@@ -1,3 +1,4 @@
+;; -*- lexical-binding: nil; -*-
 ;;===--- sil-mode.el ------------------------------------------------------===;;
 ;;
 ;; This source file is part of the Swift.org open source project
@@ -144,6 +145,7 @@
    ;; Unchecked Conversions
    `(,(regexp-opt '("upcast"
                     "address_to_pointer" "pointer_to_address"
+                    "value_to_address"
                     "unchecked_addr_cast"
                     "unchecked_ref_cast"
                     "unchecked_trivial_bit_cast"

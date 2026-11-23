@@ -278,7 +278,6 @@ swift_reflection_addReflectionInfo(SwiftReflectionContextRef ContextRef,
         sectionFromInfo<const void *>(Info, Info.type_references),
         sectionFromInfo<const void *>(Info, Info.reflection_strings),
         ReflectionSection<const void *>(nullptr, 0),
-        ReflectionSection<MultiPayloadEnumDescriptorIterator>(0, 0),
         {}};
 
     Context->addReflectionInfo(ContextInfo);
@@ -302,7 +301,6 @@ void swift_reflection_addReflectionMappingInfo(
         reflectionSectionFromLocalAndRemote<const void *>(
             Info.reflection_strings),
         ReflectionSection<const void *>(nullptr, 0),
-        MultiPayloadEnumSection(0, 0),
         {}};
 
     Context->addReflectionInfo(ContextInfo);
@@ -890,6 +888,9 @@ size_t swift_reflection_demangle(const char *MangledName, size_t Length,
   static_cast<void>(err);
 #else
   strncpy(OutDemangledName, Demangled.c_str(), MaxLength);
+  // Always terminate the output string, as long as it has room for a NUL.
+  if (MaxLength > 0)
+    OutDemangledName[MaxLength - 1] = '\0';
 #endif
   return Demangled.size();
 }
@@ -1030,7 +1031,7 @@ swift_reflection_asyncTaskSlabAllocations(SwiftReflectionContextRef ContextRef,
     auto [Error, Info] = Context->asyncTaskSlabAllocations(SlabPtr);
 
     swift_async_task_slab_allocations_return_t Result = {};
-    if (Result.Error) {
+    if (Error) {
       Result.Error = returnableCString(ContextRef, Error);
       return Result;
     }
@@ -1087,6 +1088,7 @@ swift_reflection_asyncTaskInfo(SwiftReflectionContextRef ContextRef,
     Result.IsGroupChildTask = TaskInfo.IsGroupChildTask;
     Result.IsAsyncLetTask = TaskInfo.IsAsyncLetTask;
     Result.IsSynchronousStartTask = TaskInfo.IsSynchronousStartTask;
+    Result.HasSynchronousOperation = TaskInfo.HasSynchronousOperation;
 
     Result.MaxPriority = TaskInfo.MaxPriority;
     Result.IsCancelled = TaskInfo.IsCancelled;
@@ -1102,6 +1104,7 @@ swift_reflection_asyncTaskInfo(SwiftReflectionContextRef ContextRef,
 
     Result.RunJob = TaskInfo.RunJob;
     Result.AllocatorSlabPtr = TaskInfo.AllocatorSlabPtr;
+    Result.RegistryNext = TaskInfo.RegistryNext;
 
     auto *ChildTasks =
         ContextRef
@@ -1160,5 +1163,16 @@ swift_reflection_nextJob(SwiftReflectionContextRef ContextRef,
   return ContextRef->withContext([&](auto *Context) {
     return Context->nextJob(
         RemoteAddress(JobPtr, RemoteAddress::DefaultAddressSpace));
+  });
+}
+
+const char *swift_reflection_iterateTaskRegistry(
+    SwiftReflectionContextRef ContextRef,
+    swift_taskRegistryIterator Call, void *ContextPtr) {
+  return ContextRef->withContext([&](auto *Context) {
+    auto Error = Context->iterateTaskRegistry([&](auto TaskAddr) {
+      Call(TaskAddr, ContextPtr);
+    });
+    return returnableCString(ContextRef, Error);
   });
 }

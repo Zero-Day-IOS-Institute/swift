@@ -14,11 +14,16 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "BitPatternBuilder.h"
 #include "FixedTypeInfo.h"
 #include "GenType.h"
 #include "IRGenModule.h"
 #include "LoadableTypeInfo.h"
 #include "NonFixedTypeInfo.h"
+#include "swift/AST/DiagnosticsIRGen.h"
+#include "llvm/Support/MathExtras.h"
+
+#include <limits>
 
 using namespace swift;
 using namespace irgen;
@@ -324,8 +329,15 @@ public:
   APInt getFixedExtraInhabitantMask(IRGenModule &IGM) const override {
     if (ArraySize == 0)
       return APInt::getAllOnes(0);
-    APInt elementMask = Element.getFixedExtraInhabitantMask(IGM);
-    return elementMask.zext(this->getFixedSize().getValueInBits());
+    unsigned bits = this->getFixedSize().getValueInBits();
+    auto elementMask = Element.getFixedExtraInhabitantMask(IGM);
+    // An element without extra inhabitants can return a one-bit zero mask.
+    if (elementMask.isZero())
+      return APInt::getZero(bits);
+    BitPatternBuilder mask(IGM.Triple.isLittleEndian());
+    mask.append(std::move(elementMask));
+    mask.padWithClearBitsTo(bits);
+    return mask.build().value();
   }
 
   /// Create a constant of the given bit width holding one of the extra
@@ -335,7 +347,11 @@ public:
   APInt getFixedExtraInhabitantValue(IRGenModule &IGM,
                                      unsigned bits,
                                      unsigned index) const override {
-    return Element.getFixedExtraInhabitantValue(IGM, bits, index);
+    BitPatternBuilder value(IGM.Triple.isLittleEndian());
+    value.append(Element.getFixedExtraInhabitantValue(
+        IGM, Element.getFixedSize().getValueInBits(), index));
+    value.padWithClearBitsTo(bits);
+    return value.build().value();
   }
     
   llvm::Value *getExtraInhabitantIndex(IRGenFunction &IGF,
@@ -381,6 +397,18 @@ public:
                        elementTI.isFixedSize(ResilienceExpansion::Minimal),
                        elementTI.isABIAccessible())
   {
+  }
+
+  void printForAbstractTypeLayoutInfo(
+      IRGenModule &IGM, llvm::raw_ostream &OS,
+      unsigned indentation) const override {
+    printForAbstractTypeLayoutInfoBase(IGM, OS, indentation, this);
+  }
+
+  std::unique_ptr<SerializableHiddenTypeInfoRepresentation>
+  createSerializableHiddenTypeInfoRepresentation(
+      IRGenModule &) const override {
+    unsupportedSerializableHiddenTypeInfoRepresentation();
   }
   
   unsigned getExplosionSize() const override {
@@ -510,6 +538,19 @@ public:
                        elementTI.isABIAccessible())
   {
   }
+
+
+  void printForAbstractTypeLayoutInfo(
+      IRGenModule &IGM, llvm::raw_ostream &OS,
+      unsigned indentation) const override {
+    printForAbstractTypeLayoutInfoBase(IGM, OS, indentation, this);
+  }
+
+  std::unique_ptr<SerializableHiddenTypeInfoRepresentation>
+  createSerializableHiddenTypeInfoRepresentation(
+      IRGenModule &) const override {
+    unsupportedSerializableHiddenTypeInfoRepresentation();
+  }
 };
 
 // NOTE: This does not simply use WitnessSizedTypeInfo in order to avoid
@@ -521,6 +562,21 @@ class NonFixedArrayTypeInfo final
                              TypeInfo> {
   using super = ArrayTypeInfoBase<IndirectTypeInfo<NonFixedArrayTypeInfo, TypeInfo>,
                                   TypeInfo>;
+
+public:
+  void printForAbstractTypeLayoutInfo(
+      IRGenModule &IGM, llvm::raw_ostream &OS,
+      unsigned indentation) const override {
+    printForAbstractTypeLayoutInfoBase(IGM, OS, indentation, this);
+  }
+
+  std::unique_ptr<SerializableHiddenTypeInfoRepresentation>
+  createSerializableHiddenTypeInfoRepresentation(
+      IRGenModule &) const override {
+    unsupportedSerializableHiddenTypeInfoRepresentation();
+  }
+
+private:
   
   llvm::Value *getArraySize(IRGenFunction &IGF, SILType T) const override {
     if (auto fixedSize = getFixedArraySize(T)) {
@@ -726,13 +782,31 @@ TypeConverter::convertBuiltinFixedArrayType(BuiltinFixedArrayType *T) {
   if (!fixedSize.has_value() || !elementTI.isFixedSize()) {
     return new NonFixedArrayTypeInfo(IGM.OpaqueTy, elementTI);
   }
-  
+
+  // A fixed-layout type's storage size is recorded in a 32-bit field, so a
+  // fixed-size array whose total byte size does not fit in 32 bits cannot be
+  // represented. In addition, the size in bits must fit for the type's spare
+  // bit mask or a truncated spare bit mask would be created in
+  // getArraySpareBits, called from the LoadableArrayTypeInfo/FixedArrayTypeInfo
+  // ctors below.
+  auto &fixedElementTI = cast<FixedTypeInfo>(elementTI);
+  uint64_t stride = fixedElementTI.getFixedStride().getValue();
+  // SaturatingMultiply clamps to UINT64_MAX on overflow, so an overflowing
+  // product is still caught by the bound check below.
+  uint64_t totalSize = llvm::SaturatingMultiply(*fixedSize, stride);
+  if (totalSize > std::numeric_limits<uint32_t>::max() / 8) {
+    IGM.Context.Diags.diagnose(SourceLoc(), diag::spare_bits_type_too_large,
+                               true, CanType(T));
+    // Fall back to an empty type info so that IRGen can continue far enough to
+    // finish diagnosing; the error prevents any object file from being emitted.
+    return &getEmptyTypeInfo();
+  }
+
   if (*fixedSize <= BuiltinFixedArrayType::MaximumLoadableSize) {
     if (auto *loadableTI = dyn_cast<LoadableTypeInfo>(&elementTI)) {
       return new LoadableArrayTypeInfo(fixedSize.value(), *loadableTI);
     }
   }
-  
-  return new FixedArrayTypeInfo(fixedSize.value(),
-                                *cast<FixedTypeInfo>(&elementTI));
+
+  return new FixedArrayTypeInfo(fixedSize.value(), fixedElementTI);
 }

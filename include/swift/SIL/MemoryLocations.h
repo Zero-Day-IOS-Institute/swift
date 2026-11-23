@@ -21,7 +21,6 @@
 #include "swift/SIL/SILValue.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallBitVector.h"
-#include "llvm/Support/raw_ostream.h"
 
 namespace swift {
 
@@ -318,6 +317,9 @@ private:
   bool analyzeAddrProjection(
     SingleValueInstruction *projection, unsigned parentLocIdx,unsigned fieldNr,
     SmallVectorImpl<SILValue> &collectedVals, SubLocationMap &subLocationMap);
+
+  unsigned addSubLocation(SingleValueInstruction *projection,
+                          unsigned parentLocIdx);
 
   /// Calculates Location::numFieldsNotCoveredBySubfields
   void initFieldsCounter(Location &loc);

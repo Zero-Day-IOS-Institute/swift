@@ -17,27 +17,20 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/AST/DiagnosticsSema.h"
-#include "swift/AST/FileSystem.h"
 #include "swift/AST/Module.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/ModuleInterfaceSupport.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/Serialization/SerializationOptions.h"
-#include "clang/Frontend/CompilerInstance.h"
 #include "clang/Lex/PreprocessorOptions.h"
-#include "llvm/ADT/Hashing.h"
 #include "llvm/Support/xxhash.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/CrashRecoveryContext.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/Errc.h"
 #include "llvm/Support/Regex.h"
-#include "llvm/Support/StringSaver.h"
 #include "llvm/Support/LockFileManager.h"
-#include "llvm/ADT/STLExtras.h"
 
 using namespace swift;
 using FileDependency = SerializationOptions::FileDependency;
@@ -110,7 +103,7 @@ bool ExplicitModuleInterfaceBuilder::collectDepsForSerialization(
   // serializing resource dir inputs we need to check for
   // relative _and_ absolute prefixes.
   SmallString<128> AbsResourcePath(ResourcePath);
-  llvm::sys::fs::make_absolute(AbsResourcePath);
+  (void)fs.makeAbsolute(AbsResourcePath);
 
   auto DTDeps = Instance.getDependencyTracker()->getDependencies();
   SmallVector<std::string, 16> InitialDepNames(DTDeps.begin(), DTDeps.end());
@@ -418,7 +411,7 @@ bool ImplicitModuleInterfaceBuilder::buildSwiftModule(StringRef OutPath,
     // This process may have a different module output path. If the other
     // process doesn't build the interface to this output path, we should try
     // building ourselves.
-    auto bufferOrError = llvm::MemoryBuffer::getFile(OutPath);
+    auto bufferOrError = sourceMgr.getFileSystem()->getBufferForFile(OutPath);
     if (!bufferOrError)
       continue;
     if (ModuleBuffer)

@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -emit-sil -strict-concurrency=complete -disable-availability-checking -parse-as-library -sil-region-isolation-emit-isolation-history -verify %s -o /dev/null
+// RUN: %target-swift-frontend -emit-sil -strict-concurrency=complete -target %target-swift-5.1-abi-triple -parse-as-library -sil-region-isolation-emit-isolation-history -verify %s -o /dev/null
 
 // REQUIRES: concurrency
 
@@ -1578,6 +1578,32 @@ func closure_nested(_ b: NS) async {
   let a = NS()
   let f = { { mergeFn(a, b) }() } // expected-note {{'a' is connected to 'b' which is accessible to code in the current isolation context}}
   useClosure(f)
+  await transferToMain(a) // expected-warning {{sending 'a' risks causing data races}}
+  // expected-note @-1 {{sending 'a' to main actor-isolated global function 'transferToMain' risks causing data races between main actor-isolated code and code in the current isolation context}}
+}
+
+// The result of calling a closure is named after the variable holding the
+// closure, not the mangled name of the closure or thunk that is called.
+
+func identityGeneric<T>(_ t: T) -> T { t }
+
+func closure_call_result_param(_ b: NS, _ f: (NS) -> NS) async {
+  let a = f(b) // expected-note {{'a' is connected to result of 'f()'}}
+  // expected-note @-1 {{result of 'f()' is connected to 'b' which is accessible to code in the current isolation context}}
+  await transferToMain(a) // expected-warning {{sending 'a' risks causing data races}}
+  // expected-note @-1 {{sending 'a' to main actor-isolated global function 'transferToMain' risks causing data races between main actor-isolated code and code in the current isolation context}}
+}
+
+func closure_call_result_reabstracted(_ b: NS) async {
+  let f = identityGeneric({ (x: NS) in x })
+  let a = f(b) // expected-note {{'a' is connected to result of 'f()'}}
+  // expected-note @-1 {{result of 'f()' is connected to 'b' which is accessible to code in the current isolation context}}
+  await transferToMain(a) // expected-warning {{sending 'a' risks causing data races}}
+  // expected-note @-1 {{sending 'a' to main actor-isolated global function 'transferToMain' risks causing data races between main actor-isolated code and code in the current isolation context}}
+}
+
+func closure_call_result_immediately_invoked(_ b: NS) async {
+  let a = { (x: NS) in x }(b) // expected-note {{'a' is connected to 'b' which is accessible to code in the current isolation context}}
   await transferToMain(a) // expected-warning {{sending 'a' risks causing data races}}
   // expected-note @-1 {{sending 'a' to main actor-isolated global function 'transferToMain' risks causing data races between main actor-isolated code and code in the current isolation context}}
 }

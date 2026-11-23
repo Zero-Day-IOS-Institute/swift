@@ -15,7 +15,6 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/MacroDiscriminatorContext.h"
-#include "swift/Basic/Assertions.h"
 
 using namespace swift;
 
@@ -37,7 +36,8 @@ SourceRange MacroExpansionInfo::getSourceRange() const {
     return cast<MacroExpansionExpr>(this)->NAME();                             \
   case FreestandingMacroKind::Decl:                                            \
     return cast<MacroExpansionDecl>(this)->NAME();                             \
-  }
+  }                                                                            \
+  llvm_unreachable("covered switch");
 
 DeclContext *FreestandingMacroExpansion::getDeclContext() const {
   FORWARD_VARIANT(getDeclContext);
@@ -73,4 +73,5 @@ ASTNode FreestandingMacroExpansion::getASTNode() {
   case FreestandingMacroKind::Decl:
     return cast<MacroExpansionDecl>(this);
   }
+  llvm_unreachable("covered switch");
 }

@@ -20,8 +20,8 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/ProtocolConformanceOptions.h"
 #include "swift/AST/Type.h"
-#include "swift/AST/Types.h"
 #include "swift/AST/TypeAlignments.h"
+#include "swift/AST/Types.h"
 #include "swift/AST/Witness.h"
 #include "swift/Basic/Compiler.h"
 #include "swift/Basic/Debug.h"
@@ -29,6 +29,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/FoldingSet.h"
+#include <optional>
 #include <utility>
 
 namespace swift {
@@ -104,6 +105,17 @@ enum class BuiltinConformanceKind {
   Last_Kind = Missing
 };
 
+/// Requirements of COM identity protocols that have compiler-provided
+/// witnesses.
+enum class COMIdentityRequirementKind {
+  InterfaceID,
+  ActivationID,
+};
+
+/// Classify a compiler-managed COM identity requirement.
+std::optional<COMIdentityRequirementKind>
+classifyCOMIdentityRequirement(ValueDecl *requirement);
+
 enum : unsigned {
   NumProtocolConformanceStateBits =
       countBitsUsed(static_cast<unsigned>(ProtocolConformanceState::Last_State))
@@ -174,7 +186,6 @@ protected:
       /// Whether there is an explicit global actor specified for this
       /// conformance.
       HasExplicitGlobalActor : 1,
-      : NumPadBits,
 
       /// Options.
       Options : bitmax(NumProtocolConformanceOptions, 8),
@@ -833,6 +844,12 @@ public:
   CodeGenerationModel
   getEffectiveCodeGenerationModel() const;
 
+  /// Whether this conformance is declared in a generic context with at least
+  /// one generic parameter that is not fixed to a concrete type. A
+  /// conformance such as 'extension Array: P where Element == UInt8' is in a
+  /// generic context but is not effectively generic.
+  bool isEffectivelyGeneric() const;
+
   /// Whether this conformance represents the conformance of one protocol's
   /// conforming types to another protocol.
   ///
@@ -846,6 +863,11 @@ public:
   /// Whether clients from outside the module can rely on the value witnesses
   /// being consistent across versions of the framework.
   bool isResilient() const;
+
+  /// Whether the conforming type and the protocol were originally defined in
+  /// the same module, honoring @_originallyDefinedIn: a type moved into the
+  /// protocol's module is still considered cross-module.
+  bool isOriginallyInSameModuleAsProtocol() const;
 
   /// Retrieve the type witness and type decl (if one exists)
   /// for the given associated type.
@@ -1224,7 +1246,7 @@ public:
   /// Get the declaration context that contains the conforming extension or
   /// nominal type declaration.
   DeclContext *getDeclContext() const {
-    auto bgc = getType()->getClassOrBoundGenericClass();
+    auto bgc = getType()->getClassDecl();
 
     // In some cases, we may not have a BGC handy, in which case we should
     // delegate to the inherited conformance for the decl context.
@@ -1323,6 +1345,7 @@ public:
     case BuiltinConformanceKind::Missing:
       return true;
     }
+    llvm_unreachable("covered switch");
   }
 
   SourceLoc getLoc() const {

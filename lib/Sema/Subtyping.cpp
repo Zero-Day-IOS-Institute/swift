@@ -157,10 +157,10 @@ void swift::constraints::getTypeVariablesWithVariance(
 
 /// Determine whether the candidate type is a subclass of the superclass type.
 bool swift::constraints::isSubclassOf(Type candidateType, Type superclassType) {
-  if (!superclassType->getClassOrBoundGenericClass())
+  if (!superclassType->getClassDecl())
     return false;
 
-  if (!candidateType->getClassOrBoundGenericClass()) {
+  if (!candidateType->getClassDecl()) {
     candidateType = candidateType->getSuperclass();
     if (!candidateType)
       return false;
@@ -207,6 +207,34 @@ std::optional<bool>
 swift::constraints::isLikelyExactMatch(Type lhs, Type rhs) {
   if (!lhs->hasTypeVariable() && !lhs->hasTypeParameter() &&
       !rhs->hasTypeVariable() && !rhs->hasTypeParameter()) {
+    // Hack to deal with matchSendableExistentialToAnyInGenericArgumentPosition().
+    {
+      auto hasAnySendable = [](Type t) -> bool {
+        return t.findIf([](Type t) -> bool {
+          // Don't recurse into protocol compositions.
+          if (t->is<ProtocolCompositionType>())
+            return false;
+          return t->getKnownProtocol() == KnownProtocolKind::Sendable;
+        });
+      };
+
+      auto rewriteAnySendableToAny = [](Type t) -> Type {
+        return t.transformRec([](TypeBase *t) -> std::optional<Type> {
+          // Don't recurse into protocol compositions.
+          if (t->is<ProtocolCompositionType>())
+            return t;
+          if (t->getKnownProtocol() == KnownProtocolKind::Sendable)
+            return t->getASTContext().TheAnyType;
+          return std::nullopt;
+        });
+      };
+
+      if (hasAnySendable(lhs))
+        lhs = rewriteAnySendableToAny(lhs);
+      if (hasAnySendable(rhs))
+        rhs = rewriteAnySendableToAny(rhs);
+    }
+
     return lhs->isEqual(rhs);
   }
 
@@ -231,7 +259,7 @@ swift::constraints::getConversionBehavior(Type type) {
     if (canType->hasParameterPack())
       return true;
 
-    SmallPtrSet<TypeVariableType *, 4> referencedTypeVars;
+    SmallPtrSetVector<TypeVariableType *, 4> referencedTypeVars;
     canType->getTypeVariables(referencedTypeVars);
     for (auto *typeVar : referencedTypeVars) {
       if (typeVar->getImpl().isPackExpansion())
@@ -255,7 +283,20 @@ swift::constraints::getConversionBehavior(Type type) {
     auto structTy = cast<StructType>(canType);
     auto *decl = structTy->getDecl();
 
-    if (decl == ctx.getAnyHashableDecl())
+    // These are all non-generic declarations.
+    if (decl == ctx.getArrayDecl())
+      return ConversionBehavior::Array;
+    else if (decl == ctx.getDictionaryDecl())
+      return ConversionBehavior::Dictionary;
+    else if (decl == ctx.getSetDecl())
+      return ConversionBehavior::Set;
+    else if (decl == ctx.getUnsafePointerDecl() ||
+             decl == ctx.getUnsafeMutablePointerDecl() ||
+             decl == ctx.getAutoreleasingUnsafeMutablePointerDecl())
+      return ConversionBehavior::Pointer;
+
+    // These are all generic declarations.
+    else if (decl == ctx.getAnyHashableDecl())
       return ConversionBehavior::AnyHashable;
     else if (decl == ctx.getStringDecl())
       return ConversionBehavior::String;
@@ -269,34 +310,12 @@ swift::constraints::getConversionBehavior(Type type) {
     return ConversionBehavior::None;
   }
 
-  case TypeKind::BoundGenericStruct: {
-    auto structTy = cast<BoundGenericStructType>(canType);
-    auto *decl = structTy->getDecl();
-
-    if (decl == ctx.getArrayDecl())
-      return ConversionBehavior::Array;
-    else if (decl == ctx.getDictionaryDecl())
-      return ConversionBehavior::Dictionary;
-    else if (decl == ctx.getSetDecl())
-      return ConversionBehavior::Set;
-    else if (decl == ctx.getUnsafePointerDecl() ||
-             decl == ctx.getUnsafeMutablePointerDecl() ||
-             decl == ctx.getAutoreleasingUnsafeMutablePointerDecl())
-      return ConversionBehavior::Pointer;
-
-    return ConversionBehavior::None;
-  }
-
   case TypeKind::Class:
-  case TypeKind::BoundGenericClass:
   case TypeKind::DynamicSelf:
     return ConversionBehavior::Class;
 
-  case TypeKind::Enum:
-    return ConversionBehavior::None;
-
-  case TypeKind::BoundGenericEnum: {
-    auto enumTy = cast<BoundGenericEnumType>(canType);
+  case TypeKind::Enum: {
+    auto enumTy = cast<EnumType>(canType);
     if (enumTy->getDecl() == ctx.getOptionalDecl())
       return ConversionBehavior::Optional;
 
@@ -349,6 +368,7 @@ swift::constraints::getConversionBehavior(Type type) {
 
   case TypeKind::Error:
   case TypeKind::Placeholder:
+  case TypeKind::Hole:
   case TypeKind::UnboundGeneric:
   case TypeKind::Pack:
   case TypeKind::PackExpansion:
@@ -380,6 +400,7 @@ swift::constraints::getConversionBehavior(Type type) {
       canType->dump(out);
     });
   }
+  llvm_unreachable("covered switch");
 }
 
 bool swift::constraints::hasProperSubtypes(Type type) {
@@ -412,6 +433,7 @@ bool swift::constraints::hasProperSubtypes(Type type) {
   case ConversionBehavior::Unknown:
     return true;
   }
+  llvm_unreachable("covered switch");
 }
 
 bool swift::constraints::hasProperSupertypes(Type type) {
@@ -431,7 +453,7 @@ bool swift::constraints::hasProperSupertypes(Type type) {
     if (type->is<DynamicSelfType>())
       return true;
 
-    auto *classDecl = type->getClassOrBoundGenericClass();
+    auto *classDecl = type->getClassDecl();
     return classDecl->getSuperclassDecl();
   }
   case ConversionBehavior::AnyHashable:
@@ -456,6 +478,7 @@ bool swift::constraints::hasProperSupertypes(Type type) {
   case ConversionBehavior::Unknown:
     return true;
   }
+  llvm_unreachable("covered switch");
 }
 
 static ClassDecl *getBridgedObjCClass(ClassDecl *classDecl) {
@@ -465,8 +488,8 @@ static ClassDecl *getBridgedObjCClass(ClassDecl *classDecl) {
 }
 
 static void unwrapTollFreeBridging(Type &lhs, Type &rhs) {
-  auto *lhsDecl = lhs->getClassOrBoundGenericClass();
-  auto *rhsDecl = rhs->getClassOrBoundGenericClass();
+  auto *lhsDecl = lhs->getClassDecl();
+  auto *rhsDecl = rhs->getClassDecl();
 
   if (lhsDecl == nullptr || rhsDecl == nullptr)
     return;
@@ -490,7 +513,7 @@ static void unwrapTollFreeBridging(Type &lhs, Type &rhs) {
 }
 
 static bool isCovariantInstanceType(Type t) {
-  return t->getClassOrBoundGenericClass() ||
+  return t->getClassDecl() ||
          t->is<ArchetypeType>();
 }
 
@@ -499,6 +522,39 @@ bool swift::constraints::canConvertTo(ConformanceCache &cache,
                                       Type lhs, Type rhs,
                                       GenericSignature sig) {
   return !checkConversion(cache, lhs, rhs, sig);
+}
+
+static ConflictReason
+checkExtInfoConversion(ConformanceCache &cache,
+                       FunctionType *lhsFunc,
+                       FunctionType *rhsFunc,
+                       AnyFunctionType::ExtInfo lhsInfo,
+                       AnyFunctionType::ExtInfo rhsInfo,
+                       GenericSignature sig) {
+  if (lhsInfo.isNoEscape() && !rhsInfo.isNoEscape())
+    return ConflictFlag::FunctionNoEscape;
+
+  if (lhsInfo.isAsync() && !rhsInfo.isAsync())
+    return ConflictFlag::FunctionAsync;
+
+  auto lhsThrows = lhsFunc->getEffectiveThrownErrorType();
+  auto rhsThrows = rhsFunc->getEffectiveThrownErrorType();
+  if (lhsThrows.has_value() && !rhsThrows.has_value()) {
+    auto result = isLikelyExactMatch(*lhsThrows,
+                                     lhsFunc->getASTContext().getNeverType());
+    if (result.has_value() && *result)
+      return ConflictFlag::FunctionThrows;
+  }
+
+  if (lhsThrows.has_value() && rhsThrows.has_value()) {
+    auto reason = checkConversion(cache, *lhsThrows, *rhsThrows, sig);
+    if (reason)
+      return reason | ConflictFlag::FunctionThrows;
+  }
+
+  // FIXME: We can't usefully handle isolation (too complex) or Sendable
+  // (depends on preconcurrency context) here.
+  return std::nullopt;
 }
 
 ConflictReason swift::constraints::checkConversion(ConformanceCache &cache,
@@ -632,9 +688,102 @@ ConflictReason swift::constraints::checkConversion(ConformanceCache &cache,
         return result | ConflictFlag::Metatype;
       break;
     }
-    case ConversionBehavior::Function:
-      // FIXME: Implement.
+    case ConversionBehavior::Function: {
+      auto *lhsFunc = lhs->castTo<FunctionType>();
+      auto *rhsFunc = rhs->castTo<FunctionType>();
+
+      auto lhsInfo = lhsFunc->getExtInfo();
+      auto rhsInfo = rhsFunc->getExtInfo();
+      auto reason = checkExtInfoConversion(cache,
+                                           lhsFunc, rhsFunc,
+                                           lhsInfo, rhsInfo, sig);
+      if (reason)
+        return reason;
+
+      auto result = checkConversion(cache,
+                                    lhsFunc->getResult(),
+                                    rhsFunc->getResult(),
+                                    sig);
+      if (result)
+        return result | ConflictFlag::FunctionResult;
+
+      auto lhsParams = lhsFunc->getParams();
+      auto rhsParams = rhsFunc->getParams();
+
+      // Note: getConversionBehavior() guarantees the function types don't
+      // contain any parameter packs, so we may assume their lengths are
+      // known.
+      if (lhsFunc->getNumParams() != rhsFunc->getNumParams()) {
+        // Handle the "tuple splat" special case.
+        if (isSingleTupleParam(rhsParams) &&
+            AnyFunctionType::canComposeTuple(lhsParams)) {
+          // Implode the left-hand side arguments into a tuple and compare
+          // against the right-hand side parameter type.
+          auto lhsType = AnyFunctionType::composeTuple(
+              lhsFunc->getASTContext(),
+              lhsParams,
+              ParameterFlagHandling::IgnoreNonEmpty);
+          auto rhsType = rhsParams[0].getPlainType();
+          auto result = checkConversion(cache, lhsType, rhsType, sig);
+          if (result)
+            return result | ConflictFlag::FunctionTupleSplat;
+
+          // Success.
+          break;
+        } else if (isSingleTupleParam(lhsParams) &&
+                   AnyFunctionType::canComposeTuple(rhsParams)) {
+          // Implode the right-hand side parameters into a tuple and
+          // compare against the left-hand side argument type.
+          auto lhsType = lhsParams[0].getPlainType();
+          auto rhsType = AnyFunctionType::composeTuple(
+              lhsFunc->getASTContext(),
+              lhsParams,
+              ParameterFlagHandling::IgnoreNonEmpty);
+          auto result = checkConversion(cache, lhsType, rhsType, sig);
+          if (result)
+            return result | ConflictFlag::FunctionTupleSplat;
+
+          // Success.
+
+        }
+
+        // Otherwise, it's a conflict.
+        return ConflictReason(ConflictFlag::FunctionParamCount);
+      }
+
+      // Check each parameter against each argument.
+      for (unsigned i : indices(lhsParams)) {
+        auto lhsParam = lhsParams[i];
+        auto rhsParam = rhsParams[i];
+
+        if (lhsParam.isInOut() != rhsParam.isInOut() &&
+            (!lhsParam.getPlainType()->is<TypeVariableType>() ||
+             !lhsParam.getPlainType()->castTo<TypeVariableType>()->getImpl().canBindToInOut())) {
+          return ConflictReason(ConflictFlag::FunctionParamFlags);
+        }
+
+        if (lhsParam.isVariadic() != rhsParam.isVariadic())
+          return ConflictReason(ConflictFlag::FunctionParamFlags);
+
+        Type paramType;
+        if (lhsParam.isInOut() || lhsParam.isVariadic()) {
+          auto result = isLikelyExactMatch(lhsParam.getPlainType(),
+                                           rhsParam.getPlainType());
+          if (result.has_value() && !*result)
+            return ConflictReason(ConflictFlag::FunctionParamType);
+        } else {
+          auto result = checkConversion(cache,
+                                        rhsParam.getPlainType(),
+                                        lhsParam.getPlainType(),
+                                        sig);
+          if (result)
+            return result | ConflictFlag::FunctionParamType;
+        }
+      }
+
       break;
+    }
+
     case ConversionBehavior::InOut:
     case ConversionBehavior::LValue: {
       // InOut-to-InOut and LValue-to-LValue conversions are invariant.
@@ -854,7 +1003,7 @@ static void decomposeConstraintType(Type t,
 
     anyObject |= compositionTy->hasExplicitAnyObject();
     invertible |= compositionTy->getInverses();
-  } else if (t->getClassOrBoundGenericClass()) {
+  } else if (t->getClassDecl()) {
     superclass = t;
   } else {
     ABORT([&](auto &out) {
@@ -985,7 +1134,9 @@ static Type superclassJoinMeetImpl(Operation op, Type lhs, Type rhs) {
     unsigned i = std::min(lhsSuper.size(), rhsSuper.size());
     while (i > 0) {
       --i;
-      if (lhsSuper[i]->isEqual(rhsSuper[i]))
+      auto result = isLikelyExactMatch(lhsSuper[i], rhsSuper[i]);
+      ASSERT(result);
+      if (*result)
         return lhsSuper[i];
     }
   } else {
@@ -999,81 +1150,145 @@ static Type superclassJoinMeetImpl(Operation op, Type lhs, Type rhs) {
   return Type();
 }
 
+/// Joins or meets the properties of \p lhsInfo and \p rhsInfo that can depend
+/// on a type, along with the types they depend on, into \p result. Returns
+/// std::nullopt if the result can't be represented.
+///
+/// Each such property has a least restrictive value, e.g. @Sendable rather than
+/// non-Sendable, and a dependent type stands for whether the property has that
+/// value.
+static std::optional<ASTExtInfoBuilder>
+joinMeetTypeDependencies(Operation op, AnyFunctionType::ExtInfo lhsInfo,
+                         AnyFunctionType::ExtInfo rhsInfo,
+                         ASTExtInfoBuilder result) {
+  auto isLeastRestrictive = [](TypeDependenceKind kind,
+                               AnyFunctionType::ExtInfo info) {
+    switch (kind) {
+    case TypeDependenceKind::Sendable:
+      return info.isSendable();
+    case TypeDependenceKind::ExecutionSemantics:
+      return !info.hasCalledAtMostOnceSemantics();
+    }
+    llvm_unreachable("unhandled kind");
+  };
+
+  // While a property depends on a type, it keeps its default value.
+  auto setTypeDependency = [&](TypeDependenceKind kind, Type type) {
+    switch (kind) {
+    case TypeDependenceKind::Sendable:
+      result = result.withSendable(false);
+      break;
+    case TypeDependenceKind::ExecutionSemantics:
+      result = result.withExecutionSemantics(std::nullopt);
+      break;
+    }
+    result = result.withTypeDependency(kind, type);
+  };
+
+  auto dropTypeDependency = [&](TypeDependenceKind kind,
+                                AnyFunctionType::ExtInfo from) {
+    switch (kind) {
+    case TypeDependenceKind::Sendable:
+      result = result.withSendable(from.isSendable());
+      break;
+    case TypeDependenceKind::ExecutionSemantics:
+      result = result.withExecutionSemantics(from.getExecutionSemantics());
+      break;
+    }
+    result = result.withTypeDependency(kind, Type());
+  };
+
+  auto joinMeetConcrete = [&](TypeDependenceKind kind) {
+    switch (kind) {
+    case TypeDependenceKind::Sendable:
+      result = result.withSendable(
+          op == Operation::Join ? lhsInfo.isSendable() && rhsInfo.isSendable()
+                                : lhsInfo.isSendable() || rhsInfo.isSendable());
+      break;
+    case TypeDependenceKind::ExecutionSemantics: {
+      // The join suppresses the invertible protocols that either side does,
+      // and the meet those that both sides do.
+      auto inverses =
+          getSuppressedInvertibleProtocols(lhsInfo.getExecutionSemantics());
+      auto rhsInverses =
+          getSuppressedInvertibleProtocols(rhsInfo.getExecutionSemantics());
+      if (op == Operation::Join)
+        inverses.insertAll(rhsInverses);
+      else
+        inverses.intersect(rhsInverses);
+      result = result.withExecutionSemantics(
+          getExecutionSemanticsSuppressing(inverses));
+      break;
+    }
+    }
+  };
+
+  for (unsigned i = 0; i != NumTypeDependenceKinds; ++i) {
+    auto kind = TypeDependenceKind(i);
+    auto lhsDep = lhsInfo.getTypeDependencyFor(kind);
+    auto rhsDep = rhsInfo.getTypeDependencyFor(kind);
+
+    if (!lhsDep && !rhsDep) {
+      joinMeetConcrete(kind);
+      continue;
+    }
+
+    if (lhsDep && rhsDep) {
+      // We cannot represent the meet of two dependent types.
+      if (op == Operation::Meet)
+        return std::nullopt;
+
+      // A tuple conforms to a protocol iff all of its elements do, so the
+      // join has the least restrictive value iff both dependent types give it.
+      TupleTypeElt elts[] = {lhsDep, rhsDep};
+      setTypeDependency(kind, TupleType::get(elts, lhsDep->getASTContext()));
+      continue;
+    }
+
+    // The join keeps the dependence if the other side has the least
+    // restrictive value, and the meet if it doesn't. Otherwise, the other
+    // side's value is the result.
+    auto otherInfo = lhsDep ? rhsInfo : lhsInfo;
+    if (isLeastRestrictive(kind, otherInfo) == (op == Operation::Join))
+      setTypeDependency(kind, lhsDep ? lhsDep : rhsDep);
+    else
+      dropTypeDependency(kind, otherInfo);
+  }
+
+  return result;
+}
+
 static std::optional<AnyFunctionType::ExtInfo>
 extInfoJoinMeetImpl(Operation op,
                     AnyFunctionType::ExtInfo lhsInfo,
                     AnyFunctionType::ExtInfo rhsInfo) {
-  bool noEscape, sendable, throwing;
-  Type sendableDep;
+  bool noEscape, throwing, async;
   Type thrownError;
 
   // Concurrency is too hard to reason about here.
   if (lhsInfo.getIsolation() != rhsInfo.getIsolation())
     return std::nullopt;
 
-  auto lhsSendableDep = lhsInfo.getSendableDependentType();
-  auto rhsSendableDep = rhsInfo.getSendableDependentType();
-
   if (op == Operation::Join) {
     noEscape = lhsInfo.isNoEscape() || rhsInfo.isNoEscape();
-
-    if (lhsSendableDep && rhsSendableDep) {
-      // Form a tuple; its Sendable iff both components are Sendable.
-      SmallVector<TupleTypeElt, 2> elts;
-      elts.push_back(lhsSendableDep);
-      elts.push_back(rhsSendableDep);
-      sendableDep = TupleType::get(elts, lhsSendableDep->getASTContext());
-      sendable = false;
-    } else if (lhsSendableDep && !rhsSendableDep) {
-      if (rhsInfo.isSendable())
-        sendableDep = lhsSendableDep;
-      sendable = false;
-    } else if (!lhsSendableDep && rhsSendableDep) {
-      if (lhsInfo.isSendable())
-        sendableDep = rhsSendableDep;
-      sendable = false;
-    } else {
-      sendable = lhsInfo.isSendable() && rhsInfo.isSendable();
-    }
+    async = lhsInfo.isAsync() || rhsInfo.isAsync();
 
     throwing = lhsInfo.isThrowing() || rhsInfo.isThrowing();
-    Type thrownError;
     if (throwing) {
       // Join is only typed-throws if both functions are typed throws.
       auto lhsThrownError = lhsInfo.getThrownError();
       auto rhsThrownError = rhsInfo.getThrownError();
       if (lhsThrownError && rhsThrownError) {
-        auto result = isLikelyExactMatch(thrownError, rhsThrownError);
+        auto result = isLikelyExactMatch(lhsThrownError, rhsThrownError);
         if (result && *result)
           thrownError = lhsThrownError;
       }
     }
   } else {
     noEscape = lhsInfo.isNoEscape() && rhsInfo.isNoEscape();
-
-    if (lhsSendableDep && rhsSendableDep) {
-      // We cannot represent the meet of two sendable-dependent types.
-      return std::nullopt;
-    } else if (lhsSendableDep && !rhsSendableDep) {
-      if (rhsInfo.isSendable()) {
-        sendable = true;
-      } else {
-        sendable = false;
-        sendableDep = lhsSendableDep;
-      }
-    } else if (!lhsSendableDep && rhsSendableDep) {
-      if (lhsInfo.isSendable()) {
-        sendable = true;
-      } else {
-        sendable = false;
-        sendableDep = rhsSendableDep;
-      }
-    } else {
-      sendable = lhsInfo.isSendable() || rhsInfo.isSendable();
-    }
+    async = lhsInfo.isAsync() && rhsInfo.isAsync();
 
     throwing = lhsInfo.isThrowing() && rhsInfo.isThrowing();
-    Type thrownError;
     if (throwing) {
       auto lhsThrownError = lhsInfo.getThrownError();
       auto rhsThrownError = rhsInfo.getThrownError();
@@ -1081,21 +1296,30 @@ extInfoJoinMeetImpl(Operation op,
       // Meet is typed-throws if at least one is typed throws.
       if (!lhsThrownError) {
         thrownError = rhsThrownError;
+      } else if (!rhsThrownError) {
+        thrownError = lhsThrownError;
       } else {
-        auto result = isLikelyExactMatch(thrownError, rhsThrownError);
-        if (result && !*result)
+        bool uninhabited = false;
+        thrownError = subtypeMeet(lhsThrownError, rhsThrownError,
+                                  &uninhabited);
+        if (uninhabited) {
+          throwing = false;
           thrownError = Type();
+        }
       }
     }
   }
 
   // FIXME: Implement everything else!
-  return lhsInfo.intoBuilder()
-      .withNoEscape(noEscape)
-      .withThrows(throwing, thrownError)
-      .withSendable(sendable)
-      .withSendableDependentType(sendableDep)
-      .build();
+  auto result = lhsInfo.intoBuilder()
+                    .withNoEscape(noEscape)
+                    .withThrows(throwing, thrownError)
+                    .withAsync(async);
+
+  auto combined = joinMeetTypeDependencies(op, lhsInfo, rhsInfo, result);
+  if (!combined)
+    return std::nullopt;
+  return combined->build();
 }
 
 static Type subtypeJoinMeetImpl(Operation op, Type lhs, Type rhs,
@@ -1191,7 +1415,7 @@ static Type subtypeJoinMeetImpl(Operation op, Type lhs, Type rhs,
       auto result = rec(lhsElt, rhsElt);
 
       auto &ctx = lhs->getASTContext();
-      return BoundGenericType::get(ctx.getSetDecl(), Type(), result);
+      return NominalType::get(ctx.getSetDecl(), Type(), result, ctx);
     }
 
     case ConversionBehavior::Double:
@@ -1216,26 +1440,26 @@ static Type subtypeJoinMeetImpl(Operation op, Type lhs, Type rhs,
       auto *lhsFunc = lhs->castTo<FunctionType>();
       auto *rhsFunc = rhs->castTo<FunctionType>();
 
-      auto result = rec(lhsFunc->getResult(), rhsFunc->getResult());
-
-      SmallVector<AnyFunctionType::Param, 4> params;
-
       // Note: getConversionBehavior() guarantees the function types don't
       // contain any parameter packs, so we may assume their lengths are
       // known.
       if (lhsFunc->getNumParams() != rhsFunc->getNumParams())
         return fail();
 
+      auto result = rec(lhsFunc->getResult(), rhsFunc->getResult());
+
+      SmallVector<AnyFunctionType::Param, 4> params;
+
       for (unsigned i : indices(lhsFunc->getParams())) {
         auto lhsParam = lhsFunc->getParams()[i];
         auto rhsParam = rhsFunc->getParams()[i];
 
-        if (lhsParam.getParameterFlags() != rhsParam.getParameterFlags())
+        if (lhsParam.getParameterFlags() != rhsParam.getParameterFlags() ||
+            lhsParam.getAccessScope() != rhsParam.getAccessScope())
           return fail();
 
         Type paramType;
         if (lhsParam.isInOut() || lhsParam.isVariadic()) {
-          ASSERT(rhsParam.isInOut());
           auto result = isLikelyExactMatch(lhsParam.getPlainType(),
                                            rhsParam.getPlainType());
           if (!result)
@@ -1263,13 +1487,54 @@ static Type subtypeJoinMeetImpl(Operation op, Type lhs, Type rhs,
         params.push_back(lhsParam.withType(paramType));
       }
 
+      if (lhsFunc->getNumYields() != rhsFunc->getNumYields())
+        return fail();
+
+      SmallVector<AnyFunctionType::Yield, 4> yields;
+      for (unsigned i : indices(lhsFunc->getYields())) {
+        auto lhsYield = lhsFunc->getYields()[i];
+        auto rhsYield = rhsFunc->getYields()[i];
+
+        if (lhsYield.getFlags() != rhsYield.getFlags())
+          return fail();
+        
+        Type yieldType;
+        if (lhsYield.isInOut()) {
+          ASSERT(rhsYield.isInOut());
+          auto result = isLikelyExactMatch(lhsYield.getType(),
+                                           rhsYield.getType());
+          if (!result)
+            return fail();
+          if (!*result)
+            return fail();
+
+          yieldType = lhsYield.getType();
+        } else if (op == Operation::Join) {
+          bool uninhabited = false;
+          yieldType = subtypeMeet(lhsYield.getType(),
+                                  rhsYield.getType(),
+                                  &uninhabited);
+          if (uninhabited)
+            return fail();
+        } else {
+          bool existentialUpperBound = false;
+          yieldType = subtypeJoin(lhsYield.getType(),
+                                  rhsYield.getType(),
+                                  &existentialUpperBound);
+          if (existentialUpperBound)
+            return fail();
+        }
+
+        yields.push_back(lhsYield.withType(yieldType));
+      }
+      
       auto extInfo = extInfoJoinMeetImpl(op,
                                          lhsFunc->getExtInfo(),
                                          rhsFunc->getExtInfo());
-      if(!extInfo.has_value())
+      if (!extInfo.has_value())
         return fail();
 
-      return FunctionType::get(params, result, *extInfo);
+      return FunctionType::get(params, yields, result, *extInfo);
     }
 
     case ConversionBehavior::Metatype: {
@@ -1331,7 +1596,7 @@ static Type subtypeJoinMeetImpl(Operation op, Type lhs, Type rhs,
       auto result = existentialConstraintJoinMeetImpl(op, lhs, rhs);
       if (!result)
         return fail();
-      if (result->getClassOrBoundGenericClass())
+      if (result->getClassDecl())
         return result;
       ASSERT(!result->is<ExistentialType>());
       return ExistentialType::get(result);
@@ -1344,7 +1609,7 @@ static Type subtypeJoinMeetImpl(Operation op, Type lhs, Type rhs,
           op, lhsConstraint, rhsConstraint);
       if (!result)
         return fail();
-      if (result->getClassOrBoundGenericClass())
+      if (result->getClassDecl())
         return MetatypeType::get(result);
       ASSERT(!result->is<ExistentialType>());
       return ExistentialMetatypeType::get(result);
@@ -1498,9 +1763,11 @@ Type swift::constraints::subtypeMeet(Type lhs, Type rhs,
 /// This could almost use Type::transformWithPosition(), however that would give
 /// us no way to construct the correct locator.
 static Type openTypeJoinsAndMeetsRec(ConstraintSystem &cs, Type type,
-                                     ConstraintLocatorBuilder locator) {
+                                     ConstraintLocatorBuilder locator,
+                                     bool allowNoEscape) {
   auto rec = [&](Type type, LocatorPathElt elt,
-                 std::optional<LocatorPathElt> secondElt=std::nullopt) -> Type {
+                 bool allowNoEscape = false,
+                 std::optional<LocatorPathElt> secondElt = std::nullopt) -> Type {
     if (!type->hasJoinOrMeet())
       return type;
 
@@ -1508,44 +1775,47 @@ static Type openTypeJoinsAndMeetsRec(ConstraintSystem &cs, Type type,
     return openTypeJoinsAndMeetsRec(cs, type,
                                     (secondElt.has_value()
                                      ? subLocator.withPathElement(*secondElt)
-                                     : subLocator));
+                                     : subLocator),
+                                    allowNoEscape);
   };
 
   if (type->is<MeetType>() || type->is<JoinType>()) {
     unsigned options = TVO_PrefersSubtypeBinding | TVO_CanBindToHole;
+    if (allowNoEscape)
+      options |= TVO_CanBindToNoEscape;
     return cs.createTypeVariable(cs.getConstraintLocator(locator), options);
   }
 
   switch (getConversionBehavior(type)) {
   case ConversionBehavior::Optional: {
     auto result = rec(type->getOptionalObjectType(),
-                      LocatorPathElt::GenericArgument(0));
+                      ConstraintLocator::OptionalPayload);
     return OptionalType::get(result);
   }
 
   case ConversionBehavior::Array: {
-    auto *boundTy = type->castTo<BoundGenericStructType>();
+    auto *boundTy = type->castTo<StructType>();
     auto result = rec(boundTy->getGenericArgs()[0],
                       LocatorPathElt::GenericArgument(0));
     return ArraySliceType::get(result);
   }
 
   case ConversionBehavior::Dictionary: {
-    auto *boundTy = type->castTo<BoundGenericStructType>();
+    auto *boundTy = type->castTo<StructType>();
     auto keyTy = rec(boundTy->getGenericArgs()[0],
-                      LocatorPathElt::GenericArgument(0));
+                     LocatorPathElt::GenericArgument(0));
     auto valueTy = rec(boundTy->getGenericArgs()[1],
                        LocatorPathElt::GenericArgument(1));
     return DictionaryType::get(keyTy, valueTy);
   }
 
   case ConversionBehavior::Set: {
-    auto *boundTy = type->castTo<BoundGenericStructType>();
+    auto *boundTy = type->castTo<StructType>();
     auto eltTy = rec(boundTy->getGenericArgs()[0],
                      LocatorPathElt::GenericArgument(0));
 
     auto &ctx = cs.getASTContext();
-    return BoundGenericType::get(ctx.getSetDecl(), Type(), eltTy);
+    return NominalType::get(ctx.getSetDecl(), Type(), eltTy, ctx);
   }
 
   case ConversionBehavior::Function: {
@@ -1556,14 +1826,26 @@ static Type openTypeJoinsAndMeetsRec(ConstraintSystem &cs, Type type,
 
     SmallVector<AnyFunctionType::Param, 4> params;
     for (unsigned i : indices(funcTy->getParams())) {
+      // Note: This is the only spot where allowNoEscape is true.
       const auto &param = funcTy->getParams()[i];
       auto paramType = rec(param.getPlainType(),
                            LocatorPathElt::FunctionArgument(),
+                           /*allowNoEscape=*/true,
                            LocatorPathElt::TupleElement(i));
       params.push_back(param.withType(paramType));
     }
 
-    return FunctionType::get(params, result, funcTy->getExtInfo());
+    SmallVector<AnyFunctionType::Yield, 1> yields;
+    for (unsigned i : indices(funcTy->getYields())) {
+      const auto &yield = funcTy->getYields()[i];
+      auto yieldType = rec(yield.getType(),
+                           LocatorPathElt::FunctionYield(),
+                           /*allowNoEscape=*/false,
+                           LocatorPathElt::TupleElement(i));
+      yields.push_back(yield.withType(yieldType));
+    }
+
+    return FunctionType::get(params, yields, result, funcTy->getExtInfo());
   }
 
   case ConversionBehavior::Metatype: {
@@ -1601,7 +1883,49 @@ Type swift::constraints::openTypeJoinsAndMeets(ConstraintSystem &cs, Type type,
   // These should never appear at the top level, or we'll enter an infinite loop.
   ASSERT(!type->is<JoinType>() && !type->is<MeetType>());
 
-  return openTypeJoinsAndMeetsRec(cs, type, locator);
+  return openTypeJoinsAndMeetsRec(cs, type, locator, /*allowNoEscape=*/false);
+}
+
+bool swift::constraints::isPackExpansionType(Type type) {
+  if (type->is<PackExpansionType>())
+    return true;
+
+  if (auto *typeVar = type->getAs<TypeVariableType>())
+    return typeVar->getImpl().isPackExpansion();
+
+  return false;
+}
+
+/// Check whether given parameter list represents a single tuple
+/// or type variable which could be later resolved to tuple.
+/// This is useful for SE-0110 related fixes in `matchFunctionTypes`.
+bool swift::constraints::isSingleTupleParam(ArrayRef<AnyFunctionType::Param> params) {
+  if (params.size() != 1)
+    return false;
+
+  const auto &param = params.front();
+  if ((param.isVariadic() || isPackExpansionType(param.getPlainType())) ||
+      param.isInOut() || param.hasLabel() || param.isIsolated())
+    return false;
+
+  auto paramType = param.getPlainType();
+
+  // Support following case which was allowed until 5:
+  //
+  // func bar(_: (Int, Int) -> Void) {}
+  // let foo: ((Int, Int)?) -> Void = { _ in }
+  //
+  // bar(foo) // Ok
+  if (!paramType->getASTContext().isLanguageModeAtLeast(LanguageMode::v5))
+    paramType = paramType->lookThroughAllOptionalTypes();
+
+  // Parameter type should either a tuple or something that can become a
+  // tuple later on. Note that type parameters can appear here when we're
+  // called from disjunction selection to compare a function argument
+  // type against an unopened overload's parameter type.
+  return (paramType->is<TupleType>() ||
+          paramType->isTypeVariableOrMember() ||
+          paramType->isTypeParameter());
 }
 
 void swift::constraints::simple_display(llvm::raw_ostream &out,
@@ -1637,4 +1961,22 @@ void swift::constraints::simple_display(llvm::raw_ostream &out,
     out << " tuple_element";
   if (reason.contains(ConflictFlag::Existential))
     out << " existential";
+  if (reason.contains(ConflictFlag::FunctionResult))
+    out << " function_result";
+  if (reason.contains(ConflictFlag::FunctionParamCount))
+    out << " function_param_count";
+  if (reason.contains(ConflictFlag::FunctionParamFlags))
+    out << " function_param_flags";
+  if (reason.contains(ConflictFlag::FunctionParamType))
+    out << " function_param_type";
+  if (reason.contains(ConflictFlag::FunctionNoEscape))
+    out << " function_no_escape";
+  if (reason.contains(ConflictFlag::FunctionAsync))
+    out << " function_async";
+  if (reason.contains(ConflictFlag::FunctionThrows))
+    out << " function_throws";
+  if (reason.contains(ConflictFlag::FunctionSendable))
+    out << " function_sendable";
+  if (reason.contains(ConflictFlag::FunctionTupleSplat))
+    out << " function_tuple_splat";
 }

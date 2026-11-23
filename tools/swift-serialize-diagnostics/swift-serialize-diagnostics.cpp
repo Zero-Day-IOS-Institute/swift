@@ -15,21 +15,15 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/Basic/LLVMInitialize.h"
-#include "swift/Basic/STLExtras.h"
 #include "swift/Localization/LocalizationFormat.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/Bitstream/BitstreamReader.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/Compiler.h"
-#include "llvm/Support/EndianStream.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/OnDiskHashTable.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/YAMLParser.h"
-#include "llvm/Support/YAMLTraits.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
 
@@ -74,7 +68,13 @@ int main(int argc, char *argv[]) {
   {
     assert(llvm::sys::path::extension(options::InputFilePath) == ".strings");
 
-    StringsLocalizationProducer strings(options::InputFilePath);
+    auto buffer = llvm::MemoryBuffer::getFile(options::InputFilePath);
+    if (!buffer) {
+      llvm::errs() << "Cannot read diagnostic file " << options::InputFilePath
+                   << '\n';
+      return EXIT_FAILURE;
+    }
+    StringsLocalizationProducer strings(std::move(*buffer));
 
     strings.forEachAvailable(
         [&Serializer](swift::DiagID id, llvm::StringRef translation) {

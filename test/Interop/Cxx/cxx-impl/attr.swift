@@ -37,30 +37,31 @@ func plainOperatorName(x: Int32) -> Int32 { return x }
 func plainCallOperatorName(x: Int32) -> Int32 { return x }
 
 
-// Only top-level func decls are currently supported.
+// Only top-level func decls and functions in extensions of C++ namespaces,
+// structs, and classes are supported.
 
 class Foo {
-  // expected-error@+2{{@cxx can only be applied to global functions}}
+  // expected-error@+2{{'@cxx' can only be applied to global functions or functions in extensions of C++ namespaces, structs, and classes}}
   // expected-error@+1{{'@cxx' must be combined with '@implementation'}}
   @cxx
   func foo(x: Int32) -> Int32 { return x }
 
-  // expected-error@+2{{@cxx can only be applied to global functions}}
+  // expected-error@+2{{'@cxx' can only be applied to global functions or functions in extensions of C++ namespaces, structs, and classes}}
   // expected-error@+1{{'@cxx' must be combined with '@implementation'}}
   @cxx
   static func bar(x: Int32) -> Int32 { return x }
 }
 
-// expected-error@+1{{@cxx may only be used on 'func' declarations}}
+// expected-error@+1{{'@cxx' may only be used on 'func' declarations}}
 @cxx
 var notAFunction: Int32 = 0
 
-// expected-error@+1{{@cxx may only be used on 'func' declarations}}
+// expected-error@+1{{'@cxx' may only be used on 'func' declarations}}
 @cxx
 enum NotAFunctionEnum { case a }
 
 var accessorHost: Int32 {
-  // expected-error@+1{{@cxx may only be used on 'func' declarations}}
+  // expected-error@+1{{'@cxx' may only be used on 'func' declarations}}
   @cxx
   get { return 0 }
 }
@@ -69,7 +70,7 @@ var accessorHost: Int32 {
 // Reject using both @cxx and @objc on the same decl.
 
 // expected-error@+3{{cannot apply both '@cxx' and '@objc' to global function}}
-// expected-error@+2{{'@objc' can only be used with members of classes, '@objc' protocols, and concrete extensions of classes}}
+// expected-error@+2{{Objective-C interoperability is disabled}}
 // expected-error@+1{{'@cxx' must be combined with '@implementation'}}
 @objc @cxx
 func conflictWithObjC(x: Int32) -> Int32 { return x }

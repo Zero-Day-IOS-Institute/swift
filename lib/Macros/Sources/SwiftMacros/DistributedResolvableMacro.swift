@@ -115,7 +115,7 @@ extension DistributedResolvableMacro {
       for binding in variable.bindings {
         if let accessorBlock = binding.accessorBlock {
           for accessor in accessorBlock.accessors.children(viewMode: .all) {
-            let accessorStub = "\(accessor) { \(stubFunctionBody()) }"
+            let accessorStub = "\(accessor) { \(stubFunctionBody())\n }"
             accessorStubs.append(accessorStub)
           }
         }
@@ -152,11 +152,13 @@ extension DistributedResolvableMacro {
 
   static func stubFunctionBody() -> DeclSyntax {
     """
+    #if !$Embedded
     if #available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *) {
       Distributed._distributedStubFatalError()
-    } else {
-      fatalError()
     }
+    #endif
+
+    fatalError()
     """
   }
 }
@@ -272,7 +274,18 @@ extension DistributedResolvableMacro {
       }
     }
 
-    let stubActorBody: String
+    // A stub is only ever resolved as a remote reference, never created as
+    // a local instance. Declaring this init also suppresses the implicitly
+    // synthesized 'init(actorSystem:)'
+    let unavailableInit =
+      """
+      @available(*, unavailable, message: "stub '$\(proto.name.trimmed)' can only be resolved as a remote reference, use '$\(proto.name.trimmed).resolve(id:using:)'")
+      init(actorSystem: ActorSystem) {
+        fatalError()
+      }
+      """
+
+    var stubActorBody: String
     if isGenericOverActorSystem {
       // there may be no `where` clause specifying an actor system,
       // but perhaps there is a typealias (or extension with a typealias),
@@ -286,6 +299,7 @@ extension DistributedResolvableMacro {
     } else {
       stubActorBody = ""
     }
+    stubActorBody += stubActorBody.isEmpty ? unavailableInit : "\n\n" + unavailableInit
 
     return [
       """

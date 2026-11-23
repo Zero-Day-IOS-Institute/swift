@@ -14,11 +14,11 @@
 #include "swift/AST/FineGrainedDependencies.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/FineGrainedDependencyFormat.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/LLVMInitialize.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/VirtualOutputBackends.h"
 #include "llvm/Support/YAMLParser.h"
 #include "llvm/Support/YAMLTraits.h"
@@ -215,7 +215,8 @@ int swift_dependency_tool_main(ArrayRef<const char *> argv, void *MainAddr) {
   }
 
   case ActionType::BinaryToYAML: {
-    auto fg = SourceFileDepGraph::loadFromPath(InputFilename, true);
+    auto fg = SourceFileDepGraph::loadFromPath(
+        InputFilename, *llvm::vfs::createPhysicalFileSystem(), true);
     if (!fg) {
       llvm::errs() << "Failed to read dependency file\n";
       return 1;

@@ -4,7 +4,7 @@
 
 // RUN: %target-build-swift %t/struct.swift -emit-module -emit-library -static -module-name OpaqueStruct -emit-module-path %t/Inputs/OpaqueStruct.swiftmodule -enable-library-evolution
 
-// RUN: %target-swift-emit-irgen %t/test.swift -I %t/Inputs -enable-experimental-cxx-interop -disable-availability-checking | %FileCheck %s
+// RUN: %target-swift-emit-irgen %t/test.swift -I %t/Inputs -enable-experimental-cxx-interop -target %target-swift-5.8-abi-triple | %FileCheck %s
  
 //--- Inputs/module.modulemap
 module CxxModule {
@@ -61,7 +61,7 @@ public struct SharedFRT_OpaqueLayout {
 }
 
 // CHECK: define{{.*}} @"$s4test24ImmortalFRT_OpaqueLayoutVMr"
-// CHECK: store ptr getelementptr inbounds (ptr, ptr @"$sBpWV", i32
+// CHECK: store ptr getelementptr inbounds (i8, ptr @"$sBpWV", i{{32|64}}
 
 // CHECK: define{{.*}} @"$s4test22SharedFRT_OpaqueLayoutVMr"
-// CHECK: store ptr getelementptr inbounds (ptr, ptr @"$sBpWV", i32
+// CHECK: store ptr getelementptr inbounds (i8, ptr @"$sBpWV", i{{32|64}}

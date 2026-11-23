@@ -191,13 +191,16 @@ Type LinearMapInfo::getLinearMapType(ADContext &context, FullApplySite fai) {
 
   bool hasActiveSemanticResultArgument = false;
   bool hasActiveArguments = false;
-  auto numIndirectResults = fai.getNumIndirectSILResults();
+  // `getArgumentsWithoutIndirectResults()` skips the indirect results and the
+  // indirect error results, so the parameters start at
+  // `getSILArgIndexOfFirstParam()` in SIL argument order.
+  auto firstParamArgIdx = fai.getSubstCalleeConv().getSILArgIndexOfFirstParam();
   for (auto argIdx : range(fai.getSubstCalleeConv().getNumParameters())) {
     auto arg = fai.getArgumentsWithoutIndirectResults()[argIdx];
     if (activityInfo.isActive(arg, config)) {
       hasActiveArguments = true;
       auto paramInfo = fai.getSubstCalleeConv().getParamInfoForSILArg(
-          numIndirectResults + argIdx);
+          firstParamArgIdx + argIdx);
       if (paramInfo.isAutoDiffSemanticResult())
         hasActiveSemanticResultArgument = true;
     }
@@ -300,8 +303,8 @@ Type LinearMapInfo::getLinearMapType(ADContext &context, FullApplySite fai) {
     if (param.isAutoDiffSemanticResult())
       flags = flags.withInOut(true);
 
-    params.push_back(
-        AnyFunctionType::Param(param.getInterfaceType(), Identifier(), flags));
+    params.push_back(AnyFunctionType::Param::bodyAccess(
+        param.getInterfaceType(), Identifier(), flags));
   }
 
   AnyFunctionType *astFnTy;
@@ -309,12 +312,13 @@ Type LinearMapInfo::getLinearMapType(ADContext &context, FullApplySite fai) {
     // FIXME: Verify ExtInfo state is correct, not working by accident.
     GenericFunctionType::ExtInfo info;
     astFnTy = GenericFunctionType::get(
-        genSig, params, silFnTy->getAllResultsInterfaceType().getASTType(),
-        info);
+        genSig, params, /* yields */ {},
+        silFnTy->getAllResultsInterfaceType().getASTType(), info);
   } else {
     FunctionType::ExtInfo info;
     astFnTy = FunctionType::get(
-        params, silFnTy->getAllResultsInterfaceType().getASTType(), info);
+        params, /* yields */ {},
+        silFnTy->getAllResultsInterfaceType().getASTType(), info);
   }
 
   Type resultType =
@@ -557,6 +561,16 @@ bool LinearMapInfo::shouldDifferentiateInstruction(SILInstruction *inst) {
   if (auto inject = dyn_cast<InjectEnumAddrInst>(inst))
     if (shouldDifferentiateInjectEnumAddr(*inject, activityInfo, config))
       return true;
+
+  // Should differentiate `startAsyncLetWithLocalBuffer` with
+  // active result buffer
+  if (auto *bi = dyn_cast<BuiltinInst>(inst);
+      bi &&
+      bi->getBuiltinKind() == BuiltinValueKind::StartAsyncLetWithLocalBuffer) {
+    auto resultBuf = bi->getArguments().back();
+    if (activityInfo.isActive(resultBuf, config))
+      return true;
+  }
 
   return false;
 }

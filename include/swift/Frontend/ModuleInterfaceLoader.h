@@ -115,7 +115,6 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/StringSaver.h"
-#include "llvm/Support/YAMLTraits.h"
 
 namespace llvm {
 namespace cas {
@@ -651,7 +650,8 @@ using ArgListTy = std::vector<std::string>;
 
 void setOutputPath(ResultTy &outputPath, const StringRef &moduleName,
                    const StringRef &interfacePath, const StringRef &sdkPath,
-                   const CompilerInvocation &CI, const ArgListTy &extraArgs);
+                   const CompilerInvocation &CI, const ArgListTy &extraArgs,
+                   llvm::vfs::FileSystem &FS);
 } // namespace SwiftInterfaceModuleOutputPathResolution
 
 struct InterfaceSubContextDelegateImpl : InterfaceSubContextDelegate {

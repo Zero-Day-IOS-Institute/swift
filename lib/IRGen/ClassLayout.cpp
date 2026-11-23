@@ -14,11 +14,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/AST/ASTContext.h"
 #include "swift/SIL/SILType.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include "ClassLayout.h"
+#include "ClassTypeInfo.h"
 #include "GenHeap.h"
 #include "IRGenFunction.h"
 #include "IRGenModule.h"
@@ -85,32 +85,58 @@ Size ClassLayout::getInstanceStart() const {
   return getSize();
 }
 
-std::optional<uint64_t>
-ClassLayout::computeTypedMallocTypeDescriptor(IRGenModule &IGM,
-                                              SILType selfType) const {
+void ClassLayout::collectAllStoredPropertyTypes(
+    IRGenModule &IGM, SILType classType, SmallVectorImpl<SILType> &fieldTypes) {
+  auto *classDecl = classType.getClassDecl();
+  // ClassLayout::AllStoredProperties for a class is populated to
+  // include its ancestors' properties only when the class includes a
+  // generic parameter and fully specialized (which is the same
+  // condition as collectStoredProperties in
+  // addDirectFieldsFromClass()). We need to walk the superclass chain
+  // up to find the first class that meets that condition.
+  bool alreadyIncludesAncestors =
+      classDecl->isGenericContext() &&
+      !classType.getASTType()->getRecursiveProperties().hasUnboundGeneric();
+  if (!alreadyIncludesAncestors) {
+    if (SILType superclassType = classType.getSuperclass())
+      collectAllStoredPropertyTypes(IGM, superclassType, fieldTypes);
+  }
+  auto &classTI = IGM.getTypeInfo(classType).as<ClassTypeInfo>();
+  auto &classLayout = classTI.getClassLayout(IGM, classType,
+                                             /*forBackwardDeployment=*/false);
+  for (Field field : classLayout.AllStoredProperties) {
+    assert(field.isConcrete() && "Missing member on fixed size class");
+    fieldTypes.push_back(field.getType(IGM, classType).getObjectType());
+  }
+}
+
+std::optional<uint64_t> ClassLayout::computeTypedMallocTypeDescriptor(
+    IRGenModule &IGM, SILType selfType,
+    ArrayRef<SILType> tailElementTypes) const {
+  if (!IGM.isTypedAllocationAvailable())
+    return std::nullopt;
   if (!isFixedSize()) {
     return std::nullopt;
   }
   llvm::SmallVector<SILType> storageEntries;
 
-  auto rawPointerType = SILType::getRawPointerType(IGM.Context);
-
-  // Add the heap header as the first entry
+  auto header = HeapHeaderKind::None;
   if (hasObjCImplementation()) {
-    storageEntries.push_back(rawPointerType);
+    header = HeapHeaderKind::ObjC;
   } else if (!HeaderSize.isZero()) {
     assert(HeaderSize == IGM.RefCountedStructSize &&
            "Swift object with non-standard header size");
-    storageEntries.push_back(rawPointerType);
-    storageEntries.push_back(rawPointerType);
+    header = HeapHeaderKind::Swift;
   }
 
-  // Add entries for each stored property
-  for (auto field : AllStoredProperties) {
-    assert(field.isConcrete() && "Missing member on fixed size class");
-    auto fieldType = field.getType(IGM, selfType).getObjectType();
-    storageEntries.push_back(fieldType);
-  }
+  collectAllStoredPropertyTypes(IGM, selfType, storageEntries);
 
-  return irgen::computeTypedMallocTypeDescriptor(IGM, storageEntries);
+  if (tailElementTypes.empty())
+    return irgen::computeTypedMallocTypeDescriptor(IGM, header, storageEntries);
+
+  // The tail-allocated arrays follow the header. Their counts aren't known
+  // here, so describe them as one array of a union of their element types.
+  return irgen::computeTypedMallocTypeDescriptor(
+      IGM, header, storageEntries,
+      TypedMemoryCallsiteFlags::HeaderPrefixedArray, tailElementTypes);
 }

@@ -460,8 +460,8 @@ func enumLValueHelper(_: inout E, _: inout E) {}
 // CHECK:   apply %6(%3, %5) : $@convention(thin) (@inout E, @inout E) -> ()
 // CHECK:   end_access %4 : $*StructOfEnum
 // CHECK:   end_access %2 : $*StructOfEnum
-// CHECK:   %10 = tuple ()
-// CHECK:   return %10 : $()
+// CHECK:   [[VOID:%.*]] = tuple ()
+// CHECK:   return [[VOID]] : $()
 // CHECK-LABEL: } // end sil function '$s20access_marker_verify14testEnumLValue1syAA08StructOfE0Vz_tF'
 func testEnumLValue(s: inout StructOfEnum) {
   enumLValueHelper(&s.e, &s.f)
@@ -791,8 +791,7 @@ class C : Abstractable {
 // CHECK-NEXT:   [[THUNKED_NEW_FN:%.*]] = partial_apply [callee_guaranteed] [[THUNK]]([[NEW_FN_CONV]])
 // CHECK-NEXT:   store [[THUNKED_NEW_FN]] to [init] [[ADDR]] :
 // CHECK-NEXT:   dealloc_stack [[TEMP]]
-// CHECK-NEXT:   end_apply [[TOKEN]]
-// CHECK-NEXT:   [[TUPLE:%.*]] = tuple ()
+// CHECK-NEXT:   [[TUPLE:%.*]] = end_apply [[TOKEN]] as $()
 // CHECK-NEXT:   end_borrow [[SELF]] : $C
 // CHECK-NEXT:   return [[TUPLE]]
 

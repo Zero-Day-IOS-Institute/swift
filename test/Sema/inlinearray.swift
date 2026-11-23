@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -disable-availability-checking
+// RUN: %target-typecheck-verify-swift -target %target-swift-6.2-abi-triple
 
 let a: InlineArray = [1, 2, 3] // Ok, InlineArray<3, Int>
 let b: InlineArray<_, Int> = [1, 2, 3] // Ok, InlineArray<3, Int>
@@ -6,6 +6,18 @@ let c: InlineArray<3, _> = [1, 2, 3] // Ok, InlineArray<3, Int>
 
 let d: InlineArray<2, _> = [1, 2, 3] // expected-error {{expected 2 elements in inline array literal, but got 3}}
 let e: InlineArray<2, _> = [1] // expected-error {{expected 2 elements in inline array literal, but got 1}}
+
+// Negative and out-of-range counts must never match the number of elements
+// in the literal, even after truncation to a narrower integer.
+let _: InlineArray<-1, Int> = [0] // expected-error {{expected -1 elements in inline array literal, but got 1}}
+let _: InlineArray<-2, Int> = [0, 0] // expected-error {{expected -2 elements in inline array literal, but got 2}}
+let _: InlineArray<-3, Int> = [0, 0, 0, 0, 0] // expected-error {{expected -3 elements in inline array literal, but got 5}}
+let _: [-1 of Int] = [0] // expected-error {{expected -1 elements in inline array literal, but got 1}}
+let _: [-2 of [-1 of Int]] = [[0], [0]]
+// expected-error@-1 {{expected -2 elements in inline array literal, but got 2}}
+// expected-error@-2 2 {{expected -1 elements in inline array literal, but got 1}}
+let _: InlineArray<4294967297, Int> = [0] // expected-error {{expected 4294967297 elements in inline array literal, but got 1}}
+let _: InlineArray<99999999999999999999999, Int> = [0] // expected-error {{expected 99999999999999999999999 elements in inline array literal, but got 1}}
 
 let f: InlineArray<_, Int> = ["hello"] // expected-error {{cannot convert value of type 'String' to expected element type 'Int'}}
 

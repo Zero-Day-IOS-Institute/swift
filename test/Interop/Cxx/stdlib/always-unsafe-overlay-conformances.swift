@@ -1,14 +1,13 @@
-// RUN: %target-typecheck-verify-swift -I %S/Inputs -cxx-interoperability-mode=default -enable-experimental-feature ImportUnsafeCxxMethodsAsAlwaysUnsafe
+// RUN: %target-typecheck-verify-swift -I %S/Inputs -cxx-interoperability-mode=default
 
-// REQUIRES: swift_feature_ImportUnsafeCxxMethodsAsAlwaysUnsafe
 
 // This fails only for 32-bit Android for some reason.
 // XFAIL: OS=linux-androideabi
 
-// The C++ standard library overlay still spells '__beginUnsafe()',
-// '__insertUnsafe(_:)' and friends in its protocol requirements, so the
-// synthesized conformances and the safe wrappers built on top of them must keep
-// working with the feature enabled.
+// The C++ standard library overlay's protocol requirements name methods such as
+// 'begin()', which are '@unsafe(always)' and disfavored, or '__insertUnsafe(_:)'.
+// The synthesized conformances and the safe wrappers built on top of them must
+// keep working.
 //
 // 'std::set' and 'std::map' are covered by
 // always-unsafe-overlay-conformances-set-map.swift instead, since their
@@ -19,7 +18,7 @@ import StdOptional
 import CxxStdlib
 
 func useVector(_ v: inout Vector) {
-  // Requires CxxRandomAccessCollection, i.e. a witness named '__beginUnsafe()'.
+  // Requires CxxRandomAccessCollection, i.e. a witness named 'begin()'.
   for x in v {
     _ = x
   }
@@ -28,20 +27,22 @@ func useVector(_ v: inout Vector) {
   _ = v.map { $0 + 1 }
 
   // Requires CxxMutableRandomAccessCollection, whose synthesis looks up
-  // '__beginMutatingUnsafe()' by name through ClangRecordMemberLookup.
+  // 'beginMutating()' by name through ClangRecordMemberLookup.
   v[0] = 1
   v.sort()
 }
 
 func useOptional(_ o: StdOptionalInt) {
-  // 'value' keeps the rename, so CxxOptional.value is not shadowed.
+  // 'value' keeps its name as a disfavored '@unsafe(always)' overload, so
+  // CxxOptional.value is still what this resolves to.
   _ = o.value
   _ = o.hasValue
   _ = Int32?(fromCxx: o)
 }
 
 func useString(_ s: inout std.string) {
-  // 'append' keeps the rename, so the overlay's append(_:) is not ambiguated.
+  // Likewise 'append': the overlay's append(_:) wins over the disfavored
+  // unsafe import rather than being ambiguated by it.
   s.append(s)
   _ = s + s
   _ = String(s)

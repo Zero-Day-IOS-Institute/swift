@@ -23,9 +23,7 @@
 #include "swift/SIL/SILBasicBlock.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILSuccessor.h"
-#include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/Support/Debug.h"
 
 namespace swift {
 
@@ -225,7 +223,8 @@ public:
         return Unreachable();
       case Effect::Value::Gen:
         return Reachable();
-      };
+      }
+      llvm_unreachable("covered switch");
     };
     bool operator==(const State &other) { return value == other.value; }
     bool operator!=(const State &other) { return value != other.value; }
@@ -864,6 +863,7 @@ bool IterativeBackwardReachability<Effects>::Result::setEndStateforBlock(
     return notPreviouslyUnknown;
   }
   }
+  llvm_unreachable("covered switch");
 }
 
 //===----------------------------------------------------------------------===//

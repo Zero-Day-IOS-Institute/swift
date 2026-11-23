@@ -297,21 +297,16 @@ foreach(sdk ${SWIFT_SDKS})
       if(sdk STREQUAL "ANDROID")
         set(android_libraries -llog)
         set(libpthread)
-      elseif(SWIFT_CONCURRENCY_USES_DISPATCH)
+      endif()
+      if(SWIFT_CONCURRENCY_USES_DISPATCH)
         set(concurrency_libs "-ldispatch -lBlocksRuntime")
       endif()
 
-      file(WRITE "${SWIFTSTATICLIB_DIR}/${linkfile}" "
--ldl
-${libpthread}
-${android_libraries}
--lswiftCore
-${concurrency_libs}
--lstdc++
--lm
--Xlinker -export-dynamic
--Xlinker --exclude-libs
--Xlinker ALL")
+      configure_file(
+        "${SWIFT_SOURCE_DIR}/stdlib/public/Resources/static-stdlib-args.lnk.in"
+        "${SWIFTSTATICLIB_DIR}/${linkfile}"
+        @ONLY
+        NEWLINE_STYLE LF)
     endif()
 
     swift_install_in_component(FILES "${SWIFTSTATICLIB_DIR}/${linkfile}"

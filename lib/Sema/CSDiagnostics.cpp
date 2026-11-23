@@ -34,6 +34,7 @@
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/ImportCache.h"
 #include "swift/AST/Initializer.h"
+#include "swift/AST/KnownProtocols.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/ProtocolConformance.h"
@@ -48,6 +49,7 @@
 #include "swift/Sema/ConstraintLocator.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "swift/Sema/IDETypeChecking.h"
+#include "swift/Sema/Subtyping.h"
 #include "swift/Sema/TypeVariableType.h"
 #include "clang/AST/DeclCXX.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -429,7 +431,11 @@ const DeclContext *RequirementFailure::getRequirementDC() const {
     }
   } while ((DC = DC->getParent()));
 
-  return AffectedDecl->getAsGenericContext();
+  // None of the enclosing contexts satisfy the requirement, which can
+  // happen e.g. when the requirements of an extension conflict with each
+  // other. The affected declaration is not always a generic context itself
+  // (e.g. a property), so fall back to its innermost declaration context.
+  return AffectedDecl->getInnermostDeclContext();
 }
 
 bool RequirementFailure::isStaticOrInstanceMember(const ValueDecl *decl) {
@@ -744,26 +750,42 @@ bool MissingConformanceFailure::diagnoseTypeCannotConform(
   emitDiagnostic(diag::type_cannot_conform,
                  nonConformingType, protocolType);
 
-  bool emittedSpecializedNote = false;
+  bool emitCanNeverConformNote = true;
   if (auto protoType = protocolType->getAs<ProtocolType>()) {
     auto *protoDecl = protoType->getDecl();
-    if (protoDecl->isSpecificProtocol(KnownProtocolKind::Sendable)) {
-      if (nonConformingType->is<FunctionType>()) {
-        emitDiagnostic(diag::nonsendable_function_type);
-        emittedSpecializedNote = true;
-      } else if (nonConformingType->is<TupleType>()) {
-        emitDiagnostic(diag::nonsendable_tuple_type);
-        emittedSpecializedNote = true;
+
+    auto emitSpecializedNote = [&](Diag<> note) {
+      emitDiagnostic(note);
+      emitCanNeverConformNote = false;
+    };
+
+    if (nonConformingType->is<FunctionType>()) {
+      if (auto known = protoDecl->getKnownProtocolKind()) {
+        switch (*known) {
+        case KnownProtocolKind::Sendable:
+          emitSpecializedNote(diag::nonsendable_function_type);
+          break;
+
+        case KnownProtocolKind::Escapable:
+          emitSpecializedNote(diag::nonescapable_function_type);
+          break;
+
+        case KnownProtocolKind::Copyable:
+        case KnownProtocolKind::Deinitable:
+          emitCanNeverConformNote = false;
+          break;
+
+        default:
+          break;
+        }
       }
-    } else if (protoDecl->isSpecificProtocol(KnownProtocolKind::Escapable)) {
-      if (nonConformingType->is<AnyFunctionType>()) {
-        emitDiagnostic(diag::nonescapable_function_type);
-        emittedSpecializedNote = true;
-      }
+    } else if (nonConformingType->is<TupleType>() &&
+               protoDecl->isSpecificProtocol(KnownProtocolKind::Sendable)) {
+      emitSpecializedNote(diag::nonsendable_tuple_type);
     }
   }
 
-  if (!emittedSpecializedNote)
+  if (emitCanNeverConformNote)
     emitDiagnostic(diag::only_concrete_types_conform_to_protocols);
 
   if (auto *OTD = dyn_cast<OpaqueTypeDecl>(AffectedDecl)) {
@@ -971,6 +993,7 @@ bool GenericArgumentsMismatchFailure::diagnoseAsError() {
   while (!path.empty()) {
     auto last = path.back();
     if (last.is<LocatorPathElt::OptionalInjection>() ||
+        last.is<LocatorPathElt::OptionalPayload>() ||
         last.is<LocatorPathElt::OpenedGeneric>() ||
         last.is<LocatorPathElt::AnyRequirement>() ||
         last.is<LocatorPathElt::GenericType>() ||
@@ -983,15 +1006,7 @@ bool GenericArgumentsMismatchFailure::diagnoseAsError() {
   }
 
   std::optional<Diag<Type, Type>> diagnostic;
-  if (path.empty()) {
-    if (isExpr<AssignExpr>(anchor)) {
-      diagnostic = getDiagnosticFor(CTP_AssignSource);
-    } else if (locator->isForCoercion()) {
-      diagnostic = getDiagnosticFor(CTP_CoerceOperand);
-    } else {
-      return false;
-    }
-  } else {
+  if (!path.empty()) {
     const auto &last = path.back();
     switch (last.getKind()) {
     case ConstraintLocator::TernaryBranch:
@@ -1110,8 +1125,11 @@ bool GenericArgumentsMismatchFailure::diagnoseAsError() {
   }
 
   if (!diagnostic) {
-    // Handle all mismatches involving an `AssignExpr`
-    if (auto *assignExpr = getAsExpr<AssignExpr>(anchor)) {
+    // Handle all mismatches involving an `OptionalTryExpr`.
+    if (isExpr<OptionalTryExpr>(anchor)) {
+      diagnostic = diag::cannot_convert_initializer_value;
+    // Handle all mismatches involving an `AssignExpr`.
+    } else if (auto *assignExpr = getAsExpr<AssignExpr>(anchor)) {
       diagnostic = getDiagnosticFor(CTP_AssignSource);
       fromType = getType(assignExpr->getSrc());
       toType = getType(assignExpr->getDest());
@@ -1204,7 +1222,7 @@ bool ArrayLiteralToDictionaryConversionFailure::diagnoseAsError() {
   }
 
   auto CTP = FailureDiagnostic::getContextualTypePurpose(AE);
-  emitDiagnostic(diag::should_use_dictionary_literal,
+  emitDiagnostic(diag::should_use_dictionary_literal_not_array_literal,
                  getToType()->lookThroughAllOptionalTypes(),
                  CTP == CTP_Initialization);
 
@@ -1224,6 +1242,38 @@ bool ArrayLiteralToDictionaryConversionFailure::diagnoseAsError() {
       }
     }
   }
+  return true;
+}
+
+bool ArrayLiteralToTupleConversionFailure::diagnoseAsError() {
+  ArrayExpr *AE = getAsExpr<ArrayExpr>(getAnchor());
+  assert(AE);
+
+  auto CTP = FailureDiagnostic::getContextualTypePurpose(AE);
+  emitDiagnostic(diag::should_use_tuple_not_array_literal,
+                 getToType()->lookThroughAllOptionalTypes(),
+                 CTP == CTP_Initialization);
+
+  emitDiagnostic(diag::meant_tuple)
+    .fixItReplace(AE->getLBracketLoc(), "(")
+    .fixItReplace(AE->getRBracketLoc(), ")");
+  
+  return true;
+}
+
+bool TupleToArrayConversionFailure::diagnoseAsError() {
+  TupleExpr *TE = getAsExpr<TupleExpr>(getAnchor());
+  assert(TE);
+
+  auto CTP = FailureDiagnostic::getContextualTypePurpose(TE);
+  emitDiagnostic(diag::should_use_array_literal_not_tuple,
+                 getToType()->lookThroughAllOptionalTypes(),
+                 CTP == CTP_Initialization);
+
+  emitDiagnostic(diag::meant_array)
+    .fixItReplace(TE->getLParenLoc(), "[")
+    .fixItReplace(TE->getRParenLoc(), "]");
+
   return true;
 }
 
@@ -1857,12 +1907,11 @@ bool MissingOptionalUnwrapFailure::diagnoseAsError() {
 
   assert(!baseType->hasTypeVariable() &&
          "Base type must not be a type variable");
-  assert(!baseType->isPlaceholder() &&
-         "Base type must not be a type placeholder");
+  assert(!baseType->is<HoleType>() && "Base type must not be a type hole");
   assert(!unwrappedType->hasTypeVariable() &&
          "Unwrapped type must not be a type variable");
-  assert(!unwrappedType->isPlaceholder() &&
-         "Unwrapped type must not be a type placeholder");
+  assert(!unwrappedType->is<HoleType>() &&
+         "Unwrapped type must not be a type hole");
 
   if (!baseType->getOptionalObjectType())
     return false;
@@ -2608,6 +2657,7 @@ AssignmentFailure::getMemberRef(ConstraintLocator *locator) const {
                      : std::nullopt;
   }
   }
+  llvm_unreachable("covered switch");
 }
 
 Diag<StringRef> AssignmentFailure::findDeclDiagnostic(ASTContext &ctx,
@@ -3595,8 +3645,8 @@ bool ContextualFailure::tryTypeCoercionFixIt(
   // type, let's suggest a force unwrap "!". Otherwise fallback to potential
   // coercion or force cast.
   if (!bothOptional && fromType->getOptionalObjectType()) {
-    if (TypeChecker::isSubtypeOf(fromType->lookThroughAllOptionalTypes(),
-                                 toType, getDC())) {
+    ConformanceCache cache;
+    if (canConvertTo(cache, fromType->lookThroughAllOptionalTypes(), toType)) {
       diagnostic.fixItInsert(
           Lexer::getLocForEndOfToken(getASTContext().SourceMgr,
                                      getSourceRange().End),
@@ -4397,7 +4447,7 @@ DeclName MissingMemberFailure::findCorrectEnumCaseName(
     Type Ty, TypoCorrectionResults &corrections, DeclNameRef memberName) {
   if (memberName.isSpecial() || !memberName.isSimpleName())
     return DeclName();
-  if (!Ty->getEnumOrBoundGenericEnum())
+  if (!Ty->getEnumDecl())
     return DeclName();
   auto candidate =
       corrections.getUniqueCandidateMatching([&](ValueDecl *candidate) {
@@ -4414,10 +4464,10 @@ ValueDecl *MissingMemberFailure::
 findImportedCaseWithMatchingSuffix(Type instanceTy, DeclNameRef name) {
   IterableDeclContext *idc = nullptr;
 
-  if (auto ED = instanceTy->getEnumOrBoundGenericEnum()) {
+  if (auto ED = instanceTy->getEnumDecl()) {
     idc = ED;
   }
-  else if (auto SD = instanceTy->getStructOrBoundGenericStruct()) {
+  else if (auto SD = instanceTy->getStructDecl()) {
     // Did ClangImporter add OptionSet to this struct?
     for (auto protoAttr :
             SD->getAttrs().getAttributes<SynthesizedProtocolAttr>()) {
@@ -4497,6 +4547,9 @@ bool MissingMemberFailure::diagnoseAsError() {
     return true;
 
   if (diagnoseForSubscriptMemberWithTupleBase())
+    return true;
+
+  if (diagnoseForTupleElementWithSubscriptMemberBase())
     return true;
 
   auto baseType = resolveType(getBaseType())->getWithoutSpecifierType();
@@ -4625,7 +4678,7 @@ bool MissingMemberFailure::diagnoseAsError() {
     return true;
   } else {
     // Check for a few common cases that can cause missing members.
-    auto *ED = baseType->getEnumOrBoundGenericEnum();
+    auto *ED = baseType->getEnumDecl();
     if (ED && getName().isSimpleName("rawValue")) {
       auto loc = ED->getNameLoc();
       if (loc.isValid()) {
@@ -4741,6 +4794,18 @@ bool MissingMemberFailure::diagnoseInLiteralCollectionContext() const {
   return false;
 }
 
+static std::optional<unsigned> getFieldNumber(StringRef memberName) {
+  llvm::Regex NumericRegex("^[0-9]+$");
+
+  if (!NumericRegex.match(memberName))
+    return std::nullopt;
+
+  unsigned int literalValue = 0;
+  if (memberName.getAsInteger(/*Radix=*/10, literalValue))
+    return std::nullopt;
+  return literalValue;
+}
+
 bool MissingMemberFailure::diagnoseForSubscriptMemberWithTupleBase() const {
   auto locator = getLocator();
   auto baseType = resolveType(getBaseType())->getWithoutSpecifierType();
@@ -4760,26 +4825,24 @@ bool MissingMemberFailure::diagnoseForSubscriptMemberWithTupleBase() const {
     auto *literal =
         dyn_cast<IntegerLiteralExpr>(argExpr->getSemanticsProvidingExpr());
 
-    llvm::Regex NumericRegex("^[0-9]+$");
     // Literal expressions may have other types of representations e.g. 0x01,
     // 0b01. So let's make sure to only suggest this tailored literal fix-it for
     // number only literals.
-    if (literal && NumericRegex.match(literal->getDigitsText())) {
-      unsigned int literalValue = 0;
-      literal->getDigitsText().getAsInteger(/*Radix=*/0, literalValue);
+    if (literal) {
+      if (auto literalValue = getFieldNumber(literal->getDigitsText())) {
+        // Verify if the literal value is within the bounds of tuple elements.
+        if (!literal->isNegative() &&
+            *literalValue < tupleType->getNumElements()) {
+          llvm::SmallString<4> dotAccess;
+          llvm::raw_svector_ostream OS(dotAccess);
+          OS << "." << *literalValue;
 
-      // Verify if the literal value is within the bounds of tuple elements.
-      if (!literal->isNegative() &&
-          literalValue < tupleType->getNumElements()) {
-        llvm::SmallString<4> dotAccess;
-        llvm::raw_svector_ostream OS(dotAccess);
-        OS << "." << literalValue;
-
-        emitDiagnostic(
-            diag::could_not_find_subscript_member_tuple_did_you_mean_use_dot,
-            baseType, literal->getDigitsText())
-            .fixItReplace(args->getSourceRange(), OS.str());
-        return true;
+          emitDiagnostic(
+                         diag::could_not_find_subscript_member_tuple_did_you_mean_use_dot,
+                         baseType, literal->getDigitsText())
+          .fixItReplace(args->getSourceRange(), OS.str());
+          return true;
+        }
       }
     }
 
@@ -4806,6 +4869,70 @@ bool MissingMemberFailure::diagnoseForSubscriptMemberWithTupleBase() const {
 
   emitDiagnostic(diag::could_not_find_subscript_member_tuple, baseType);
   return true;
+}
+
+bool MissingMemberFailure::diagnoseForTupleElementWithSubscriptMemberBase() const {
+  auto locator = getLocator();
+  auto baseType = resolveType(getBaseType())->getWithoutSpecifierType();
+
+  // Are we using the tuple element syntax?
+  if (getName().hasModuleSelector() || getName().isCompoundName()
+        || getName().isSpecial())
+    return false;
+
+  auto fieldNumber = getFieldNumber(this->getName().getBaseIdentifier().str());
+  if (!fieldNumber)
+    return false;
+
+  // Don't suggest a subscript if the field number would be out of bounds
+  // for an InlineArray with a known count.
+  if (auto count = baseType->getInlineArrayCount())
+    if (*fieldNumber >= count->getLimitedValue())
+      return false;
+
+  SourceRange lookupRange;
+  if (auto *UDE = getAsExpr<UnresolvedDotExpr>(locator->getAnchor()))
+    lookupRange = SourceRange(UDE->getDotLoc(), UDE->getNameLoc().getEndLoc());
+  else
+    return false;
+
+  // Does the base type have a subscript with a single unlabeled parameter which
+  // conforms to `ExpressibleByIntegerLiteral`?
+  // FIXME: Could be refined further to handle default arguments
+  if (!baseType->mayHaveMembers())
+    return false;
+
+  auto subscriptName = DeclNameRef::createSubscript()
+                           .withArgumentLabels(getASTContext(), {Identifier()});
+  auto subscripts = TypeChecker::lookupMember(getDC(), baseType, subscriptName);
+
+  for (auto &subscript : subscripts) {
+    auto SD = cast<SubscriptDecl>(subscript.getValueDecl());
+
+    if (SD->getParameterList()->size() != 1)
+      continue;
+
+    auto PD = SD->getParameterList()->get(0);
+    if (!PD->getArgumentName().empty() ||
+        !conformsToKnownProtocol(PD->getTypeInContext(),
+            KnownProtocolKind::ExpressibleByIntegerLiteral))
+      continue;
+
+    // Found at least one; emit tailored diagnostic and return.
+    llvm::SmallString<8> subscriptAccess;
+    llvm::raw_svector_ostream os(subscriptAccess);
+
+    os << '[' << *fieldNumber << ']';
+
+    emitDiagnostic(diag::could_not_find_tuple_member_did_you_mean_use_subscript,
+                   baseType, *fieldNumber)
+        .fixItReplace(lookupRange, os.str());
+
+    return true;
+  }
+
+  // Loop did not find a suitable subscript.
+  return false;
 }
 
 bool UnintendedExtraGenericParamMemberFailure::diagnoseAsError() {
@@ -6585,7 +6712,12 @@ bool InaccessibleMemberFailure::diagnoseAsError() {
 
   auto loc = nameLoc.isValid() ? nameLoc.getStartLoc() : ::getLoc(anchor);
   auto accessLevel = Member->getFormalAccessScope().accessLevelForDiagnostics();
-  if (auto *CD = dyn_cast<ConstructorDecl>(Member)) {
+  if (accessLevel == AccessLevel::Internal
+        && Member->getAttrs().hasAttribute<CArrayProjectionAttr>()) {
+    // This is a modern C array projection with no matching legacy projection.
+    emitDiagnosticAt(loc, diag::candidate_inaccessible_c_array, Member)
+        .highlight(nameLoc.getSourceRange());
+  } else if (auto *CD = dyn_cast<ConstructorDecl>(Member)) {
     emitDiagnosticAt(loc, diag::init_candidate_inaccessible,
                      CD->getResultInterfaceType(), accessLevel)
         .highlight(nameLoc.getSourceRange());
@@ -7642,8 +7774,26 @@ bool AsyncFunctionConversionFailure::diagnoseAsError() {
 
 bool ConversionBetweenFunctionsWithDifferentExecutionSemantics::
     diagnoseAsError() {
-  emitDiagnostic(diag::called_once_function_type_mismatch, getFromType(),
-                 getToType());
+  auto getSemantics = [](Type type) -> std::optional<ExecutionSemantics> {
+    if (auto *fnType = type->getAs<FunctionType>())
+      return fnType->getExecutionSemantics();
+    return std::nullopt;
+  };
+
+  // Usually the source has the execution semantics. When the constraint
+  // requires the two types to be equal, only the destination might.
+  if (auto semantics = getSemantics(getFromType())) {
+    emitDiagnostic(diag::execution_semantics_function_type_mismatch,
+                   getExecutionSemanticsAttrSpelling(*semantics), getFromType(),
+                   getToType());
+    return true;
+  }
+
+  emitDiagnostic(
+      diag::execution_semantics_function_type_mismatch_to, getFromType(),
+      getExecutionSemanticsAttrSpelling(
+          getSemantics(getToType()).value_or(ExecutionSemantics::AtMostOnce)),
+      getToType());
   return true;
 }
 
@@ -7816,12 +7966,15 @@ bool ArgumentMismatchFailure::diagnoseAsError() {
   if (diagnoseKeyPathAsFunctionResultMismatch())
     return true;
 
+  if (diagnoseInOutToPointerInSubscript())
+    return true;
+
   auto argType = getFromType();
 
   // Unresolved key path argument requires a tailored diagnostic
   // that doesn't mention a fallback type - `KeyPath<_, _>`.
   if (argType->isKeyPath() && !paramType->isKnownKeyPathType()) {
-    auto keyPathTy = argType->castTo<BoundGenericType>();
+    auto keyPathTy = argType->castTo<NominalType>();
     auto rootTy = keyPathTy->getGenericArgs()[0];
     if (rootTy->isBareErrorType()) {
       emitDiagnostic(diag::cannot_convert_unresolved_key_path_argument_value,
@@ -8156,6 +8309,29 @@ bool ArgumentMismatchFailure::diagnoseAttemptedRegexBuilder() const {
   return true;
 }
 
+bool ArgumentMismatchFailure::diagnoseInOutToPointerInSubscript() const {
+  // Only for `&x` passed where a pointer is expected.
+  auto *argExpr = getAsExpr(getAnchor());
+  if (!argExpr || !argExpr->isSemanticallyInOutExpr())
+    return false;
+
+  PointerTypeKind pointerKind;
+  if (!getToType()->lookThroughAllOptionalTypes()->getAnyPointerElementType(
+          pointerKind))
+    return false;
+
+  // The implicit inout-to-pointer conversion deliberately does not apply to
+  // subscript arguments; `inout` there means the index takes the exclusive
+  // access itself. See `matchTypes` in CSSimplify.cpp.
+  auto overload = getCalleeOverloadChoiceIfAvailable(getLocator());
+  if (!overload || !overload->choice.isDecl() ||
+      !isa<SubscriptDecl>(overload->choice.getDecl()))
+    return false;
+
+  emitDiagnostic(diag::cannot_pass_inout_arg_to_subscript);
+  return true;
+}
+
 bool ArgumentMismatchFailure::diagnoseClosureMismatch() const {
   if (!isExpr<ClosureExpr>(getAnchor()))
     return false;
@@ -8187,7 +8363,7 @@ bool ArgumentMismatchFailure::diagnoseKeyPathAsFunctionResultMismatch() const {
   if (!argType->isKnownKeyPathType())
     return false;
 
-  auto kpType = argType->castTo<BoundGenericType>();
+  auto kpType = argType->castTo<NominalType>();
   auto kpRootType = kpType->getGenericArgs()[0];
   auto kpValueType = kpType->getGenericArgs()[1];
 
@@ -8884,8 +9060,8 @@ bool KeyPathRootTypeMismatchFailure::diagnoseAsError() {
 
 bool MultiArgFuncKeyPathFailure::diagnoseAsError() {
   // Diagnose use a keypath where a function with multiple arguments is expected
-  emitDiagnostic(diag::expr_keypath_multiparam_func_conversion,
-                 resolveType(functionType));
+  emitDiagnostic(diag::expr_keypath_wrong_param_func_conversion,
+                 resolveType(functionType), resolveType(expectedType));
   return true;
 }
 
@@ -9986,6 +10162,12 @@ bool OutOfPlaceThenStmtFailure::diagnoseAsError() {
   return true;
 }
 
+bool NonExactlyOnceDeinitArgumentFailure::diagnoseAsError() {
+  emitDiagnostic(diag::without_actually_deiniting_requires_exactly_once,
+                 ArgType);
+  return true;
+}
+
 bool InvalidTypeSpecializationArity::diagnoseAsError() {
   diagnoseInvalidGenericArguments(getLoc(), D,
                                   NumArgs, NumParams,
@@ -10000,7 +10182,10 @@ bool InvalidTypeAsKeyPathSubscriptIndex::diagnoseAsError() {
 }
 
 bool IncorrectInlineArrayLiteralCount::diagnoseAsError() {
-  emitDiagnostic(diag::inlinearray_literal_incorrect_count, lhsCount, rhsCount);
+  SmallString<20> expectedCount;
+  lhsCount->getValue().toStringSigned(expectedCount);
+  emitDiagnostic(diag::inlinearray_literal_incorrect_count, expectedCount,
+                 rhsCount);
   return true;
 }
 

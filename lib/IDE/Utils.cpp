@@ -11,8 +11,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/IDE/Utils.h"
+#include "swift/AST/Module.h"
 #include "swift/AST/SourceFile.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Edit.h"
 #include "swift/Basic/Platform.h"
 #include "swift/Basic/SourceManager.h"
@@ -22,9 +22,7 @@
 #include "clang/AST/ASTContext.h"
 #include "llvm/ADT/RewriteBuffer.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/Support/Compiler.h"
 #include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/Path.h"
 
 using namespace swift;
 using namespace ide;
@@ -550,7 +548,8 @@ static ArrayRef<const char *> getDeviceOnlyModuleList() {
 
 void ide::collectModuleNames(StringRef SDKPath,
                                std::vector<std::string> &Modules) {
-  std::string SDKName = getSDKName(SDKPath);
+  std::string SDKName =
+      getSDKName(SDKPath, *llvm::vfs::createPhysicalFileSystem());
   std::string lowerSDKName = StringRef(SDKName).lower();
   bool isOSXSDK = StringRef(lowerSDKName).contains("macosx");
   bool isDeviceOnly = StringRef(lowerSDKName).contains("iphoneos");
@@ -627,10 +626,10 @@ remove(SourceManager &SM, CharSourceRange Range) {
 
 /// Given the expanded code for a particular macro, perform whitespace
 /// adjustments to make the refactoring more suitable for inline insertion.
-static StringRef
-adjustMacroExpansionWhitespace(GeneratedSourceInfo::Kind kind,
-                               StringRef expandedCode,
-                               llvm::SmallString<64> &scratch) {
+static StringRef adjustMacroExpansionWhitespace(GeneratedSourceInfo::Kind kind,
+                                                StringRef expandedCode,
+                                                llvm::SmallString<64> &scratch,
+                                                SourceFile *originalFile) {
   scratch.clear();
 
   switch (kind) {
@@ -663,8 +662,18 @@ adjustMacroExpansionWhitespace(GeneratedSourceInfo::Kind kind,
   case GeneratedSourceInfo::DefaultArgument:
   case GeneratedSourceInfo::AttributeFromClang:
   case GeneratedSourceInfo::SyntheticMacro:
+    // If inside a macro expansion from a synthetic macro, add a leading
+    // new line so that consecutive buffers do not end/start on the same line,
+    // and the first buffer is not on the same line as the conformance context's
+    // braces.
+    if (originalFile && originalFile->Kind == SourceFileKind::SyntheticMacro) {
+      scratch += "\n";
+      scratch += expandedCode;
+      return scratch;
+    }
     return expandedCode;
   }
+  llvm_unreachable("covered switch");
 }
 
 void swift::ide::SourceEditConsumer::acceptMacroExpansionBuffer(
@@ -682,11 +691,6 @@ void swift::ide::SourceEditConsumer::acceptMacroExpansionBuffer(
       rewrittenBuffer.empty())
     return;
 
-  SmallString<64> scratchBuffer;
-  if (adjustExpansion) {
-    rewrittenBuffer = adjustMacroExpansionWhitespace(
-        generatedInfo->kind, rewrittenBuffer, scratchBuffer);
-  }
 
   // `containingFile` is the file of the actual expansion site, where as
   // `originalFile` is the possibly enclosing buffer. Concretely:
@@ -710,6 +714,24 @@ void swift::ide::SourceEditConsumer::acceptMacroExpansionBuffer(
   SourceFile *originalFile =
       containingSF->getParentModule()->getSourceFileContainingLocation(
           originalSourceRange.getStart());
+
+  SmallString<64> scratchBuffer;
+  if (adjustExpansion) {
+    rewrittenBuffer = adjustMacroExpansionWhitespace(
+        generatedInfo->kind, rewrittenBuffer, scratchBuffer, originalFile);
+  }
+
+  if (originalFile && originalFile->Kind == SourceFileKind::SyntheticMacro) {
+    auto derivationInfo =
+        SM.getGeneratedSourceInfo(originalFile->getBufferID());
+    // The derivation buffer is anchored at the conformance context's opening
+    // brace.
+    auto memberListStart = Lexer::getLocForEndOfToken(
+        SM, derivationInfo->originalSourceRange.getStart());
+    originalSourceRange = CharSourceRange(memberListStart, 0);
+    originalFile = originalFile->getEnclosingSourceFile();
+  }
+
   StringRef originalPath;
   if (containingSF->getBufferID() != originalFile->getBufferID()) {
     originalPath = SM.getIdentifierForBuffer(originalFile->getBufferID());
@@ -1069,8 +1091,8 @@ bool swift::ide::isDynamicRef(Expr *Base, ValueDecl *D, llvm::function_ref<Type(
   // here, but not if the instance type is a struct/enum.
   if (auto IT = getType(Base)->getAs<MetatypeType>()) {
     auto InstanceType = IT->getInstanceType();
-    if (InstanceType->getStructOrBoundGenericStruct() ||
-        InstanceType->getEnumOrBoundGenericEnum())
+    if (InstanceType->getStructDecl() ||
+        InstanceType->getEnumDecl())
       return false;
   }
 

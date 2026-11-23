@@ -10,14 +10,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "ArgumentSource.h"
-#include "Conversion.h"
 #include "ExecutorBreadcrumb.h"
 #include "Initialization.h"
 #include "LValue.h"
 #include "RValue.h"
 #include "SILGenFunction.h"
-#include "SILGenFunctionBuilder.h"
 #include "Scope.h"
 #include "swift/AST/ASTMangler.h"
 #include "swift/AST/AvailabilityDomain.h"
@@ -25,15 +22,12 @@
 #include "swift/AST/AvailabilityRange.h"
 #include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/DistributedDecl.h"
-#include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/PlatformKindUtils.h"
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/ProtocolConformanceRef.h"
-#include "swift/Basic/Assertions.h"
-#include "swift/Basic/Defer.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILDeclRef.h"
 #include "swift/SIL/TypeLowering.h"
@@ -88,19 +82,10 @@ static void initializeProperty(SILGenFunction &SGF, SILLocation loc,
 /******************* COMMON (DISTRIBUTED) SIL PATTERNS ************************/
 /******************************************************************************/
 
-/// Emit the following branch SIL instruction:
-/// \verbatim
-/// if __isRemoteActor(self) {
-///   <isRemoteBB>
-/// } else {
-///   <isLocalBB>
-/// }
-/// \endverbatim
-void SILGenFunction::emitDistributedIfRemoteBranch(SILLocation Loc,
-                                                   SILValue selfValue,
-                                                   Type selfTy,
-                                                   SILBasicBlock *isRemoteBB,
-                                                   SILBasicBlock *isLocalBB) {
+/// Emit a call to `__isRemoteActor(self)` and return the unwrapped i1 result.
+SILValue SILGenFunction::emitDistributedActorIsRemote(SILLocation Loc,
+                                                      SILValue selfValue,
+                                                      Type selfTy) {
   ASTContext &ctx = getASTContext();
 
   SILValue isRemoteResultUnwrapped;
@@ -127,7 +112,24 @@ void SILGenFunction::emitDistributedIfRemoteBranch(SILLocation Loc,
         std::move(result).forwardAsSingleValue(*this, Loc);
     isRemoteResultUnwrapped = emitUnwrapIntegerResult(Loc, isRemoteResult);
   }
-  B.createCondBranch(Loc, isRemoteResultUnwrapped, isRemoteBB, isLocalBB);
+  return isRemoteResultUnwrapped;
+}
+
+/// Emit the following branch SIL instruction:
+/// \verbatim
+/// if __isRemoteActor(self) {
+///   <isRemoteBB>
+/// } else {
+///   <isLocalBB>
+/// }
+/// \endverbatim
+void SILGenFunction::emitDistributedIfRemoteBranch(SILLocation Loc,
+                                                   SILValue selfValue,
+                                                   Type selfTy,
+                                                   SILBasicBlock *isRemoteBB,
+                                                   SILBasicBlock *isLocalBB) {
+  SILValue isRemote = emitDistributedActorIsRemote(Loc, selfValue, selfTy);
+  B.createCondBranch(Loc, isRemote, isRemoteBB, isLocalBB);
 }
 
 // ==== ------------------------------------------------------------------------
@@ -543,11 +545,6 @@ void SILGenFunction::emitDistributedActorSystemResignIDCall(
   case DistributedResignIDKind::ResignRemoteID:
     methodName = ctx.Id_resignRemoteID;
     break;
-  }
-
-  if (kind == DistributedResignIDKind::ResignRemoteID &&
-      !ctx.LangOpts.hasFeature(Feature::DistributedActorResignRemoteID)) {
-    return;
   }
 
   ProtocolDecl *DAS = ctx.getDistributedActorSystemDecl();

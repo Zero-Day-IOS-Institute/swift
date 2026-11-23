@@ -33,6 +33,12 @@ module InheritFRT {
   requires cplusplus
 }
 
+module InheritFRTSubclassing {
+  header "inherit-frt-subclassing.h"
+  requires cplusplus
+  export *
+}
+
 module WitnessTable {
   header "witness-table.h"
   requires cplusplus
@@ -70,6 +76,11 @@ module DerivedFieldGetterReturnsOwnedFRT {
 
 module FunctionsAndMethodsReturningFRT {
   header "cxx-functions-and-methods-returning-frt.h"
+  requires cplusplus
+}
+
+module BorrowAccessorOptionalClosure {
+  header "borrow-accessor-optional-closure.h"
   requires cplusplus
 }
 
@@ -152,5 +163,19 @@ module InheritedGenericArgument {
 
 module LibkernOwnership {
   header "libkern-ownership.hpp"
+  requires cplusplus
+}
+
+module CDeclFRT {
+  header "cdecl.h"
+}
+
+module CFReturnsAttributesFRT {
+  header "frt-cf-returns-attributes.h"
+  requires cplusplus
+}
+
+module MultiPayloadEnum {
+  header "multi-payload-enum.h"
   requires cplusplus
 }

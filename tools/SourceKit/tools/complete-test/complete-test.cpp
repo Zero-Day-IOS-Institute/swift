@@ -13,8 +13,6 @@
 #include "sourcekitd/sourcekitd.h"
 
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/Support/CommandLine.h"
-#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/raw_ostream.h"
@@ -79,7 +77,6 @@ static int handleTestInvocation(TestOptions &options);
 static sourcekitd_uid_t KeyRequest;
 static sourcekitd_uid_t KeyCompilerArgs;
 static sourcekitd_uid_t KeyOffset;
-static sourcekitd_uid_t KeyLength;
 static sourcekitd_uid_t KeySourceFile;
 static sourcekitd_uid_t KeySourceText;
 static sourcekitd_uid_t KeyName;
@@ -311,7 +308,6 @@ static int skt_main(int argc, const char **argv) {
   KeyRequest = sourcekitd_uid_get_from_cstr("key.request");
   KeyCompilerArgs = sourcekitd_uid_get_from_cstr("key.compilerargs");
   KeyOffset = sourcekitd_uid_get_from_cstr("key.offset");
-  KeyLength = sourcekitd_uid_get_from_cstr("key.length");
   KeyKind = sourcekitd_uid_get_from_cstr("key.kind");
   KeyCodeCompleteOptions =
       sourcekitd_uid_get_from_cstr("key.codecomplete.options");

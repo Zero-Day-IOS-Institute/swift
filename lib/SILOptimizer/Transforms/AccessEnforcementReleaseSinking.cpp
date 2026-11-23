@@ -25,7 +25,6 @@
 
 #define DEBUG_TYPE "access-enforcement-release"
 
-#include "swift/Basic/Assertions.h"
 #include "swift/SIL/ApplySite.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/InstructionUtils.h"
@@ -94,6 +93,9 @@ static bool isBarrier(SILInstruction *inst) {
 #define BUILTIN_BINARY_OPERATION_WITH_OVERFLOW(Id, Name, UncheckedID, Attrs,   \
                                                Overload)                       \
   BUILTIN_NO_BARRIER(Id)
+#define BUILTIN_BINARY_OPERATION_RELAXED(Id, Name, UncheckedID, Attrs,         \
+                                         Overload)                             \
+  BUILTIN_NO_BARRIER(Id)
 #define BUILTIN_UNARY_OPERATION(Id, Name, Attrs, Overload)                     \
   BUILTIN_NO_BARRIER(Id)
 #define BUILTIN_BINARY_PREDICATE(Id, Name, Attrs, Overload)                    \
@@ -118,6 +120,7 @@ static bool isBarrier(SILInstruction *inst) {
     case BuiltinValueKind::IsBitwiseTakable:
     case BuiltinValueKind::IsSameMetatype:
     case BuiltinValueKind::Alignof:
+    case BuiltinValueKind::TypedAllocationID:
     case BuiltinValueKind::OnFastPath:
     case BuiltinValueKind::ExtractElement:
     case BuiltinValueKind::InsertElement:
@@ -206,6 +209,7 @@ static bool isBarrier(SILInstruction *inst) {
     case BuiltinValueKind::DestroyDefaultActor:
     case BuiltinValueKind::InitializeDistributedRemoteActor:
     case BuiltinValueKind::InitializeNonDefaultDistributedActor:
+    case BuiltinValueKind::InitializeForeignReferenceSubclassVTables:
     case BuiltinValueKind::BuildOrdinaryTaskExecutorRef:
     case BuiltinValueKind::BuildOrdinarySerialExecutorRef:
     case BuiltinValueKind::BuildComplexEqualitySerialExecutorRef:
@@ -214,6 +218,9 @@ static bool isBarrier(SILInstruction *inst) {
     case BuiltinValueKind::ResumeNonThrowingContinuationReturning:
     case BuiltinValueKind::ResumeThrowingContinuationReturning:
     case BuiltinValueKind::ResumeThrowingContinuationThrowing:
+    case BuiltinValueKind::GetSplitContinuationAddr:
+    case BuiltinValueKind::CreateSplitContinuation:
+    case BuiltinValueKind::DestroySplitContinuation:
     case BuiltinValueKind::AutoDiffProjectTopLevelSubcontext:
     case BuiltinValueKind::AutoDiffAllocateSubcontextWithType:
     case BuiltinValueKind::AddressOfBorrowOpaque:

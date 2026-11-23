@@ -372,6 +372,8 @@ bool MemoryLifetimeVerifier::anyCalleeHasArgumentEffect(
         hasArgumentEffect) {
   if (isa<PartialApplyInst>(argOp->getUser()))
     return partialApplyResult;
+  if (isa<YieldInst>(argOp->getUser()))
+    return unknownCalleesResult;
 
   FullApplySite as(argOp->getUser());
   CalleeList callees;
@@ -406,7 +408,10 @@ bool MemoryLifetimeVerifier::applyMayRead(Operand *argOp, SILValue addr) {
         // This can happen if a store to an unused inout has been eliminated at
         // a call site and afterwards the callee is specialized and therefore
         // doesn't have the required side-effects computed, yet.
-        return callee->hasArgumentEffects() && callee->argumentMayRead(op, a);
+        // Note that this must not check `hasArgumentEffects()`: a specialized
+        // function can inherit _escape_ effects from its generic function
+        // without having any side-effects computed.
+        return callee->hasComputedSideEffects() && callee->argumentMayRead(op, a);
       });
 }
 
@@ -419,7 +424,7 @@ bool MemoryLifetimeVerifier::applyMayNotWrite(Operand *argOp, SILValue addr) {
       /*unknownCalleesResult=*/true,
       /*noAddressResult=*/true,
       [](SILFunction *callee, Operand *op, SILValue a) {
-        return !callee->hasArgumentEffects() || callee->argumentMayWrite(op, a);
+        return !callee->hasComputedSideEffects() || callee->argumentMayWrite(op, a);
       });
 }
 
@@ -550,7 +555,9 @@ void MemoryLifetimeVerifier::initDataflowInBlock(SILBasicBlock *block,
       case SILInstructionKind::UnconditionalCheckedCastAddrInst: {
         SILValue src = I.getOperand(CopyLikeInstruction::Src);
         SILValue dest = I.getOperand(CopyLikeInstruction::Dest);
-        killBits(state, src);
+        auto *cast = dyn_cast<UnconditionalCheckedCastAddrInst>(&I);
+        if (!cast || !cast->isCopy())
+          killBits(state, src);
         genBits(state, dest);
         break;
       }
@@ -652,8 +659,12 @@ void MemoryLifetimeVerifier::setBitsOfPredecessor(Bits &getSet, Bits &killSet,
       break;
     case CastConsumptionKind::BorrowAlways:
       llvm_unreachable("checked_cast_addr_br cannot have BorrowAlways");
+    case CastConsumptionKind::TestOnly:
+      break;
     }
-    if (castInst->getSuccessBB() == block)
+    // A test_only cast produces no value and has no destination, so there is
+    // nothing to mark initialized on the success edge.
+    if (castInst->getSuccessBB() == block && castInst->hasDest())
       locations.genBits(getSet, killSet, castInst->getDest());
   }
 }
@@ -703,6 +714,7 @@ void MemoryLifetimeVerifier::checkFunction(BitDataflow &dataFlow) {
   // Collect the bits which we require to be set at function exits.
   Bits expectedReturnBits(locations.getNumLocations());
   Bits expectedThrowBits(locations.getNumLocations());
+  Bits expectedUnwindBits(locations.getNumLocations());
   for (SILArgument *arg : function->getArguments()) {
     SILFunctionArgument *funcArg = cast<SILFunctionArgument>(arg);
     switch (funcArg->getArgumentConvention()) {
@@ -710,6 +722,7 @@ void MemoryLifetimeVerifier::checkFunction(BitDataflow &dataFlow) {
     case SILArgumentConvention::Indirect_In_Guaranteed:
       locations.setBits(expectedReturnBits, funcArg);
       locations.setBits(expectedThrowBits, funcArg);
+      locations.setBits(expectedUnwindBits, funcArg);
       break;
     case SILArgumentConvention::Indirect_Out:
       if (funcArg->isIndirectErrorResult()) {
@@ -749,11 +762,18 @@ void MemoryLifetimeVerifier::checkFunction(BitDataflow &dataFlow) {
     assert(bits == bs.data.exitSet || isa<TryApplyInst>(term));
     switch (term->getKind()) {
       case SILInstructionKind::ReturnInst:
-      case SILInstructionKind::UnwindInst:
         require(expectedReturnBits & ~bs.data.exitSet,
           "indirect argument is not alive at function return", term);
         require(bs.data.exitSet & ~expectedReturnBits & nonTrivialLocations,
                 "memory is initialized at function return but shouldn't be",
+                term,
+                /*excludeTrivialEnums*/ true);
+        break;
+      case SILInstructionKind::UnwindInst:
+        require(expectedUnwindBits & ~bs.data.exitSet,
+                "indirect argument is not alive at coroutine return", term);
+        require(bs.data.exitSet & ~expectedUnwindBits & nonTrivialLocations,
+                "memory is initialized at coroutine return but shouldn't be",
                 term,
                 /*excludeTrivialEnums*/ true);
         break;
@@ -890,7 +910,7 @@ void MemoryLifetimeVerifier::checkBlock(SILBasicBlock *block, Bits &bits) {
           locations.clearBits(bits, sbi->getDest());
         } else if (auto *lbi = dyn_cast<LoadBorrowInst>(ebi->getOperand())) {
           if (!lbi->isUnchecked()) {
-            requireBitsSet(bits, lbi->getOperand(), &I);
+            requireBitsSet(bits, lbi->getAddress(), &I);
           }
         }
         break;
@@ -900,7 +920,9 @@ void MemoryLifetimeVerifier::checkBlock(SILBasicBlock *block, Bits &bits) {
         SILValue src = I.getOperand(CopyLikeInstruction::Src);
         SILValue dest = I.getOperand(CopyLikeInstruction::Dest);
         requireBitsSet(bits, src, &I);
-        locations.clearBits(bits, src);
+        auto *cast = dyn_cast<UnconditionalCheckedCastAddrInst>(&I);
+        if (!cast || !cast->isCopy())
+          locations.clearBits(bits, src);
         requireBitsClear(bits & nonTrivialLocations, dest, &I);
         locations.setBits(bits, dest);
         requireNoStoreBorrowLocation(dest, &I);
@@ -909,7 +931,9 @@ void MemoryLifetimeVerifier::checkBlock(SILBasicBlock *block, Bits &bits) {
       case SILInstructionKind::CheckedCastAddrBranchInst: {
         auto *castInst = cast<CheckedCastAddrBranchInst>(&I);
         requireBitsSet(bits, castInst->getSrc(), &I);
-        requireBitsClear(bits & nonTrivialLocations, castInst->getDest(), &I);
+        // A test_only cast has no destination to require uninitialized.
+        if (castInst->hasDest())
+          requireBitsClear(bits & nonTrivialLocations, castInst->getDest(), &I);
         break;
       }
       case SILInstructionKind::PartialApplyInst:

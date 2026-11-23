@@ -12,10 +12,10 @@
 
 #include "swift/SILOptimizer/Utils/ConstantFolding.h"
 
+#include "swift/AST/AvailabilityQuery.h"
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/SemanticAttrs.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/PatternMatch.h"
 #include "swift/SIL/SILBuilder.h"
@@ -150,7 +150,6 @@ APInt swift::constantFoldCast(APInt val, const BuiltinInfo &BI) {
   uint32_t DestBitWidth =
   DestTy->castTo<BuiltinIntegerType>()->getGreatestWidth();
 
-  APInt CastResV;
   if (SrcBitWidth == DestBitWidth) {
     return val;
   } else switch (BI.ID) {
@@ -746,9 +745,12 @@ static SILValue constantFoldBinary(BuiltinInst *BI, BuiltinValueKind ID,
     return B.createIntegerLiteral(BI->getLoc(), BI->getType(), ResI);
   }
   case BuiltinValueKind::FAdd:
+  case BuiltinValueKind::FAddRelaxed:
   case BuiltinValueKind::FDiv:
   case BuiltinValueKind::FMul:
-  case BuiltinValueKind::FSub: {
+  case BuiltinValueKind::FMulRelaxed:
+  case BuiltinValueKind::FSub:
+  case BuiltinValueKind::FSubRelaxed: {
     OperandValueArrayRef Args = BI->getArguments();
     auto *LHS = dyn_cast<FloatLiteralInst>(Args[0]);
     auto *RHS = dyn_cast<FloatLiteralInst>(Args[1]);
@@ -759,15 +761,18 @@ static SILValue constantFoldBinary(BuiltinInst *BI, BuiltinValueKind ID,
     switch (ID) {
     default: llvm_unreachable("Not all cases are covered!");
     case BuiltinValueKind::FAdd:
+    case BuiltinValueKind::FAddRelaxed:
       LHSF.add(RHSF, APFloat::rmNearestTiesToEven);
       break;
     case BuiltinValueKind::FDiv:
       LHSF.divide(RHSF, APFloat::rmNearestTiesToEven);
       break;
     case BuiltinValueKind::FMul:
+    case BuiltinValueKind::FMulRelaxed:
       LHSF.multiply(RHSF, APFloat::rmNearestTiesToEven);
       break;
     case BuiltinValueKind::FSub:
+    case BuiltinValueKind::FSubRelaxed:
       LHSF.subtract(RHSF, APFloat::rmNearestTiesToEven);
       break;
     }
@@ -1553,6 +1558,23 @@ static bool isApplyOfBuiltin(SILInstruction &I, BuiltinValueKind kind) {
   return false;
 }
 
+/// Returns the kind of OS version query function that `callee` is, or
+/// `std::nullopt` if `callee` is not one of those functions.
+///
+/// The type checker adds the kind to the `availability.osversion` semantics
+/// attribute of the standard library's query functions, e.g.,
+/// `availability.osversion(isOSVersionAtLeast)`. Because the kind is part of
+/// the attribute, it is also found on clones and specializations of those
+/// functions.
+static std::optional<OSVersionQueryKind>
+getOSVersionQueryKind(SILFunction *callee) {
+  for (const auto &attr : callee->getSemanticsAttrs()) {
+    if (auto kind = parseOSVersionQuerySemanticsAttr(attr))
+      return kind;
+  }
+  return std::nullopt;
+}
+
 static bool isApplyOfKnownAvailability(SILInstruction &I) {
   // Inlinable functions can be deserialized in other modules which can be
   // compiled with a different deployment target.
@@ -1565,28 +1587,28 @@ static bool isApplyOfKnownAvailability(SILInstruction &I) {
   auto callee = apply.getReferencedFunctionOrNull();
   if (!callee)
     return false;
-  if (!callee->hasSemanticsAttr("availability.osversion"))
-    return false;
-  auto &context = I.getFunction()->getASTContext();
-  auto deploymentAvailability = AvailabilityRange::forDeploymentTarget(context);
-  if (apply.getNumArguments() != 3)
-    return false;
-  auto arg0 = dyn_cast<IntegerLiteralInst>(apply.getArgument(0));
-  if (!arg0)
-    return false;
-  auto arg1 = dyn_cast<IntegerLiteralInst>(apply.getArgument(1));
-  if (!arg1)
-    return false;
-  auto arg2 = dyn_cast<IntegerLiteralInst>(apply.getArgument(2));
-  if (!arg2)
+
+  auto queryKind = getOSVersionQueryKind(callee);
+  if (!queryKind)
     return false;
 
-  auto version = VersionRange::allGTE(llvm::VersionTuple(
-      arg0->getValue().getLimitedValue(), arg1->getValue().getLimitedValue(),
-      arg2->getValue().getLimitedValue()));
+  // Give up unless the arguments are all integer literals. Each argument is one
+  // component of one of the versions that the query tests.
+  SmallVector<unsigned, 6> arguments;
+  for (auto argument : apply.getArguments()) {
+    auto *literal = dyn_cast<IntegerLiteralInst>(argument);
+    if (!literal)
+      return false;
+    arguments.push_back(literal->getValue().getLimitedValue());
+  }
 
-  auto callAvailability = AvailabilityRange(version);
-  return deploymentAvailability.isContainedIn(callAvailability);
+  auto &ctx = I.getFunction()->getASTContext();
+  auto query =
+      AvailabilityQuery::forOSVersionQueryCall(*queryKind, arguments, ctx);
+  if (!query)
+    return false;
+
+  return query->isAlwaysTrueForDeploymentTargets(ctx);
 }
 
 static bool isApplyOfStringConcat(SILInstruction &I) {
@@ -1798,6 +1820,8 @@ ConstantFolder::processWorkList() {
                           WorkList.remove(I);
                           I->eraseFromParent();
                         });
+  if (EnableDiagnostics)
+    CastOpt.setPreserveDebugInfo();
 
   auto callbacks =
       InstModCallbacks().onDelete([&](SILInstruction *instToDelete) {

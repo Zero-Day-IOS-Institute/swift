@@ -18,18 +18,20 @@
 #include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
+#include "swift/AST/MacroDefinition.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/SynthesizedDeclBuilder.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/Assertions.h"
+#include "swift/Basic/Feature.h"
 #include "swift/Basic/QuotedString.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -139,10 +141,9 @@ bool DerivedConformance::derivesProtocolConformance(
         // conformance.
       case KnownDerivableProtocolKind::Equatable:
         return canDeriveEquatable(DC, Nominal);
-      
+
       case KnownDerivableProtocolKind::Comparable:
-        return !enumDecl->hasPotentiallyUnavailableCaseValue()
-            && canDeriveComparable(DC, enumDecl); 
+        return canDeriveComparable(DC, enumDecl);
 
         // "Simple" enums without availability attributes can explicitly derive
         // a CaseIterable conformance.
@@ -404,6 +405,20 @@ ValueDecl *DerivedConformance::getDerivableRequirement(NominalTypeDecl *nominal,
       if (argumentNames.size() == 2 &&
           argumentNames[0] == ctx.Id_id &&
           argumentNames[1] == ctx.Id_using) {
+        return getRequirement(KnownProtocolKind::DistributedActor);
+      }
+    }
+
+    // Embedded Swift only:
+    // DistributedActor._executeDistributedTarget(target:invocationDecoder:resultHandler:)
+    if (ctx.LangOpts.hasFeature(Feature::Embedded) &&
+        name.isCompoundName() &&
+        name.getBaseName() == ctx.Id_executeDistributedTarget) {
+      auto argumentNames = name.getArgumentNames();
+      if (argumentNames.size() == 3 &&
+          argumentNames[0] == ctx.getIdentifier("target") &&
+          argumentNames[1] == ctx.getIdentifier("invocationDecoder") &&
+          argumentNames[2] == ctx.getIdentifier("resultHandler")) {
         return getRequirement(KnownProtocolKind::DistributedActor);
       }
     }
@@ -1106,10 +1121,24 @@ swift::deriveRequirementViaMacro(DerivedConformance &derived,
   }
   ASSERT(expansion);
 
+  auto *macro = C.getBuiltinDerivedConformanceMacroDecl(macroKind);
+
+  auto external = macro->getDefinition().getExternalMacro();
+  auto externalDef =
+      evaluateOrDefault(C.evaluator,
+                        ExternalMacroDefinitionRequest{&C, external.moduleName,
+                                                       external.macroTypeName},
+                        ExternalMacroDefinition::error(""));
+  if (externalDef.isError()) {
+    derived.ConformanceDecl->diagnose(
+        diag::derivation_macro_could_not_be_loaded,
+        external.macroTypeName, requirement->getName(), external.moduleName);
+    return nullptr;
+  }
+
   // Resolve the macro reference directly to the builtin MacroDecl, bypassing
   // name lookup.
-  expansion->setMacroRef(
-      ConcreteDeclRef(C.getBuiltinDerivedConformanceMacroDecl(macroKind)));
+  expansion->setMacroRef(ConcreteDeclRef(macro));
 
   // Find the expanded `ValueDecl *` and return it. There should only ever be a
   // single one.
@@ -1124,8 +1153,13 @@ swift::deriveRequirementViaMacro(DerivedConformance &derived,
 
     witness = vDecl;
   });
-  ASSERT(witness && "Expected a witness but got NULL");
-
+  
+  if (!witness) {
+    derived.ConformanceDecl->diagnose(
+        diag::failed_to_expand_derived_conformance, derived.getProtocolType());
+    return nullptr;
+  }
+  
   expansion->forEachExpandedNode([&](ASTNode node) {
     auto *decl = node.dyn_cast<Decl *>();
     if (!decl)
@@ -1141,12 +1175,138 @@ swift::deriveRequirementViaMacro(DerivedConformance &derived,
   return witness;
 }
 
+bool swift::checkAvailabilityForElement(
+    const EnumElementDecl *elt, AvailabilityContext availabilityContext,
+    SmallVectorImpl<AvailabilityQuery> &availabilityQueries) {
+  auto &C = elt->getASTContext();
+
+  // A case should not be emitted for an element that is unreachable at runtime
+  // since otherwise that unavailable element could be constructed illegally via
+  // instantiation from a specific raw value. Hand-written versions of
+  // init(rawValue:) would most likely handle this by wrapping the case in an
+  // appropriate `#if` condition, which we cannot do in code synthesis. Leaving
+  // the case out also keeps its raw value from appearing in the generated code,
+  // which matters for an element that is hidden behind a disabled domain.
+  //
+  // An element of an enum that is itself unreachable is exempt. Every element
+  // of such an enum inherits its unreachability, so honoring it here would
+  // leave init(rawValue:) with no cases at all.
+  if (elt->isUnreachableAtRuntime() &&
+      !elt->getParentEnum()->isUnreachableAtRuntime())
+    return false;
+
+  for (auto const &restriction :
+       availabilityContext.allRestrictionsForDecl(elt)) {
+    // Deprecation doesn't prevent the case from being reached.
+    if (restriction.isDeprecated())
+      continue;
+
+    auto domain = restriction.getDomain();
+
+    // Unavailability restrictions must be handled carefully. If there is no
+    // way to express an availability query that corresponds to the restriction
+    // then a case cannot be synthesized for this element.
+    if (restriction.isUnavailable() &&
+        (domain.isVersioned() || !domain.supportsQueries()))
+      return false;
+
+    // Some restrictions are active for type checking but can't translate to
+    // runtime restrictions.
+    if (!restriction.isActiveForRuntimeQueries(C))
+      continue;
+
+    // There is no query that can guard the case, so it can never be reached.
+    if (!domain.supportsQueries())
+      return false;
+
+    // Comparisons must be made in the canonical domain for the current
+    // compilation, which may differ from the domain that was written.
+    auto domainAndRange = restriction.getDomainAndRange(C);
+    domain = domainAndRange.getDomain();
+
+    // Only a versioned domain takes a version argument in a query.
+    std::optional<AvailabilityRange> range;
+    if (domain.isVersioned())
+      range.emplace(domainAndRange.getRange());
+
+    auto query = AvailabilityQuery::forDomain(domain, range,
+                                              /*variantRange=*/std::nullopt)
+                     .asUnavailable(restriction.isUnavailable());
+
+    availabilityQueries.push_back(query);
+  }
+
+  return true;
+}
+
+/// Prints the minimum version of \p range as a string literal, or `nil` if the
+/// range does not constrain the version to \p out.
+static void printAvailabilityRange(llvm::raw_ostream &out,
+                                   std::optional<AvailabilityRange> range) {
+  if (!range || !range->hasMinimumVersion()) {
+    out << "nil";
+    return;
+  }
+
+  out << QuotedString(range->getRawMinimumVersion().getAsString());
+}
+
+/// Prints the AvailabilityDomain \p domain as a quoted string to \p
+/// out.
+static void printAvailabilityDomain(llvm::raw_ostream &out,
+                                    AvailabilityDomain domain) {
+  std::string scratch = {};
+  auto s = llvm::raw_string_ostream(scratch);
+  domain.print(s);
+  printAsQuotedString(out, s.str());
+}
+
+/// Prints a string containing swift syntax describing the AvailabilityQuery \p
+/// query to \p out.
+static void printAvailabilityQuery(llvm::raw_ostream &out,
+                                   const AvailabilityQuery &query) {
+  out << "AvailabilityQuery(domain: ";
+  printAvailabilityDomain(out, query.getDomain());
+  out << ", primaryRange: ";
+  printAvailabilityRange(out, query.getPrimaryRange());
+  out << ", variantRange: ";
+  printAvailabilityRange(out, query.getVariantRange());
+  out << ", isUnavailability: "
+      << (query.isUnavailability() ? "true" : "false");
+  out << ", constantResult: ";
+  auto constantResult = query.getConstantResult();
+  out << (constantResult ? ((*constantResult) ? "true" : "false") : "nil");
+  out << ")";
+}
+
+/// Prints the Swift source text of an enum case's raw value literal
+/// expression \p raw to \p out.
+static void printRawValueLiteral(llvm::raw_ostream &out,
+                                 const LiteralExpr *raw) {
+  if (auto *intLit = dyn_cast<IntegerLiteralExpr>(raw)) {
+    if (intLit->isNegative())
+      out << "-";
+    out << intLit->getDigitsText();
+  } else if (isa<NilLiteralExpr>(raw)) {
+    out << "nil";
+  } else if (auto *stringLit = dyn_cast<StringLiteralExpr>(raw)) {
+    out << QuotedString(stringLit->getValue());
+  } else if (auto *floatLit = dyn_cast<FloatLiteralExpr>(raw)) {
+    if (floatLit->isNegative())
+      out << "-";
+    out << floatLit->getDigitsText();
+  } else if (auto *boolLit = dyn_cast<BooleanLiteralExpr>(raw)) {
+    out << (boolLit->getValue() ? "true" : "false");
+  } else {
+    llvm_unreachable("invalid raw literal expr");
+  }
+}
+
 /// Prints a string containing swift syntax describing the case \p  decl with
 /// relevant information to \p out.
 static void printEnumCaseInfo(llvm::raw_ostream &out,
                               const EnumElementDecl *decl) {
-  bool markReachable = !decl->isUnreachableAtRuntime() ||
-                       decl->getParentEnum()->isUnreachableAtRuntime();
+  auto &C = decl->getASTContext();
   // Escape names as they must appear in source so a keyword-named case or
   // label (`init`, `class`, ...) round-trips as a valid reference in the
   // macros.
@@ -1165,18 +1325,54 @@ static void printEnumCaseInfo(llvm::raw_ostream &out,
                   name.str(), PrintNameContext::FunctionParameterExternal));
         }
       });
-  out << "], isReachable: " << (markReachable ? "true" : "false") << ")";
+  auto availabilityContext = AvailabilityContext::forDeploymentTarget(C);
+  SmallVector<AvailabilityQuery, 2> availabilityQueries;
+  bool isConstructible = checkAvailabilityForElement(decl, availabilityContext,
+                                                     availabilityQueries);
+  bool isReachable = !decl->isUnreachableAtRuntime() ||
+                     decl->getParentEnum()->isUnreachableAtRuntime();
+
+  out << "], rawValue: ";
+  if (auto *raw = decl->getRawValueExpr()) {
+    std::string literalText;
+    auto litOut = llvm::raw_string_ostream(literalText);
+    printRawValueLiteral(litOut, raw);
+    out << QuotedString(litOut.str());
+  } else {
+    out << "nil";
+  }
+  out << ", isReachable: " << (isReachable ? "true" : "false")
+      << ", isConstructible: " << (isConstructible ? "true" : "false")
+      << ", runtimeAvailabilityQueries: [";
+  llvm::interleaveComma(availabilityQueries, out,
+                        [&out](const AvailabilityQuery &query) {
+                          printAvailabilityQuery(out, query);
+                        });
+  out << "])";
+}
+
+std::string swift::getEnumTypeInfoString(EnumDecl *decl) {
+  std::string s;
+  llvm::raw_string_ostream out(s);
+  out << "EnumTypeInfo(isObjC: " << (decl->isObjC() ? "true" : "false")
+      << ", cases: [";
+  llvm::interleaveComma(
+      decl->getAllElements(), out,
+      [&](const EnumElementDecl *elem) { printEnumCaseInfo(out, elem); });
+  out << "], rawTypeName: ";
+  if (Type rawType = decl->getRawType()) {
+    out << QuotedString(rawType->getString());
+  } else {
+    out << "nil";
+  }
+  out << ")";
+  return s;
 }
 
 /// Prints a string containing swift syntax describing the enum \p
 /// decl with relevant information to \p out.
 static void printEnumTypeKind(llvm::raw_ostream &out, EnumDecl *decl) {
-  out << "enumLike(EnumTypeInfo(isObjC: " << (decl->isObjC() ? "true" : "false")
-      << ", cases: [";
-  llvm::interleaveComma(
-      decl->getAllElements(), out,
-      [&](const EnumElementDecl *elem) { printEnumCaseInfo(out, elem); });
-  out << "]))";
+  out << "enumLike(" << getEnumTypeInfoString(decl) << ")";
 }
 
 /// Prints a string containing swift syntax describing the stored property \p
@@ -1225,7 +1421,8 @@ static void printNominalTypeKind(llvm::raw_ostream &out,
 
 std::string swift::getNominalTypeInfoString(DerivedConformance &derived) {
   bool isUnsafe =
-      derived.Conformance->getExplicitSafety() == ExplicitSafety::Unsafe;
+      derived.Conformance->getExplicitSafety() == ExplicitSafety::Unsafe ||
+      derived.Nominal->getExplicitSafety() == ExplicitSafety::Unsafe;
 
   // A parameter of noncopyable type has to state its ownership explicitly.
   // The old synthesis built parameters without a TypeRepr, which is the only

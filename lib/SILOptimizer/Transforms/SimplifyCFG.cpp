@@ -32,11 +32,11 @@
 
 #include "swift/SILOptimizer/Transforms/SimplifyCFG.h"
 #include "swift/AST/Module.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/SIL/BasicBlockDatastructures.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/Dominance.h"
 #include "swift/SIL/InstructionUtils.h"
+#include "swift/SIL/NodeDatastructures.h"
 #include "swift/SIL/Projection.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILModule.h"
@@ -45,7 +45,6 @@
 #include "swift/SIL/Test.h"
 #include "swift/SILOptimizer/Analysis/DeadEndBlocksAnalysis.h"
 #include "swift/SILOptimizer/Analysis/DominanceAnalysis.h"
-#include "swift/SILOptimizer/Analysis/ProgramTerminationAnalysis.h"
 #include "swift/SILOptimizer/Analysis/SimplifyInstruction.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
@@ -57,6 +56,7 @@
 #include "swift/SILOptimizer/Utils/OwnershipOptUtils.h"
 #include "swift/SILOptimizer/Utils/SILInliner.h"
 #include "swift/SILOptimizer/Utils/SILSSAUpdater.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
@@ -690,7 +690,7 @@ getEnumCaseRecursive(SILValue Val, SILBasicBlock *UsedInBB, int RecursionDepth,
     return nullptr;
 
   // Handle the obvious case.
-  if (auto *EI = dyn_cast<EnumInst>(Val))
+  if (auto *EI = dyn_cast<EnumInst>(lookThroughOwnershipInsts(Val)))
     return EI->getElement();
 
   // Check if the value is dominated by a switch_enum, e.g.
@@ -854,6 +854,30 @@ static bool couldRemoveRelease(SILBasicBlock *SrcBB, SILValue SrcV,
   return IsReleaseOfDest;
 }
 
+/// Returns true if the condition of \p condBr is computed from \p arg, only
+/// considering instructions in the block of \p condBr.
+/// Only then, substituting a constant for \p arg has a chance to fold the
+/// cond_br after jump threading.
+static bool conditionDependsOnArgument(CondBranchInst *condBr,
+                                       SILArgument *arg) {
+  SILBasicBlock *block = condBr->getParent();
+  ValueWorklist worklist(condBr->getCondition());
+  unsigned numVisitedInsts = 0;
+  while (SILValue v = worklist.pop()) {
+    if (v == arg)
+      return true;
+    auto *inst = v->getDefiningInstruction();
+    if (!inst || inst->getParent() != block)
+      continue;
+    // Avoid compile time problems for corner cases of very large blocks.
+    if (++numVisitedInsts > 16)
+      return false;
+    for (SILValue op : inst->getOperandValues())
+      worklist.pushIfNotVisited(op);
+  }
+  return false;
+}
+
 /// Returns true if any instruction in \p block may write memory.
 static bool blockMayWriteMemory(SILBasicBlock *block) {
   for (auto instAndIdx : llvm::enumerate(*block)) {
@@ -947,9 +971,14 @@ bool SimplifyCFG::tryJumpThreading(BranchInst *BI) {
   }
 
   if (ThreadingBudget == 0) {
-    if (isa<CondBranchInst>(destTerminator)) {
-      for (auto V : BI->getArgs()) {
-        if (isa<IntegerLiteralInst>(V) || isa<FloatLiteralInst>(V)) {
+    if (auto *condBr = dyn_cast<CondBranchInst>(destTerminator)) {
+      for (unsigned i : indices(BI->getArgs())) {
+        SILValue V = BI->getArg(i);
+        // Jump threading a literal is only worth it if it can simplify the
+        // branch condition. Otherwise we would just duplicate code, which can
+        // lead to exponential code growth for chains of diamond-shaped CFGs.
+        if ((isa<IntegerLiteralInst>(V) || isa<FloatLiteralInst>(V)) &&
+            conditionDependsOnArgument(condBr, DestBB->getArgument(i))) {
           ThreadingBudget = 4;
           break;
         }
@@ -1176,6 +1205,101 @@ TrampolineDest::TrampolineDest(SILBasicBlock *sourceBB,
   destBB = destBlock;
 }
 
+/// Clones the debug_values of a bypassed \p trampolineBB before \p insertPt.
+static void forwardTrampolineDebugValues(SILBasicBlock *trampolineBB,
+                                         SILInstruction *insertPt) {
+  for (SILInstruction &inst : *trampolineBB) {
+    if (isa<DebugValueInst>(inst))
+      inst.clone(insertPt);
+  }
+}
+
+/// Identifies the variable described by \p dvi. Fragments are separate
+/// variables.
+static SILDebugVariable getVariableKey(DebugValueInst *dvi) {
+  SILDebugVariable var = *dvi->getVarInfo();
+  var.Type = std::nullopt;
+  var.DIExpr = var.DIExpr.getFragmentPart();
+  return var;
+}
+
+/// Whether \p a and \p b describe the same value of a variable.
+static bool isSameDebugValue(DebugValueInst *a, DebugValueInst *b) {
+  // Debug reconstruction blocks are not compared.
+  if (a->getDebugReconstructionBlock() || b->getDebugReconstructionBlock())
+    return false;
+  return a->getSingleOperand() == b->getSingleOperand() &&
+         a->getCompleteVarInfo() == b->getCompleteVarInfo() &&
+         a->usesMoveableValueDebugInfo() == b->usesMoveableValueDebugInfo() &&
+         a->hasTrace() == b->hasTrace();
+}
+
+/// Creates a debug_value before \p insertPt which describes the variable of
+/// \p dvi as optimized out.
+static void createKilledDebugValue(DebugValueInst *dvi,
+                                   SILInstruction *insertPt) {
+  SILFunction *f = dvi->getFunction();
+  // When fragments are removed, this could just use the vartype.
+  SILValue described;
+  if (auto *debugBB = dvi->getDebugReconstructionBlock())
+    described = cast<ReturnInst>(debugBB->getTerminator())->getOperand();
+  else
+    described = dvi->getSingleOperand();
+  SILType type = described->getType().getObjectType();
+  SILDebugVariable var = dvi->getCompleteVarInfo();
+  // Like killOperand: address-only types keep the address and deref.
+  if (!type.isLoadableOrOpaque(*f)) {
+    type = type.getAddressType();
+  } else if (var.DIExpr.startsWithDeref()) {
+    var.DIExpr.eraseElement(var.DIExpr.element_begin());
+  }
+  SILBuilder builder(insertPt, dvi->getDebugScope());
+  builder.createDebugValue(dvi->getLoc(), SILUndef::get(f, type), var,
+                           dvi->usesMoveableValueDebugInfo(), dvi->hasTrace());
+}
+
+/// Joins the debug_values of \p trampolineBBs, the paths to a common
+/// destination, before \p insertPt. The last debug_value of a variable in each
+/// path is kept if it is the same on all paths, and killed otherwise.
+static void joinTrampolineDebugValues(ArrayRef<SILBasicBlock *> trampolineBBs,
+                                      SILInstruction *insertPt) {
+  size_t trampolineCount = trampolineBBs.size();
+  // Map of each debug variable to the debug_values defining them in each
+  // trampoline. The SmallVector stores one debug_value per trampoline.
+  llvm::MapVector<SILDebugVariable, SmallVector<DebugValueInst *, 2>>
+      lastDebugValues;
+  for (size_t i = 0; i != trampolineCount; ++i) {
+    for (SILInstruction &inst : *trampolineBBs[i]) {
+      auto *dvi = dyn_cast<DebugValueInst>(&inst);
+      if (!dvi)
+        continue;
+      auto &debugValues = lastDebugValues[getVariableKey(dvi)];
+      debugValues.resize(trampolineCount);
+      // Set this debug_value as defining the variable for the current
+      // trampoline. Only the last definition is kept.
+      debugValues[i] = dvi;
+    }
+  }
+  for (auto &entry : lastDebugValues) {
+    ArrayRef<DebugValueInst *> debugValues = entry.second;
+    // Find the first nonnull debug_value, and check if the debug_value is the
+    // same in all trampolines.
+    DebugValueInst *first =
+        *llvm::find_if(debugValues, [](DebugValueInst *dvi) { return dvi; });
+    bool allSame = llvm::all_of(debugValues, [&](DebugValueInst *dvi) {
+      return dvi && isSameDebugValue(dvi, first);
+    });
+    // The debug_value is cloned if they are all the same, otherwise it is
+    // killed. Debug reconstruction block comparison is not supported.
+    // Moving the debug_value up is safe: as critical edges don't exist in
+    // SIL, all values that exist in the trampoline exist at insertPt.
+    if (allSame)
+      first->clone(insertPt);
+    else
+      createKilledDebugValue(first, insertPt);
+  }
+}
+
 #ifndef NDEBUG
 /// Is the block reachable from the entry.
 static bool isReachable(SILBasicBlock *Block) {
@@ -1326,6 +1450,8 @@ bool SimplifyCFG::simplifyBranchBlock(BranchInst *BI) {
     LLVM_DEBUG(llvm::dbgs()
                << "jump to trampoline from bb" << BB->getDebugID() << " to bb"
                << trampolineDest.destBB->getDebugID() << '\n');
+    // Debug values from the bypassed trampoline are forwarded before the `br`.
+    forwardTrampolineDebugValues(DestBB, BI);
     SILBuilderWithScope(BI).createBranch(BI->getLoc(), trampolineDest.destBB,
                                          trampolineDest.newSourceBranchArgs);
     // Eliminating the trampoline can expose opportunities to improve the
@@ -1550,6 +1676,10 @@ bool SimplifyCFG::simplifyCondBrBlock(CondBranchInst *BI) {
                << trueTrampolineDest.destBB->getDebugID() << '\n');
 
     eraseTrampolineDestArgs(trueTrampolineDest);
+    // Debug values from the bypassed trampoline are forwarded to its
+    // destination, as the destination has exactly one predecessor.
+    forwardTrampolineDebugValues(TrueSide,
+                                 &*trueTrampolineDest.destBB->begin());
     SILBuilderWithScope(BI).createCondBranch(
         BI->getLoc(), BI->getCondition(), trueTrampolineDest.destBB,
         FalseSide, BI->getTrueBBCount(), BI->getFalseBBCount());
@@ -1571,6 +1701,8 @@ bool SimplifyCFG::simplifyCondBrBlock(CondBranchInst *BI) {
                << falseTrampolineDest.destBB->getDebugID() << '\n');
 
     eraseTrampolineDestArgs(falseTrampolineDest);
+    forwardTrampolineDebugValues(FalseSide,
+                                 &*falseTrampolineDest.destBB->begin());
     SILBuilderWithScope(BI).createCondBranch(
         BI->getLoc(), BI->getCondition(), TrueSide,
         falseTrampolineDest.destBB, BI->getTrueBBCount(),
@@ -1585,28 +1717,16 @@ bool SimplifyCFG::simplifyCondBrBlock(CondBranchInst *BI) {
 
   // Simplify cond_br where both sides jump to the same blocks with the same
   // args.
-  auto condBrToBr = [&](ArrayRef<SILValue> branchArgs, SILBasicBlock *newDest) {
+  if (trueTrampolineDest && (trueTrampolineDest == falseTrampolineDest)) {
     LLVM_DEBUG(llvm::dbgs()
                << "replace cond_br with same dests with br: " << *BI);
-    SILBuilderWithScope(BI).createBranch(BI->getLoc(), newDest, branchArgs);
+    joinTrampolineDebugValues({TrueSide, FalseSide}, BI);
+    SILBuilderWithScope(BI).createBranch(BI->getLoc(),
+                                         trueTrampolineDest.destBB,
+                                         trueTrampolineDest.newSourceBranchArgs);
     BI->eraseFromParent();
     addToWorklist(ThisBB);
     ++NumConstantFolded;
-  };
-  if (trueTrampolineDest.destBB == FalseSide
-      && trueTrampolineDest.newSourceBranchArgs.empty()) {
-    condBrToBr(trueTrampolineDest.newSourceBranchArgs, FalseSide);
-    removeIfDead(TrueSide);
-    return true;
-  }
-  if (falseTrampolineDest.destBB == TrueSide) {
-    condBrToBr(falseTrampolineDest.newSourceBranchArgs, TrueSide);
-    removeIfDead(FalseSide);
-    return true;
-  }
-  if (trueTrampolineDest && (trueTrampolineDest == falseTrampolineDest)) {
-    condBrToBr(trueTrampolineDest.newSourceBranchArgs,
-               trueTrampolineDest.destBB);
     removeIfDead(TrueSide);
     removeIfDead(FalseSide);
     return true;
@@ -1616,7 +1736,7 @@ bool SimplifyCFG::simplifyCondBrBlock(CondBranchInst *BI) {
   // select_enum with the first case and swap our operands. This simplifies
   // later dominance based processing.
   if (auto *SEI = dyn_cast<SelectEnumInst>(BI->getCondition())) {
-    EnumDecl *E = SEI->getEnumOperand()->getType().getEnumOrBoundGenericEnum();
+    EnumDecl *E = SEI->getEnumOperand()->getType().getEnumDecl();
 
     auto AllElts = E->getAllElements();
     auto Iter = AllElts.begin();
@@ -1877,7 +1997,7 @@ static bool containsOnlyObjMethodCallOnOptional(SILValue optionalValue,
     if (auto *refCast = dyn_cast<UncheckedRefCastInst>(inst)) {
       // An unchecked_ref_cast on a safe objc_method apply behaves like the
       // optional (it is null if the optional was null).
-      if (refCast->getType().getClassOrBoundGenericClass() &&
+      if (refCast->getType().getClassDecl() &&
           std::find(objCApplies.begin(), objCApplies.end(),
                     refCast->getOperand()) != objCApplies.end())
         optionalPayloads.push_back(refCast);
@@ -2065,7 +2185,7 @@ bool SimplifyCFG::simplifySwitchEnumOnObjcClassOptional(SwitchEnumInst *SEI) {
   auto optional = SEI->getOperand();
   auto optionalPayloadType = optional->getType().getOptionalObjectType();
   if (!optionalPayloadType ||
-      !optionalPayloadType.getClassOrBoundGenericClass())
+      !optionalPayloadType.getClassDecl())
     return false;
 
   if (SEI->getNumCases() != 2)
@@ -2188,7 +2308,7 @@ bool SimplifyCFG::simplifySwitchEnumBlock(SwitchEnumInst *SEI) {
   }
 
   if (EI && isInstructionTriviallyDead(EI)) {
-    EI->replaceAllUsesOfAllResultsWithUndef();
+    salvageDebugInfo(EI);
     EI->eraseFromParent();
   }
 
@@ -2516,15 +2636,80 @@ static bool isTryApplyWithUnreachableError(TryApplyInst *TAI,
   return false;
 }
 
+/// Determines how the apply that replaces \p TAI calls \p callee, which is
+/// converted to the try_apply's callee, and returns false if it can't.
+///
+/// If the try_apply is the only user of each conversion, and each conversion
+/// forwards the ownership of its operand, they're deleted along with it, and
+/// the apply uses the callee as the try_apply used the conversions. Otherwise,
+/// the conversions still use the callee, so the apply needs a copy of the
+/// callee, and a consumed old callee is destroyed.
+static bool canReplaceConvertedCallee(
+    TryApplyInst *TAI, SILValue callee,
+    SmallVectorImpl<SingleValueInstruction *> &deadConversions,
+    bool &needsCalleeCopy) {
+  needsCalleeCopy = false;
+
+  // If the try_apply's callee doesn't need to be cleaned up, neither does
+  // the callee it was converted from, so the apply can use the callee as is.
+  SILValue oldCallee = TAI->getCallee();
+  if (!requiresOSSACleanup(oldCallee))
+    return true;
+
+  // isTryApplyOfConvertFunction ensures that the use-def chain from the
+  // try_apply's callee to the callee only involves conversion instructions.
+  for (SILValue value = oldCallee; value != callee;) {
+    auto *conversion = cast<SingleValueInstruction>(value);
+    Operand &operand = conversion->getAllOperands()[0];
+    // A conversion that doesn't forward ownership, such as a
+    // convert_escape_to_noescape of an escaping closure, leaves the callee
+    // with a lifetime of its own, so the apply can't take its place.
+    auto ownership = operand.getOperandOwnership();
+    if (!hasOneNonDebugUse(value) ||
+        (ownership != OperandOwnership::ForwardingConsume &&
+         ownership != OperandOwnership::GuaranteedForwarding &&
+         ownership != OperandOwnership::TrivialUse)) {
+      deadConversions.clear();
+      break;
+    }
+    deadConversions.push_back(conversion);
+    value = operand.get();
+  }
+  if (!deadConversions.empty())
+    return true;
+
+  SILFunction *fn = TAI->getFunction();
+  needsCalleeCopy = requiresOSSACleanup(callee);
+  // A noncopyable callee, such as an exactly-once closure, can't be copied.
+  if (needsCalleeCopy && callee->getType().isMoveOnly())
+    return false;
+  // A consumed old callee would have to be destroyed, which isn't possible if
+  // it can't be destroyed implicitly, as an exactly-once closure can't.
+  if (TAI->getCalleeOperand()->isConsuming() &&
+      !oldCallee->getType().isImplicitlyDestroyable(*fn))
+    return false;
+  return true;
+}
+
 bool SimplifyCFG::simplifyTryApplyBlock(TryApplyInst *TAI) {
   SILValue Callee;
   SILType CalleeType;
 
-  // Two reasons for converting a try_apply to an apply.
-  if (!isTryApplyOfConvertFunction(TAI, Callee, CalleeType) &&
-      !isTryApplyWithUnreachableError(TAI, Callee, CalleeType)) {
-    return false;
+  // Two reasons for converting a try_apply to an apply. When the error block
+  // is unreachable, the new apply calls the same value as the try_apply, and
+  // uses it in the same way.
+  SmallVector<SingleValueInstruction *, 4> deadConversions;
+  bool needsCalleeCopy = false;
+  bool isConversion =
+      isTryApplyOfConvertFunction(TAI, Callee, CalleeType) &&
+      canReplaceConvertedCallee(TAI, Callee, deadConversions, needsCalleeCopy);
+  if (!isConversion) {
+    deadConversions.clear();
+    needsCalleeCopy = false;
+    if (!isTryApplyWithUnreachableError(TAI, Callee, CalleeType))
+      return false;
   }
+
   LLVM_DEBUG(llvm::dbgs() << "simplify try_apply block\n");
 
   auto CalleeFnTy = CalleeType.castTo<SILFunctionType>();
@@ -2586,14 +2771,10 @@ bool SimplifyCFG::simplifyTryApplyBlock(TryApplyInst *TAI) {
 
   LLVM_DEBUG(llvm::dbgs() << "replace with apply: " << *TAI);
 
-  // If the new callee is owned, copy it to extend the lifetime
-  //
-  // TODO: The original convert_function will likely be dead after
-  // replacement. It could be deleted on-the-fly with a utility to avoid
-  // creating a new copy.
+  // If the conversions still use the callee, copy it to extend the lifetime.
   auto calleeLoc = RegularLocation::getAutoGeneratedLocation();
   auto newCallee = Callee;
-  if (requiresOSSACleanup(newCallee)) {
+  if (needsCalleeCopy) {
     newCallee = SILBuilderWithScope(newCallee->getNextInstruction())
                     .createCopyValue(calleeLoc, newCallee);
     newCallee = makeValueAvailable(newCallee, TAI->getParent());
@@ -2617,15 +2798,24 @@ bool SimplifyCFG::simplifyTryApplyBlock(TryApplyInst *TAI) {
   BranchInst *branch = Builder.createBranch(Loc, NormalBB, {CastedResult});
 
   auto *oldCalleeOper = TAI->getCalleeOperand();
-  if (oldCalleeOper->getOwnershipConstraint().isConsuming()) {
-    // Destroy the oldCallee before the new call.
-    SILBuilderWithScope(NewAI).createDestroyValue(TAI->getLoc(),
-                                                  oldCalleeOper->get());
-  } else if (newCallee != Callee) {
+  bool keepsConversions = isConversion && deadConversions.empty();
+  if (oldCalleeOper->isConsuming()) {
+    // The old callee is no longer consumed by a call, so destroy it before the
+    // new call, which consumes the copy, if any.
+    if (keepsConversions)
+      SILBuilderWithScope(NewAI).createDestroyValue(TAI->getLoc(),
+                                                    oldCalleeOper->get());
+  } else if (needsCalleeCopy) {
     // Destroy the copied newCallee after the call.
     SILBuilderWithScope(branch).createDestroyValue(TAI->getLoc(), newCallee);
   }
   TAI->eraseFromParent();
+
+  // Delete the conversions, starting with the try_apply's callee.
+  for (auto *conversion : deadConversions) {
+    salvageDebugInfo(conversion);
+    eraseFromParentWithDebugInsts(conversion);
+  }
   return true;
 }
 
@@ -2651,6 +2841,9 @@ bool SimplifyCFG::simplifyTermWithIdenticalDestBlocks(SILBasicBlock *BB) {
   }
   TermInst *Term = BB->getTerminator();
   LLVM_DEBUG(llvm::dbgs() << "replace term with identical dests: " << *Term);
+  SmallVector<SILBasicBlock *, 8> trampolineBBs(
+      BB->getSuccessorBlocks().begin(), BB->getSuccessorBlocks().end());
+  joinTrampolineDebugValues(trampolineBBs, Term);
   SILBuilderWithScope(Term).createBranch(Term->getLoc(), commonDest.destBB,
                                          commonDest.newSourceBranchArgs);
   Term->eraseFromParent();
@@ -3073,7 +3266,7 @@ bool ArgumentSplitter::createNewArguments() {
 
   // Only handle struct and tuple type.
   SILType Ty = Arg->getType();
-  if (!Ty.getStructOrBoundGenericStruct() && !Ty.is<TupleType>())
+  if (!Ty.getStructDecl() && !Ty.is<TupleType>())
     return false;
 
   // Get the first level projection for the struct or tuple type.
@@ -3239,7 +3432,7 @@ static bool splitBBArguments(SILFunction &Fn) {
       SILType ArgTy = Arg->getType();
 
       if (!ArgTy.isObject() ||
-          (!ArgTy.is<TupleType>() && !ArgTy.getStructOrBoundGenericStruct())) {
+          (!ArgTy.is<TupleType>() && !ArgTy.getStructDecl())) {
         continue;
       }
 
@@ -3352,24 +3545,6 @@ static bool hasMandatoryArgument(TermInst *term) {
   return (!isa<BranchInst>(term) && !isa<CondBranchInst>(term));
 }
 
-
-// Get the element of Aggregate corresponding to the one extracted by
-// Extract.
-static SILValue getInsertedValue(SILInstruction *Aggregate,
-                                 SILInstruction *Extract) {
-  if (auto *Struct = dyn_cast<StructInst>(Aggregate)) {
-    auto *SEI = cast<StructExtractInst>(Extract);
-    return Struct->getFieldValue(SEI->getField());
-  }
-  if (auto *Enum = dyn_cast<EnumInst>(Aggregate)) {
-    assert(Enum->getElement() ==
-           cast<UncheckedEnumDataInst>(Extract)->getElement());
-    return Enum->getOperand();
-  }
-  auto *Tuple = cast<TupleInst>(Aggregate);
-  auto *TEI = cast<TupleExtractInst>(Extract);
-  return Tuple->getElement(TEI->getFieldIndex());
-}
 
 /// Find a parent SwitchEnumInst of the block \p BB. The block \p BB is a
 /// predecessor of the merge-block \p PostBB which should post-dominate the
@@ -3566,7 +3741,7 @@ static bool simplifySwitchEnumToSelectEnum(SILBasicBlock *BB, unsigned ArgNum,
     // If it does, then pick one of those cases as a default.
 
     // Count the number of possible case tags for a given enum type
-    auto *Enum = SEI->getOperand()->getType().getEnumOrBoundGenericEnum();
+    auto *Enum = SEI->getOperand()->getType().getEnumDecl();
     unsigned ElemCount = 0;
     for (auto E : Enum->getAllElements()) {
       if (E)
@@ -3652,10 +3827,10 @@ static FunctionTest SimplifyCFGSimplifyBlockArgs(
     });
 } // end namespace swift::test
 
-// Attempt to simplify the ith argument of BB.  We simplify cases
-// where there is a single use of the argument that is an extract from
-// a struct, tuple or enum and where the predecessors all build the struct,
-// tuple or enum and pass it directly.
+// Attempt to simplify the ith argument of BB.
+//
+// Note: "unwrapping" of a struct, tuple or enum argument is implemented in
+// Swift - see `Phi.unwrapAggregate` in SimplifyPhiArgument.swift.
 bool SimplifyCFG::simplifyArgument(SILBasicBlock *BB, unsigned i) {
   auto *A = BB->getArgument(i);
 
@@ -3665,84 +3840,7 @@ bool SimplifyCFG::simplifyArgument(SILBasicBlock *BB, unsigned i) {
   if (!DT && A->getType().is<BuiltinIntegerType>())
     return simplifySwitchEnumToSelectEnum(BB, i, A);
 
-  // For now, just focus on cases where there is a single use.
-  SILValue argVal = lookThroughBorrowedFromUser(A);
-  if (!argVal->hasOneUse())
-    return false;
-
-  auto *Use = *argVal->use_begin();
-  auto *User = Use->getUser();
-
-  auto disableInOSSA = [](SingleValueInstruction *inst) {
-    assert(isa<StructInst>(inst) || isa<TupleInst>(inst) ||
-           isa<EnumInst>(inst));
-    if (!inst->getFunction()->hasOwnership()) {
-      return false;
-    }
-    if (inst->getOwnershipKind() == OwnershipKind::Owned)
-      return !inst->getSingleUse();
-    return false;
-  };
-
-  // Handle projections.
-  if (!isa<StructExtractInst>(User) &&
-      !isa<TupleExtractInst>(User) &&
-      !isa<UncheckedEnumDataInst>(User))
-    return false;
-  auto proj = cast<SingleValueInstruction>(User);
-
-  // For now, just handle the case where all predecessors are
-  // unconditional branches.
-  for (auto *Pred : BB->getPredecessorBlocks()) {
-    if (!isa<BranchInst>(Pred->getTerminator()))
-      return false;
-    auto *Branch = cast<BranchInst>(Pred->getTerminator());
-    SILValue BranchArg = Branch->getArg(i);
-    if (!isa<StructInst>(BranchArg) && !isa<TupleInst>(BranchArg) &&
-        !isa<EnumInst>(BranchArg)) {
-      return false;
-    }
-    if (auto *EI = dyn_cast<EnumInst>(BranchArg)) {
-      if (EI->getElement() != cast<UncheckedEnumDataInst>(proj)->getElement())
-        return false;
-    }
-    if (disableInOSSA(cast<SingleValueInstruction>(BranchArg))) {
-      return false;
-    }
-  }
-
-  // Okay, we'll replace the BB arg with one with the right type, replace
-  // the uses in this block, and then rewrite the branch operands.
-  LLVM_DEBUG(llvm::dbgs() << "unwrap argument:" << *A);
-  if (auto *bfi = getBorrowedFromUser(A)) {
-    bfi->replaceAllUsesWith(A);
-    bfi->eraseFromParent();
-  }
-  A->replaceAllUsesWith(SILUndef::get(A));
-  auto *NewArg = BB->replacePhiArgument(i, proj->getType(),
-                                        BB->getArgument(i)->getOwnershipKind());
-  proj->replaceAllUsesWith(NewArg);
-
-  // Rewrite the branch operand for each incoming branch.
-  for (auto *Pred : BB->getPredecessorBlocks()) {
-    if (auto *Branch = cast<BranchInst>(Pred->getTerminator())) {
-      auto *BranchOpValue = cast<SingleValueInstruction>(Branch->getOperand(i));
-      auto V = getInsertedValue(cast<SingleValueInstruction>(Branch->getArg(i)),
-                                proj);
-      Branch->setOperand(i, V);
-      if (isInstructionTriviallyDead(BranchOpValue)) {
-        BranchOpValue->replaceAllUsesWithUndef();
-        BranchOpValue->eraseFromParent();
-      }
-      addToWorklist(Pred);
-    }
-  }
-
-  proj->eraseFromParent();
-
-  updateGuaranteedPhis(PM, { NewArg });
-
-  return true;
+  return false;
 }
 
 namespace swift::test {

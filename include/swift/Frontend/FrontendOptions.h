@@ -19,10 +19,8 @@
 #include "swift/Basic/Version.h"
 #include "swift/Frontend/FrontendInputsAndOutputs.h"
 #include "swift/Frontend/InputFile.h"
-#include "clang/CAS/CASOptions.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/MC/MCTargetOptions.h"
 #include <optional>
 
 #include <set>
@@ -50,12 +48,6 @@ struct CompilerDebuggingOptions {
   /// upon termination.
   bool DumpClangLookupTables = false;
 
-  bool DumpAbstractLayout = false;
-
-  /// Dump every hidden-type layout known to this compilation: those recorded
-  /// during the local module's compilation plus those deserialized from any
-  /// imported Swift modules.
-  bool DumpHiddenTypeLayouts = false;
 };
 
 /// Options for controlling the behavior of the frontend.
@@ -288,11 +280,6 @@ public:
   /// entity.
   bool ProfileEntities = false;
 
-  /// Emit parseable-output directly from the frontend, instead of relying
-  /// the driver to emit it. This is used in context where frontend jobs are executed by
-  /// clients other than the driver.
-  bool FrontendParseableOutput = false;
-
   /// Indicates whether or not an import statement can pick up a Swift source
   /// file (as opposed to a module file).
   bool EnableSourceImport = false;
@@ -522,6 +509,22 @@ public:
   /// Indicates which declarations should be exposed in the generated clang
   /// header.
   std::optional<ClangHeaderExposeBehavior> ClangHeaderExposedDecls;
+
+  /// Whether the generated clang header has C++ content.
+  bool clangHeaderHasCxxContent(bool enableCxxInterop) const {
+    // FIXME: Expose Swift with @expose by default.
+    return ClangHeaderExposedDecls.has_value() || enableCxxInterop;
+  }
+
+  /// Whether the C++ content of the generated clang header only includes
+  /// declarations that are '@_expose(Cxx)' or members of such types.
+  bool clangHeaderRequiresExposeAttr() const {
+    // FIXME: should we detect any presence of @expose and require it then?
+    return ClangHeaderExposedDecls ==
+               ClangHeaderExposeBehavior::HasExposeAttr ||
+           ClangHeaderExposedDecls ==
+               ClangHeaderExposeBehavior::HasExposeAttrOrImplicitDeps;
+  }
 
   // Include declarations that are at least as visible as the acces specified
   // by -emit-clang-header-min-access

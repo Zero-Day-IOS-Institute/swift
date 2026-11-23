@@ -45,6 +45,7 @@ include(InstallSwiftInterface)
 include(PlatformInfo)
 include(gyb)
 include(ResourceEmbedding)
+include(FramePointers)
 include(CatalystSupport)
 
 option(${PROJECT_NAME}_INSTALL_NESTED_SUBDIR "Install libraries under a platform and architecture subdirectory" ON)
@@ -85,7 +86,8 @@ add_library(swift_Volatile
 set_target_properties(swift_Volatile PROPERTIES
   Swift_MODULE_NAME _Volatile)
 target_compile_options(swift_Volatile PRIVATE
-  -parse-stdlib)
+  -parse-stdlib
+  "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-Xfrontend -enable-sil-opaque-values>")
 target_link_libraries(swift_Volatile PRIVATE
   swiftCore
   $<$<BOOL:${SwiftSwiftDirectRuntime_FOUND}>:swiftSwiftDirectRuntime>)

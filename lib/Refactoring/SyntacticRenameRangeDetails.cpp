@@ -10,7 +10,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/Basic/Assertions.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Refactoring/Refactoring.h"
 
@@ -375,6 +374,7 @@ RegionType RenameRangeDetailCollector::getSyntacticRenameRegionType(
   case ResolvedLocContext::StringLiteral:
     return RegionType::String;
   }
+  llvm_unreachable("covered switch");
 }
 
 enum class SpecialBaseName {

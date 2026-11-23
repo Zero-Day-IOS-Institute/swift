@@ -17,9 +17,10 @@
 #ifndef SWIFT_SILGEN_CLEANUP_H
 #define SWIFT_SILGEN_CLEANUP_H
 
-#define SWIFT_INCLUDED_IN_SILGEN_SOURCES
-
 #include "swift/Basic/Assertions.h"
+#ifndef SWIFT_INCLUDED_IN_SILGEN_SOURCES
+#define SWIFT_INCLUDED_IN_SILGEN_SOURCES 1
+#endif
 #include "swift/Basic/Debug.h"
 #include "swift/Basic/DiverseStack.h"
 #include "swift/SIL/SILLocation.h"
@@ -272,6 +273,32 @@ public:
   T &pushCleanup(A &&... args) {
     return pushCleanupInState<T, A...>(CleanupState::Active,
                                        ::std::forward<A>(args)...);
+  }
+
+  /// Push a new active cleanup followed by \p tailBytes of storage that is
+  /// part of the cleanup's allocation. Cleanups are memcpy'd around and never
+  /// destroyed, so this is how a cleanup can have variable-sized data. The
+  /// cleanup must access the tail relative to 'this', and the tail must be
+  /// trivially relocatable.
+  template <class T, class... A>
+  T &pushCleanupWithTail(size_t tailBytes, A &&...args) {
+#ifndef NDEBUG
+    CleanupsDepth oldTop = stack.stable_begin();
+#endif
+
+    T &cleanup =
+        stack.pushWithTail<T, A...>(tailBytes, ::std::forward<A>(args)...);
+    T &result = static_cast<T &>(
+        initCleanup(cleanup, sizeof(T) + tailBytes, CleanupState::Active));
+    assert(result.allocated_size() == sizeof(T) + tailBytes &&
+           "cleanup allocation doesn't fit in allocatedSize");
+
+#ifndef NDEBUG
+    auto newTop = stack.begin();
+    ++newTop;
+    assert(newTop == stack.find(oldTop));
+#endif
+    return result;
   }
 
   /// Emit the given active cleanup now and transition it to being inactive.

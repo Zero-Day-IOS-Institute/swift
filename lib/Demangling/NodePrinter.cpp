@@ -103,6 +103,17 @@ static DemanglerPrinter &operator<<(DemanglerPrinter &printer,
   return printer;
 }
 
+/// Print the payload of a symbolic reference node, which is either an index
+/// into the mangled name or, when produced by a remote reader, an address in
+/// the inspected process.
+static void printSymbolicReferencePayload(DemanglerPrinter &Printer,
+                                          NodePointer Node) {
+  if (Node->hasRemoteAddress())
+    Printer.writeHex(Node->getRemoteAddress().first);
+  else if (Node->hasIndex())
+    Printer.writeHex(Node->getIndex());
+}
+
 static StringRef toString(Directness d) {
   switch (d) {
   case Directness::Direct:
@@ -352,6 +363,7 @@ bool NodePrinter::isSimpleType(NodePointer Node) {
   case Node::Kind::EscapingObjCBlock:
   case Node::Kind::NoEscapeFunctionType:
   case Node::Kind::CalledOnceFunctionType:
+  case Node::Kind::CalledAtMostOnceFunctionType:
   case Node::Kind::ExplicitClosure:
   case Node::Kind::Extension:
   case Node::Kind::ExtensionAttachedMacroExpansion:
@@ -391,6 +403,7 @@ bool NodePrinter::isSimpleType(NodePointer Node) {
   case Node::Kind::ImplErasedIsolation:
   case Node::Kind::ImplNonisolatedNonsendingIsolation:
   case Node::Kind::ImplCalledOnceFunction:
+  case Node::Kind::ImplCalledAtMostOnceFunction:
   case Node::Kind::ImplSendingResult:
   case Node::Kind::ImplConvention:
   case Node::Kind::ImplParameterResultDifferentiability:
@@ -515,6 +528,7 @@ bool NodePrinter::isSimpleType(NodePointer Node) {
   case Node::Kind::TypeMetadataInstantiationFunction:
   case Node::Kind::TypeMetadataSingletonInitializationCache:
   case Node::Kind::TypeMetadataDemanglingCache:
+  case Node::Kind::TypeMetadataMangledNameRef:
   case Node::Kind::TypeMetadataLazyCache:
   case Node::Kind::UncurriedFunctionType:
 #define REF_STORAGE(Name, ...) \
@@ -617,6 +631,7 @@ bool NodePrinter::isSimpleType(NodePointer Node) {
     case Node::Kind::AccessibleFunctionRecord:
     case Node::Kind::BackDeploymentThunk:
     case Node::Kind::BackDeploymentFallback:
+    case Node::Kind::BackDeploymentCopy:
     case Node::Kind::ExtendedExistentialTypeShape:
     case Node::Kind::Uniquable:
     case Node::Kind::UniqueExtendedExistentialTypeShapeSymbolicReference:
@@ -630,6 +645,7 @@ bool NodePrinter::isSimpleType(NodePointer Node) {
     case Node::Kind::DefaultOverride:
     case Node::Kind::BorrowAccessor:
     case Node::Kind::MutateAccessor:
+    case Node::Kind::YieldTypes:
       return false;
     }
     printer_unreachable("bad node kind");
@@ -762,7 +778,8 @@ NodePointer NodePrinter::getChildIf(NodePointer Node, Node::Kind Kind) {
 void NodePrinter::printFunctionParameters(NodePointer LabelList,
                                           NodePointer ParameterType,
                                           unsigned depth, bool showTypes) {
-  if (ParameterType->getKind() != Node::Kind::ArgumentTuple) {
+  if (ParameterType->getKind() != Node::Kind::ArgumentTuple &&
+      ParameterType->getKind() != Node::Kind::YieldTypes) {
     setInvalid();
     return;
   }
@@ -844,7 +861,10 @@ void NodePrinter::printFunctionType(NodePointer LabelList, NodePointer node,
   case Node::Kind::NoEscapeFunctionType:
     break;
   case Node::Kind::CalledOnceFunctionType:
-    Printer << "@called(once) ";
+    Printer << "@once ";
+    break;
+  case Node::Kind::CalledAtMostOnceFunctionType:
+    Printer << "@callable(once) ";
     break;
   case Node::Kind::AutoClosureType:
   case Node::Kind::EscapingAutoClosureType:
@@ -1266,6 +1286,21 @@ void NodePrinter::printFunctionSigSpecializationParams(NodePointer Node,
       print(Node->getChild(Idx++), depth + 1);
       Printer << "]";
       break;
+    case FunctionSigSpecializationParamKind::DifferentiableFunctionProp:
+      if (Idx + 7 > End)
+        return;
+      Printer << "[";
+      print(Node->getChild(Idx++), depth + 1);
+      Printer << ", Components : [";
+      for (int I = 0; I != 3; ++I) {
+        if (I != 0)
+          Printer << ", ";
+        print(Node->getChild(Idx++), depth + 1);
+        Printer << " : ";
+        print(Node->getChild(Idx++), depth + 1);
+      }
+      Printer << "]]";
+      break;
     default:
       assert(
        ((V & unsigned(FunctionSigSpecializationParamKind::OwnedToGuaranteed)) ||
@@ -1399,6 +1434,7 @@ static bool needSpaceBeforeType(NodePointer Type) {
     case Node::Kind::NoEscapeFunctionType:
     case Node::Kind::UncurriedFunctionType:
     case Node::Kind::CalledOnceFunctionType:
+    case Node::Kind::CalledAtMostOnceFunctionType:
     case Node::Kind::DependentGenericType:
       return false;
     default:
@@ -1739,6 +1775,7 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
   case Node::Kind::UncurriedFunctionType:
   case Node::Kind::NoEscapeFunctionType:
   case Node::Kind::CalledOnceFunctionType:
+  case Node::Kind::CalledAtMostOnceFunctionType:
   case Node::Kind::AutoClosureType:
   case Node::Kind::EscapingAutoClosureType:
   case Node::Kind::ThinFunctionType:
@@ -1751,6 +1788,7 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
     Printer << Node->getText();
     return nullptr;
   case Node::Kind::ArgumentTuple:
+  case Node::Kind::YieldTypes:
     printFunctionParameters(nullptr, Node, depth,
                             Options.ShowFunctionArgumentTypes);
     return nullptr;
@@ -2006,6 +2044,9 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
       return nullptr;
     case FunctionSigSpecializationParamKind::EscapingClosureProp:
       Printer << "Escaping Closure Propagated";
+      return nullptr;
+    case FunctionSigSpecializationParamKind::DifferentiableFunctionProp:
+      Printer << "Differentiable Function Propagated";
       return nullptr;
     case FunctionSigSpecializationParamKind::ClosurePropPreviousArg:
       Printer << "Same As Argument";
@@ -2481,6 +2522,9 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
   case Node::Kind::BackDeploymentFallback:
     Printer << "back deployment fallback for ";
     return nullptr;
+  case Node::Kind::BackDeploymentCopy:
+    Printer << "back deployment copy of ";
+    return nullptr;
   case Node::Kind::ProtocolSymbolicReference:
     Printer << "protocol symbolic reference 0x";
     Printer.writeHex(Node->getIndex());
@@ -2547,6 +2591,10 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
     return nullptr;
   case Node::Kind::TypeMetadataDemanglingCache:
     Printer << "demangling cache variable for type metadata for ";
+    print(Node->getChild(0), depth + 1);
+    return nullptr;
+  case Node::Kind::TypeMetadataMangledNameRef:
+    Printer << "mangled name ref for type metadata for ";
     print(Node->getChild(0), depth + 1);
     return nullptr;
   case Node::Kind::TypeMetadataLazyCache:
@@ -2918,7 +2966,10 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
     Printer << "@isolated(any)";
     return nullptr;
   case Node::Kind::ImplCalledOnceFunction:
-    Printer << "@called(once)";
+    Printer << "@once";
+    return nullptr;
+  case Node::Kind::ImplCalledAtMostOnceFunction:
+    Printer << "@callable(once)";
     return nullptr;
   case Node::Kind::ImplCoroutineKind:
     // Skip if text is empty.
@@ -3518,15 +3569,15 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
   }
   case Node::Kind::UniqueExtendedExistentialTypeShapeSymbolicReference:
     Printer << "unique existential shape symbolic reference 0x";
-    Printer.writeHex(Node->getIndex());
+    printSymbolicReferencePayload(Printer, Node);
     return nullptr;
   case Node::Kind::NonUniqueExtendedExistentialTypeShapeSymbolicReference:
     Printer << "non-unique existential shape symbolic reference 0x";
-    Printer.writeHex(Node->getIndex());
+    printSymbolicReferencePayload(Printer, Node);
     return nullptr;
   case Node::Kind::ObjectiveCProtocolSymbolicReference:
     Printer << "objective-c protocol symbolic reference 0x";
-    Printer.writeHex(Node->getIndex());
+    printSymbolicReferencePayload(Printer, Node);
     return nullptr;
   case Node::Kind::SymbolicExtendedExistentialType: {
     auto shape = Node->getChild(0);
@@ -3536,7 +3587,7 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
     Printer << "symbolic existential type ("
             << (isUnique ? "" : "non-")
             << "unique) 0x";
-    Printer.writeHex(shape->getIndex());
+    printSymbolicReferencePayload(Printer, shape);
     Printer << " <";
     print(Node->getChild(1), depth + 1);
     if (Node->getNumChildren() > 2) {
@@ -3653,7 +3704,8 @@ NodePointer NodePrinter::printEntity(NodePointer Entity, unsigned depth,
           t->getKind() != Node::Kind::UncurriedFunctionType &&
           t->getKind() != Node::Kind::CFunctionPointer &&
           t->getKind() != Node::Kind::ThinFunctionType &&
-          t->getKind() != Node::Kind::CalledOnceFunctionType) {
+          t->getKind() != Node::Kind::CalledOnceFunctionType &&
+          t->getKind() != Node::Kind::CalledAtMostOnceFunctionType) {
         TypePr = TypePrinting::WithColon;
       }
     }
@@ -3790,6 +3842,8 @@ std::string Demangle::keyPathSourceString(const char *MangledName,
     NodePointer firstChild = root->getChild(0);
     if (firstChild->getKind() == Node::Kind::KeyPathGetterThunkHelper) {
       NodePointer child = firstChild->getChild(0);
+      if (child == nullptr)
+        return invalid;
       switch (child->getKind()) {
       case Node::Kind::Subscript: {
         std::string subscriptText = "subscript(";
@@ -3800,13 +3854,23 @@ std::string Demangle::keyPathSourceString(const char *MangledName,
           return std::string("<unknown>");
         };
         auto getArgumentNodeName = [](NodePointer node) {
+          if (node == nullptr) {
+            return std::string("<unknown>");
+          }
           if (node->getKind() == Node::Kind::Identifier) {
             return std::string(node->getText());
           }
-          if (node->getKind() == Node::Kind::LocalDeclName) {
-            auto text = node->getChild(1)->getText();
-            auto index = node->getChild(0)->getIndex() + 1;
-            return std::string(text) + " #" + std::to_string(index);
+          if (node->getKind() == Node::Kind::LocalDeclName &&
+              node->getNumChildren() >= 2) {
+            // Only attempt to generate a string if the child nodes are an index
+            // (discriminator) followed by text (name).
+            NodePointer discriminator = node->getChild(0);
+            NodePointer name = node->getChild(1);
+            if (name->hasText() && discriminator->hasIndex()) {
+              auto index = discriminator->getIndex() + 1;
+              return std::string(name->getText()) + " #" +
+                     std::to_string(index);
+            }
           }
           return std::string("<unknown>");
         };
@@ -3826,8 +3890,15 @@ std::string Demangle::keyPathSourceString(const char *MangledName,
             NodePointer argumentType = argList->getChild(idx);
             idx += 1;
             if (argumentType->getKind() == Node::Kind::TupleElement) {
-              argumentType =
-                  argumentType->getChild(0)->getChild(0)->getChild(1);
+              // A tuple element has the type as its last child, but is not
+              // required to have the shape TupleElement -> Type -> <nominal> ->
+              // [Module, Identifier]. For example, an empty-tuple element has a
+              // childless Tuple as the grandchild, so every step here can produce
+              // null.
+              NodePointer typeNode = argumentType->getLastChild();
+              NodePointer nominal =
+                  typeNode ? typeNode->getChild(0) : nullptr;
+              argumentType = nominal ? nominal->getChild(1) : nullptr;
               argumentTypeNames.push_back(getArgumentNodeName(argumentType));
               continue;
             }
@@ -3843,8 +3914,9 @@ std::string Demangle::keyPathSourceString(const char *MangledName,
                          std::make_pair(Node::Kind::Type, 0),
                      });
           if (argList != nullptr) {
+            NodePointer argType = argList->getChild(0);
             argumentTypeNames.push_back(
-                getArgumentNodeName(argList->getChild(0)->getChild(1)));
+                getArgumentNodeName(argType ? argType->getChild(1) : nullptr));
           }
         }
         child = child->getChild(1);

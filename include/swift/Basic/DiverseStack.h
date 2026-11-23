@@ -22,7 +22,6 @@
 #ifndef SWIFT_BASIC_DIVERSESTACK_H
 #define SWIFT_BASIC_DIVERSESTACK_H
 
-#include "swift/Basic/Malloc.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/PointerLikeTypeTraits.h"
 #include <cassert>
@@ -355,6 +354,20 @@ public:
   /// Push a new object onto the stack.
   template <class U, class... A> U &push(A && ...args) {
     pushNewStorage(sizeof(U));
+    return *::new (Begin) U(::std::forward<A>(args)...);
+  }
+
+  /// Push a new object onto the stack, followed by \p tailBytes of
+  /// uninitialized storage that is part of the object's allocation.
+  ///
+  /// The object's allocated_size() must account for the tail. The tail must be
+  /// trivially relocatable, and the object must access it relative to itself,
+  /// since the stack is relocated as raw bytes when it grows.
+  template <class U, class... A>
+  U &pushWithTail(std::size_t tailBytes, A &&...args) {
+    assert(tailBytes % alignof(U) == 0 &&
+           "tail would misalign the next object");
+    pushNewStorage(sizeof(U) + tailBytes);
     return *::new (Begin) U(::std::forward<A>(args)...);
   }
 
