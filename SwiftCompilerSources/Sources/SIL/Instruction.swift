@@ -756,6 +756,10 @@ final public class DebugValueInst : Instruction, DebugVariableInstruction, MetaI
     return bridged.DebugValue_hasVarInfo() ? bridged.DebugValue_getVarInfo() : nil
   }
 
+  /// The type of the variable: the stored variable type, the return type of the debug
+  /// reconstruction block or, otherwise, the operand type.
+  public var varType: Type { bridged.DebugValue_getVarType().type }
+
   public var debugReconstructionBlock: BasicBlock? {
     bridged.DebugValue_getDebugReconstructionBlock().block
   }
@@ -2210,6 +2214,16 @@ final public class BeginAccessInst : SingleValueInstruction, UnaryInstruction {
     context.notifyInstructionsChanged()
     bridged.BeginAccess_setAccessKind(accessKind.rawValue)
     context.notifyInstructionChanged(self)
+  }
+
+  /// True if the access scope forbids mutating the memory.
+  public var isReadOnly: Bool {
+    switch accessKind {
+    case .modify, .deinit:
+      return false
+    case .read, .`init`:
+      return true
+    }
   }
 
   // The raw values must match SILAccessEnforcement.

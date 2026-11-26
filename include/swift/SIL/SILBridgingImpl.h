@@ -2425,6 +2425,14 @@ bool BridgedSILDebugVariable::isLet() const {
   return unbridge().isLet();
 }
 
+void BridgedSILDebugVariable::clearType() {
+  reinterpret_cast<swift::SILDebugVariable *>(&storage)->Type = std::nullopt;
+}
+
+void BridgedSILDebugVariable::clearDIExpr() {
+  reinterpret_cast<swift::SILDebugVariable *>(&storage)->DIExpr = {};
+}
+
 OptionalBridgedDeclObj BridgedInstruction::DebugValue_getDecl() const {
   return {getAs<swift::DebugValueInst>()->getDecl()};
 }
@@ -2450,6 +2458,9 @@ bool BridgedInstruction::DebugValue_hasVarInfo() const {
 }
 BridgedSILDebugVariable BridgedInstruction::DebugValue_getVarInfo() const {
   return BridgedSILDebugVariable(getAs<swift::DebugValueInst>()->getVarInfo().value());
+}
+BridgedType BridgedInstruction::DebugValue_getVarType() const {
+  return getAs<swift::DebugValueInst>()->getVarType();
 }
 
 OptionalBridgedBasicBlock BridgedInstruction::DebugValue_getDebugReconstructionBlock() const {
@@ -3092,6 +3103,12 @@ BridgedInstruction BridgedBuilder::createUncheckedOwnershipConversion(BridgedVal
                                                                       BridgedValue::Ownership ownership) const {
   return {unbridged().createUncheckedOwnershipConversion(regularLoc(), op.getSILValue(),
                                                          BridgedValue::unbridge(ownership))};
+}
+
+BridgedInstruction BridgedBuilder::createUncheckedOwnership(BridgedValue op,
+                                                            BridgedValue::Ownership forwardingOwnership) const {
+  return {unbridged().createUncheckedOwnership(regularLoc(), op.getSILValue(),
+                                               BridgedValue::unbridge(forwardingOwnership))};
 }
 
 BridgedInstruction BridgedBuilder::createLoadBorrow(BridgedValue op) const {
